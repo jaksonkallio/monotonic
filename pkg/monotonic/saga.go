@@ -24,18 +24,21 @@ type ActionMap map[string]ActionFunc
 
 // ActionResult represents the outcome of a saga action
 type ActionResult struct {
-	// NewState is the state to transition to (must be empty if Close=true)
+	// NewState is the state to transition to
+	// Must be empty if `Close` is true
 	NewState string
 
-	// ExtraEvents are events to append to other aggregates atomically (must be empty if Close=true)
-	ExtraEvents []AggregateEvent
+	// Events are events to append to other aggregates atomically
+	// Must be empty if `Close` is true
+	Events []AggregateEvent
 
-	// Close indicates the saga should be closed. When true, NewState, ExtraEvents,
-	// and Delay must all be empty - closing is its own atomic operation.
-	// Typical pattern: transition to "completed" state, then have "completed" action return Close=true.
+	// Close indicates the saga should be closed
+	// Typical pattern: transition to some "completed" state, then have "completed" action return `Close` as true
+	// When true, other fields must be empty because closing implies that no other subsequent transitions or actions can occur
 	Close bool
 
-	// Delay before the next step can run (must be zero if Close=true)
+	// Delay before the next step can run
+	// Must be zero if `Close` is true
 	Delay time.Duration
 }
 
@@ -47,10 +50,9 @@ type sagaStartedPayload struct {
 
 // stateTransitionPayload is stored in state-transitioned events
 type stateTransitionPayload struct {
-	FromState string        `json:"from_state"`
-	ToState   string        `json:"to_state"`
-	ReadyAt   time.Time     `json:"ready_at,omitempty"`
-	Delay     time.Duration `json:"delay,omitempty"`
+	ToState string        `json:"to_state"`
+	ReadyAt time.Time     `json:"ready_at,omitempty"`
+	Delay   time.Duration `json:"delay,omitempty"`
 }
 
 // Saga is a state machine that coordinates multiple aggregates.
@@ -214,7 +216,7 @@ func (s *Saga) Step(ctx context.Context) error {
 	// Handle close request
 	if result.Close {
 		// Validate invariant: Close=true cannot have other fields set
-		if result.NewState != "" || len(result.ExtraEvents) > 0 || result.Delay > 0 {
+		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
 		return s.closeSaga()
@@ -256,10 +258,9 @@ func (s *Saga) transition(result *ActionResult) error {
 	}
 
 	payload, _ := json.Marshal(stateTransitionPayload{
-		FromState: s.State,
-		ToState:   result.NewState,
-		ReadyAt:   readyAt,
-		Delay:     result.Delay,
+		ToState: result.NewState,
+		ReadyAt: readyAt,
+		Delay:   result.Delay,
 	})
 
 	sagaEvent := Event{
@@ -273,7 +274,7 @@ func (s *Saga) transition(result *ActionResult) error {
 	allEvents := []AggregateEvent{
 		{AggregateType: s.ID.Type, AggregateID: s.ID.ID, Event: sagaEvent},
 	}
-	allEvents = append(allEvents, result.ExtraEvents...)
+	allEvents = append(allEvents, result.Events...)
 
 	// Append atomically
 	if err := s.appendMulti(allEvents); err != nil {
@@ -316,8 +317,8 @@ func (s *Saga) Run(ctx context.Context) error {
 	}
 }
 
-// PrepareEvent creates an AggregateEvent ready for AppendMulti.
-// The counter must be set to (current aggregate counter + 1).
+// PrepareEvent creates an AggregateEvent ready for AppendMulti
+// The counter must be set to (current aggregate counter + 1)
 func PrepareEvent(aggType, aggID string, counter int64, eventType string, payload any) (AggregateEvent, error) {
 	var data []byte
 	var err error

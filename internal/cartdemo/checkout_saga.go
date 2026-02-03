@@ -68,8 +68,8 @@ func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.St
 	}
 
 	return &monotonic.ActionResult{
-		NewState:    CheckoutReservingStock,
-		ExtraEvents: []monotonic.AggregateEvent{cartEvent},
+		NewState: CheckoutReservingStock,
+		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
@@ -101,8 +101,8 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monot
 	}
 
 	return &monotonic.ActionResult{
-		NewState:    CheckoutCreatingToken,
-		ExtraEvents: events,
+		NewState: CheckoutCreatingToken,
+		Events:   events,
 	}, nil
 }
 
@@ -128,8 +128,8 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 	}
 
 	return &monotonic.ActionResult{
-		NewState:    CheckoutChargingPayment,
-		ExtraEvents: []monotonic.AggregateEvent{cartEvent},
+		NewState: CheckoutChargingPayment,
+		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
@@ -165,8 +165,8 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 
 	// Transition to completed state (close happens in next step)
 	return &monotonic.ActionResult{
-		NewState:    CheckoutCompleted,
-		ExtraEvents: []monotonic.AggregateEvent{cartEvent},
+		NewState: CheckoutCompleted,
+		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
