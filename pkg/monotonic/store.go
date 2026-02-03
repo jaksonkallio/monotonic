@@ -64,7 +64,7 @@ func NewInMemoryStore() *InMemoryStore {
 }
 
 func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]Event, error) {
-	id := AggregateID{Type: aggregateType, ID: aggregateID}
+	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
 		return nil, nil // New aggregate, no events yet
@@ -73,7 +73,7 @@ func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]Event, error)
 }
 
 func (s *InMemoryStore) LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]Event, error) {
-	id := AggregateID{Type: aggregateType, ID: aggregateID}
+	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
 		return nil, nil
@@ -96,7 +96,7 @@ func (s *InMemoryStore) Append(aggregateType, aggregateID string, event Event) e
 func (s *InMemoryStore) AppendMulti(events []AggregateEvent) error {
 	// Phase 1: Validate all counters and check for closed aggregates
 	for _, ae := range events {
-		id := AggregateID{Type: ae.AggregateType, ID: ae.AggregateID}
+		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
 
 		// Check if closed
@@ -119,7 +119,7 @@ func (s *InMemoryStore) AppendMulti(events []AggregateEvent) error {
 
 	// Phase 2: All counters valid, commit all events
 	for _, ae := range events {
-		id := AggregateID{Type: ae.AggregateType, ID: ae.AggregateID}
+		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg, exists := s.aggregates[id]
 		if !exists {
 			agg = &inMemoryStoredAggregate{}
@@ -142,7 +142,7 @@ func (s *InMemoryStore) ListAggregates(aggregateType string) ([]string, error) {
 }
 
 func (s *InMemoryStore) Close(aggregateType, aggregateID string) error {
-	id := AggregateID{Type: aggregateType, ID: aggregateID}
+	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
 		// Nothing to close, but that's fine (idempotent)
@@ -153,7 +153,7 @@ func (s *InMemoryStore) Close(aggregateType, aggregateID string) error {
 }
 
 func (s *InMemoryStore) IsClosed(aggregateType, aggregateID string) (bool, error) {
-	id := AggregateID{Type: aggregateType, ID: aggregateID}
+	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
 		return false, nil

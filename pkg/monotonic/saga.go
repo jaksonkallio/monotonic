@@ -57,14 +57,13 @@ type stateTransitionPayload struct {
 // It tracks only its current state and references to aggregates -
 // all actual data lives in the aggregates themselves.
 type Saga struct {
-	ID      AggregateID
+	eventStream
+
 	State   string
 	Refs    map[string]AggregateID // named references to aggregates
 	ReadyAt time.Time              // earliest time the next step can run
 	Closed  bool                   // whether the saga is closed
 
-	counter int64
-	store   Store
 	actions ActionMap
 }
 
@@ -80,11 +79,13 @@ func NewSaga(
 	actions ActionMap,
 ) (*Saga, error) {
 	saga := &Saga{
-		ID:      AggregateID{Type: sagaType, ID: id},
+		eventStream: eventStream{
+			ID:    NewAggregateID(sagaType, id),
+			store: store,
+		},
 		State:   initialState,
 		Refs:    refs,
 		ReadyAt: time.Now(),
-		store:   store,
 		actions: actions,
 	}
 
@@ -121,14 +122,16 @@ func LoadSaga(store Store, sagaType, id string, actions ActionMap) (*Saga, error
 	}
 
 	saga := &Saga{
-		ID:      AggregateID{Type: sagaType, ID: id},
-		store:   store,
+		eventStream: eventStream{
+			ID:    NewAggregateID(sagaType, id),
+			store: store,
+		},
 		actions: actions,
 	}
 
 	for _, e := range events {
 		saga.apply(e)
-		saga.counter = e.Counter
+		saga.applied(e)
 	}
 
 	return saga, nil
@@ -158,11 +161,6 @@ func (s *Saga) apply(event Event) {
 	}
 }
 
-// Counter returns the saga's event counter
-func (s *Saga) Counter() int64 {
-	return s.counter
-}
-
 // IsReady returns true if the saga is ready to step (not delayed)
 func (s *Saga) IsReady() bool {
 	return time.Now().After(s.ReadyAt) || time.Now().Equal(s.ReadyAt)
@@ -185,13 +183,8 @@ func (s *Saga) Step(ctx context.Context) error {
 	}
 
 	// Catch up on any missed events
-	events, err := s.store.LoadAfter(s.ID.Type, s.ID.ID, s.counter)
-	if err != nil {
-		return fmt.Errorf("saga catch up: %w", err)
-	}
-	for _, e := range events {
-		s.apply(e)
-		s.counter = e.Counter
+	if err := s.catchUp(s.apply); err != nil {
+		return err
 	}
 
 	// Check again after catch-up (might have been closed by another process)
@@ -224,27 +217,27 @@ func (s *Saga) Step(ctx context.Context) error {
 		if result.NewState != "" || len(result.ExtraEvents) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
-		return s.close()
+		return s.closeSaga()
 	}
 
 	// Handle state transition
 	return s.transition(result)
 }
 
-// close appends a saga-closed event and marks the saga as closed in the store
-func (s *Saga) close() error {
+// closeSaga appends a saga-closed event and marks the saga as closed in the store
+func (s *Saga) closeSaga() error {
 	closeEvent := Event{
 		Type:       "saga-closed",
-		Counter:    s.counter + 1,
+		Counter:    s.nextCounter(),
 		AcceptedAt: time.Now(),
 	}
 
-	if err := s.store.Append(s.ID.Type, s.ID.ID, closeEvent); err != nil {
+	if err := s.append(closeEvent); err != nil {
 		return fmt.Errorf("saga close event: %w", err)
 	}
 
 	s.apply(closeEvent)
-	s.counter = closeEvent.Counter
+	s.applied(closeEvent)
 
 	// Mark closed in store (for ListAggregates filtering)
 	if err := s.store.Close(s.ID.Type, s.ID.ID); err != nil {
@@ -271,7 +264,7 @@ func (s *Saga) transition(result *ActionResult) error {
 
 	sagaEvent := Event{
 		Type:       "state-transitioned",
-		Counter:    s.counter + 1,
+		Counter:    s.nextCounter(),
 		AcceptedAt: time.Now(),
 		Payload:    payload,
 	}
@@ -283,12 +276,12 @@ func (s *Saga) transition(result *ActionResult) error {
 	allEvents = append(allEvents, result.ExtraEvents...)
 
 	// Append atomically
-	if err := s.store.AppendMulti(allEvents); err != nil {
+	if err := s.appendMulti(allEvents); err != nil {
 		return fmt.Errorf("saga transition: %w", err)
 	}
 
 	s.apply(sagaEvent)
-	s.counter = sagaEvent.Counter
+	s.applied(sagaEvent)
 
 	return nil
 }

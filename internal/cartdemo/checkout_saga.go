@@ -37,7 +37,7 @@ func StartCheckoutSaga(ctx context.Context, store monotonic.Store, sagaID string
 		sagaID,
 		CheckoutStarted,
 		map[string]monotonic.AggregateID{
-			"cart": {Type: "cart", ID: cartID},
+			"cart": monotonic.NewAggregateID("cart", cartID),
 		},
 		CheckoutActions(),
 	)

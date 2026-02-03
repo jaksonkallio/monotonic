@@ -7,6 +7,10 @@ type AggregateID struct {
 	ID   string
 }
 
+func NewAggregateID(aggregateType, id string) AggregateID {
+	return AggregateID{Type: aggregateType, ID: id}
+}
+
 // Logic is the interface that user aggregates must implement
 type Logic interface {
 	// Apply applies an event to the aggregate's state
@@ -21,10 +25,8 @@ type Logic interface {
 // AggregateBase provides the infrastructure for aggregates.
 // Embed this in your aggregate structs to get Propose() and hydration support.
 type AggregateBase struct {
-	ID      AggregateID
-	counter int64
-	store   Store
-	self    Logic
+	eventStream
+	self Logic
 }
 
 // Propose validates and persists an event, then applies it to state.
@@ -35,7 +37,7 @@ type AggregateBase struct {
 // (but doesn't eliminate) optimistic concurrency conflicts.
 func (b *AggregateBase) Propose(event Event) error {
 	// Catch up on any events we may have missed
-	if err := b.catchUp(); err != nil {
+	if err := b.catchUp(b.self.Apply); err != nil {
 		return err
 	}
 
@@ -43,36 +45,16 @@ func (b *AggregateBase) Propose(event Event) error {
 		return err
 	}
 
-	event.Counter = b.counter + 1
+	event.Counter = b.nextCounter()
 	event.AcceptedAt = time.Now()
 
-	if err := b.store.Append(b.ID.Type, b.ID.ID, event); err != nil {
+	if err := b.append(event); err != nil {
 		return err
 	}
 
 	b.self.Apply(event)
-	b.counter = event.Counter
+	b.applied(event)
 	return nil
-}
-
-// catchUp replays any events from the store that we haven't seen yet.
-func (b *AggregateBase) catchUp() error {
-	events, err := b.store.LoadAfter(b.ID.Type, b.ID.ID, b.counter)
-	if err != nil {
-		return err
-	}
-
-	for _, e := range events {
-		b.self.Apply(e)
-		b.counter = e.Counter
-	}
-
-	return nil
-}
-
-// Counter returns the current event counter (number of events applied)
-func (b *AggregateBase) Counter() int64 {
-	return b.counter
 }
 
 // Hydrate loads an aggregate from the store by replaying all events.
@@ -85,15 +67,17 @@ func Hydrate[T Logic](store Store, aggType, id string, init func(*AggregateBase)
 	}
 
 	base := &AggregateBase{
-		ID:    AggregateID{Type: aggType, ID: id},
-		store: store,
+		eventStream: eventStream{
+			ID:    NewAggregateID(aggType, id),
+			store: store,
+		},
 	}
 	agg := init(base)
 	base.self = agg
 
 	for _, e := range events {
 		agg.Apply(e)
-		base.counter = e.Counter
+		base.applied(e)
 	}
 
 	return agg, nil
