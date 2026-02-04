@@ -2,6 +2,7 @@ package cartdemo
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
@@ -49,20 +50,13 @@ func LoadCheckoutSaga(store monotonic.Store, sagaID string) (*monotonic.Saga, er
 }
 
 func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-	// Load the cart to mark checkout started
+	// Load the cart and prepare checkout-started event
 	cart, err := LoadCart(store, saga.Refs["cart"].ID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Prepare checkout-started event for the cart
-	cartEvent, err := monotonic.PrepareEvent(
-		saga.Refs["cart"].Type,
-		saga.Refs["cart"].ID,
-		cart.Counter()+1,
-		"checkout-started",
-		nil,
-	)
+	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "checkout-started"})
 	if err != nil {
 		return nil, err
 	}
@@ -81,23 +75,24 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monot
 	}
 
 	// Each item is a separate stock aggregate, so each gets counter=1
+	// Stock doesn't have a full aggregate implementation, so we create events directly
 	events := []monotonic.AggregateEvent{}
 
 	for _, item := range cart.Items {
-		event, err := monotonic.PrepareEvent(
-			"stock",
-			item, // item SKU is the stock aggregate ID
-			1,    // each stock aggregate is new, starts at counter 1
-			"reserved",
-			map[string]any{
-				"saga_id":  saga.ID.ID,
-				"quantity": 1,
+		payload, _ := json.Marshal(map[string]any{
+			"saga_id":  saga.ID.ID,
+			"quantity": 1,
+		})
+		events = append(events, monotonic.AggregateEvent{
+			AggregateType: "stock",
+			AggregateID:   item, // item SKU is the stock aggregate ID
+			Event: monotonic.Event{
+				Type:       "reserved",
+				Counter:    1, // each stock aggregate is new
+				AcceptedAt: time.Now(),
+				Payload:    payload,
 			},
-		)
-		if err != nil {
-			return nil, err
-		}
-		events = append(events, event)
+		})
 	}
 
 	return &monotonic.ActionResult{
@@ -116,13 +111,11 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 	token := "tok_" + saga.ID.ID
 
 	// Store the token on the cart
-	cartEvent, err := monotonic.PrepareEvent(
-		saga.Refs["cart"].Type,
-		saga.Refs["cart"].ID,
-		cart.Counter()+1,
-		"payment-token-set",
-		map[string]string{"token": token},
-	)
+	payload, _ := json.Marshal(map[string]string{"token": token})
+	cartEvent, err := cart.PrepareEvent(monotonic.Event{
+		Type:    "payment-token-set",
+		Payload: payload,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -152,13 +145,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 		return nil, err
 	}
 
-	cartEvent, err := monotonic.PrepareEvent(
-		saga.Refs["cart"].Type,
-		saga.Refs["cart"].ID,
-		cart.Counter()+1,
-		"payment-charged",
-		nil,
-	)
+	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "payment-charged"})
 	if err != nil {
 		return nil, err
 	}

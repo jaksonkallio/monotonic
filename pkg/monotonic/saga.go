@@ -15,7 +15,7 @@ import (
 //   - (*ActionResult, nil) with Close=true  → close the saga (no other fields allowed)
 //   - (nil, err) → transient error, retry later
 //
-// When Close=true, NewState, ExtraEvents, and Delay must be empty - the close
+// When Close=true, NewState, Events, and Delay must be empty - the close
 // operation is its own atomic step with no other side effects.
 type ActionFunc func(ctx context.Context, saga *Saga, store Store) (*ActionResult, error)
 
@@ -70,7 +70,7 @@ type Saga struct {
 }
 
 // ErrInvalidCloseResult is returned when ActionResult has Close=true with other fields set
-var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have NewState, ExtraEvents, or Delay")
+var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have NewState, Events, or Delay")
 
 // NewSaga creates and persists a new saga.
 func NewSaga(
@@ -317,25 +317,3 @@ func (s *Saga) Run(ctx context.Context) error {
 	}
 }
 
-// PrepareEvent creates an AggregateEvent ready for AppendMulti
-// The counter must be set to (current aggregate counter + 1)
-func PrepareEvent(aggType, aggID string, counter int64, eventType string, payload any) (AggregateEvent, error) {
-	var data []byte
-	var err error
-	if payload != nil {
-		data, err = json.Marshal(payload)
-		if err != nil {
-			return AggregateEvent{}, err
-		}
-	}
-	return AggregateEvent{
-		AggregateType: aggType,
-		AggregateID:   aggID,
-		Event: Event{
-			Type:       eventType,
-			Counter:    counter,
-			AcceptedAt: time.Now(),
-			Payload:    data,
-		},
-	}, nil
-}

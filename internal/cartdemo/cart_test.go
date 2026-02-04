@@ -18,7 +18,7 @@ func TestCartCatchUp(t *testing.T) {
 
 	// Process A adds an item
 	payload, _ := json.Marshal(map[string]string{"item_name": "Widget"})
-	cartA.Propose(monotonic.Event{Type: "item-added", Payload: payload})
+	cartA.Record(monotonic.Event{Type: "item-added", Payload: payload})
 
 	// cartA sees the item, cartB doesn't (yet)
 	if len(cartA.Items) != 1 {
@@ -30,9 +30,9 @@ func TestCartCatchUp(t *testing.T) {
 
 	// Process B proposes another event - this should catch up first
 	payload, _ = json.Marshal(map[string]string{"item_name": "Gadget"})
-	err := cartB.Propose(monotonic.Event{Type: "item-added", Payload: payload})
+	err := cartB.Record(monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
-		t.Fatalf("cartB Propose failed: %v", err)
+		t.Fatalf("cartB Record failed: %v", err)
 	}
 
 	// Now cartB should have both items (caught up + its own)
@@ -68,16 +68,16 @@ func TestCart(t *testing.T) {
 	}
 
 	// Try to checkout empty cart - should fail
-	err = cart.Propose(monotonic.Event{Type: "checkout-started"})
+	err = cart.Record(monotonic.Event{Type: "checkout-started"})
 	if err == nil {
 		t.Error("expected error when checking out empty cart")
 	}
 
 	// Add an item
 	payload, _ := json.Marshal(map[string]string{"item_name": "Widget"})
-	err = cart.Propose(monotonic.Event{Type: "item-added", Payload: payload})
+	err = cart.Record(monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
-		t.Fatalf("Propose item-added failed: %v", err)
+		t.Fatalf("Record item-added failed: %v", err)
 	}
 
 	// Verify state updated
@@ -90,15 +90,15 @@ func TestCart(t *testing.T) {
 
 	// Add another item
 	payload, _ = json.Marshal(map[string]string{"item_name": "Gadget"})
-	err = cart.Propose(monotonic.Event{Type: "item-added", Payload: payload})
+	err = cart.Record(monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
-		t.Fatalf("Propose item-added failed: %v", err)
+		t.Fatalf("Record item-added failed: %v", err)
 	}
 
 	// Start checkout - should succeed now
-	err = cart.Propose(monotonic.Event{Type: "checkout-started"})
+	err = cart.Record(monotonic.Event{Type: "checkout-started"})
 	if err != nil {
-		t.Fatalf("Propose checkout-started failed: %v", err)
+		t.Fatalf("Record checkout-started failed: %v", err)
 	}
 
 	if !cart.CheckoutStarted {
@@ -106,7 +106,7 @@ func TestCart(t *testing.T) {
 	}
 
 	// Try to start checkout again - should fail
-	err = cart.Propose(monotonic.Event{Type: "checkout-started"})
+	err = cart.Record(monotonic.Event{Type: "checkout-started"})
 	if err == nil {
 		t.Error("expected error when starting checkout twice")
 	}

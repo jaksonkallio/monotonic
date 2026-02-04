@@ -120,7 +120,7 @@ type Cart struct {
 ```
 
 Your struct embeds `*monotonic.AggregateBase`, which provides:
-- `Propose(event)` - validate, persist, and apply an event
+- `Record(event)` - validate, persist, and apply an event
 - `Counter()` - the number of events applied
 - Automatic catch-up if other processes have appended events
 
@@ -146,12 +146,12 @@ func (c *Cart) Apply(event monotonic.Event) {
 
 **Important**: Always use the event's `AcceptedAt` timestamp for any time-based logic, not `time.Now()`. This ensures deterministic replay - the same events always produce the same state.
 
-### Step 3: Implement ValidateProposal
+### Step 3: Implement Validate
 
-The `ValidateProposal` method decides whether a proposed event is valid given the current state. Return an error to reject the event.
+The `Validate` method decides whether an event is valid given the current state. Return an error to reject the event.
 
 ```go
-func (c *Cart) ValidateProposal(event monotonic.Event) error {
+func (c *Cart) Validate(event monotonic.Event) error {
     switch event.Type {
     case "item-added":
         // Anyone can add items
@@ -171,7 +171,7 @@ func (c *Cart) ValidateProposal(event monotonic.Event) error {
 }
 ```
 
-This is where your business rules live. The separation between validation (`ValidateProposal`) and application (`Apply`) is intentional - it keeps your state mutation simple and predictable.
+This is where your business rules live. The separation between validation (`Validate`) and application (`Apply`) is intentional - it keeps your state mutation simple and predictable.
 
 ### Step 4: Create a Load Function
 
@@ -199,9 +199,9 @@ func main() {
         panic(err)
     }
 
-    // Propose events
+    // Record events
     payload, _ := json.Marshal(map[string]string{"item_name": "Widget"})
-    err = cart.Propose(monotonic.Event{
+    err = cart.Record(monotonic.Event{
         Type:    "item-added",
         Payload: payload,
     })
@@ -213,7 +213,7 @@ func main() {
     fmt.Println(cart.Items) // ["Widget"]
 
     // Start checkout
-    err = cart.Propose(monotonic.Event{Type: "checkout-started"})
+    err = cart.Record(monotonic.Event{Type: "checkout-started"})
     if err != nil {
         panic(err)
     }
@@ -221,7 +221,7 @@ func main() {
     fmt.Println(cart.CheckoutStarted) // true
 
     // This will fail - business rule violation
-    err = cart.Propose(monotonic.Event{Type: "checkout-started"})
+    err = cart.Record(monotonic.Event{Type: "checkout-started"})
     fmt.Println(err) // "checkout has already been started"
 }
 ```
@@ -235,19 +235,19 @@ Monotonic uses **optimistic concurrency control** via event counters. Each event
 ```
 Process A: Load cart (counter=5)
 Process B: Load cart (counter=5)
-Process B: Propose event → succeeds (counter becomes 6)
-Process A: Propose event → fails! (expected counter 6, got 6)
+Process B: Record event → succeeds (counter becomes 6)
+Process A: Record event → fails! (expected counter 6, got 6)
 ```
 
-When you call `Propose()`, Monotonic automatically catches up on any events it missed before validating:
+When you call `Record()`, Monotonic automatically catches up on any events it missed before validating:
 
 ```go
-func (b *AggregateBase) Propose(event Event) error {
+func (b *AggregateBase) Record(event Event) error {
     // Catch up first - replay any events we missed
     b.catchUp()
 
     // Now validate against the current state
-    b.self.ValidateProposal(event)
+    b.self.Validate(event)
 
     // Append with the correct counter
     // ...
@@ -258,11 +258,11 @@ This minimizes conflicts but doesn't eliminate them entirely. If two processes r
 
 ```go
 for retries := 0; retries < 3; retries++ {
-    err := cart.Propose(event)
+    err := cart.Record(event)
     if err == nil {
         break
     }
-    // Propose will catch up on next attempt
+    // Record will catch up on next attempt
 }
 ```
 
@@ -335,27 +335,23 @@ func startCheckout(ctx context.Context, saga *monotonic.Saga, store monotonic.St
     }
 
     // Prepare an event for the cart aggregate
-    cartEvent, err := monotonic.PrepareEvent(
-        saga.Refs["cart"].Type,
-        saga.Refs["cart"].ID,
-        cart.Counter()+1,  // Next counter value
-        "checkout-started",
-        nil,
-    )
+    // PrepareEvent catches up the aggregate, validates,
+    // and assigns the next counter - but doesn't append or apply yet
+    cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "checkout-started"})
     if err != nil {
         return nil, err
     }
 
     return &monotonic.ActionResult{
-        NewState:    CheckoutReserving,
-        ExtraEvents: []monotonic.AggregateEvent{cartEvent},
+        NewState: CheckoutReserving,
+        Events:   []monotonic.AggregateEvent{cartEvent},
     }, nil
 }
 ```
 
 What's cool is that under the hood, the saga _itself_ is an event-sourced aggregate too. When you return an `ActionResult`, Monotonic:
 1. Creates a `state-transitioned` event for the saga
-2. Combines it with your `ExtraEvents`
+2. Combines it with your `Events`
 3. Appends all events atomically via `AppendMulti`
 
 ### Creating and Running Sagas
@@ -443,7 +439,7 @@ func chargePayment(ctx context.Context, saga *monotonic.Saga, store monotonic.St
     // Record success
     return &monotonic.ActionResult{
         NewState: CheckoutCompleted,
-        ExtraEvents: []monotonic.AggregateEvent{...},
+        Events:   []monotonic.AggregateEvent{...},
     }, nil
 }
 ```

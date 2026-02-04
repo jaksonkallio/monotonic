@@ -17,44 +17,66 @@ type Logic interface {
 	// This cannot fail - the event had already been previously accepted
 	Apply(event Event)
 
-	// ValidateProposal checks if a proposed event is valid given current state
+	// Validate checks if an event is valid given current state
 	// Return an error to reject the event
-	ValidateProposal(event Event) error
+	Validate(event Event) error
 }
 
 // AggregateBase provides the infrastructure for aggregates.
-// Embed this in your aggregate structs to get Propose() and hydration support.
+// Embed this in your aggregate structs to get Record() and hydration support.
 type AggregateBase struct {
 	eventStream
 	self Logic
 }
 
-// Propose validates and persists an event, then applies it to state.
+// Record validates and persists an event, then applies it to state.
 // This is the main entry point for making changes to an aggregate.
 //
 // Before validating, it catches up on any events that may have been
 // appended by other processes since we last loaded. This minimizes
 // (but doesn't eliminate) optimistic concurrency conflicts.
-func (b *AggregateBase) Propose(event Event) error {
-	// Catch up on any events we may have missed
-	if err := b.catchUp(b.self.Apply); err != nil {
+func (b *AggregateBase) Record(event Event) error {
+	prepared, err := b.PrepareEvent(event)
+	if err != nil {
 		return err
 	}
 
-	if err := b.self.ValidateProposal(event); err != nil {
+	if err := b.append(prepared.Event); err != nil {
 		return err
+	}
+
+	b.self.Apply(prepared.Event)
+	b.applied(prepared.Event)
+	return nil
+}
+
+// PrepareEvent validates an event and prepares it for atomic commit.
+// This catches up on missed events, validates, and sets the counter and
+// timestamp. The event is NOT appended or applied yet.
+//
+// Use this when you need to prepare events for multiple aggregates to be
+// committed atomically (e.g., in a saga). The returned AggregateEvent can
+// be passed to Store.AppendMulti().
+//
+// After AppendMulti succeeds, call ApplyPrepared() to update local state.
+func (b *AggregateBase) PrepareEvent(event Event) (AggregateEvent, error) {
+	// Catch up on any events we may have missed
+	if err := b.catchUp(b.self.Apply); err != nil {
+		return AggregateEvent{}, err
+	}
+
+	if err := b.self.Validate(event); err != nil {
+		return AggregateEvent{}, err
 	}
 
 	event.Counter = b.nextCounter()
 	event.AcceptedAt = time.Now()
 
-	if err := b.append(event); err != nil {
-		return err
-	}
-
-	b.self.Apply(event)
-	b.applied(event)
-	return nil
+	return AggregateEvent{
+		AggregateType: b.ID.Type,
+		AggregateID:   b.ID.ID,
+		Event:         event,
+	}, nil
 }
 
 // Hydrate loads an aggregate from the store by replaying all events.

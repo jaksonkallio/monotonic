@@ -15,6 +15,8 @@ type Cart struct {
 	// State - plain Go fields
 	Items           []string
 	CheckoutStarted bool
+	PaymentToken    string
+	PaymentCharged  bool
 }
 
 // LoadCart hydrates a Cart aggregate from the store
@@ -35,10 +37,20 @@ func (c *Cart) Apply(event monotonic.Event) {
 
 	case "checkout-started":
 		c.CheckoutStarted = true
+
+	case "payment-token-set":
+		var payload struct {
+			Token string `json:"token"`
+		}
+		json.Unmarshal(event.Payload, &payload)
+		c.PaymentToken = payload.Token
+
+	case "payment-charged":
+		c.PaymentCharged = true
 	}
 }
 
-func (c *Cart) ValidateProposal(event monotonic.Event) error {
+func (c *Cart) Validate(event monotonic.Event) error {
 	switch event.Type {
 	case "item-added":
 		return nil
@@ -49,6 +61,21 @@ func (c *Cart) ValidateProposal(event monotonic.Event) error {
 		}
 		if len(c.Items) == 0 {
 			return errors.New("cannot start checkout on an empty cart")
+		}
+		return nil
+
+	case "payment-token-set":
+		if !c.CheckoutStarted {
+			return errors.New("checkout has not been started")
+		}
+		return nil
+
+	case "payment-charged":
+		if c.PaymentToken == "" {
+			return errors.New("no payment token set")
+		}
+		if c.PaymentCharged {
+			return errors.New("payment has already been charged")
 		}
 		return nil
 	}
