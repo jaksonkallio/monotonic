@@ -10,16 +10,10 @@ type Store interface {
 	// LoadAfter returns events with counter > afterCounter
 	LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]Event, error)
 
-	// Append adds a new event to the aggregate's event history.
-	// Returns an error if the event's counter doesn't match the expected next value.
-	// Returns an error if the aggregate is closed.
-	Append(aggregateType, aggregateID string, event Event) error
-
-	// AppendMulti atomically appends events to multiple aggregates.
-	// Either all events are appended or none are (transactional).
-	// Returns an error if any event's counter doesn't match expected value.
-	// Returns an error if any aggregate is closed.
-	AppendMulti(events []AggregateEvent) error
+	// Append adds new event(s) to the aggregate's event history atomically
+	// Either all events are appended at once or none are
+	// Returns an error if any event could not be appended (e.g. counter mismatch, aggregate closed)
+	Append(events ...AggregateEvent) error
 
 	// ListAggregates returns all non-closed aggregate IDs of a given type.
 	// Used by saga drivers to discover sagas that need to be stepped.
@@ -87,19 +81,11 @@ func (s *InMemoryStore) LoadAfter(aggregateType, aggregateID string, afterCounte
 	return agg.events[afterCounter:], nil
 }
 
-func (s *InMemoryStore) Append(aggregateType, aggregateID string, event Event) error {
-	return s.AppendMulti([]AggregateEvent{
-		{AggregateType: aggregateType, AggregateID: aggregateID, Event: event},
-	})
-}
-
-func (s *InMemoryStore) AppendMulti(events []AggregateEvent) error {
-	// Phase 1: Validate all counters and check for closed aggregates
+func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
 
-		// Check if closed
 		if agg != nil && agg.closed {
 			return fmt.Errorf("%w: %s/%s", ErrAggregateClosed, ae.AggregateType, ae.AggregateID)
 		}

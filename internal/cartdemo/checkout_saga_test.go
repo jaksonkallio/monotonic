@@ -165,11 +165,11 @@ func TestCheckoutSagaRun(t *testing.T) {
 		t.Fatalf("Run failed: %v", err)
 	}
 
-	if saga.State != CheckoutCompleted {
-		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State)
+	if saga.State() != CheckoutCompleted {
+		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State())
 	}
 
-	if !saga.Closed {
+	if !saga.Closed() {
 		t.Error("expected saga to be closed")
 	}
 }
@@ -180,17 +180,17 @@ func TestSagaDelayedTransition(t *testing.T) {
 
 	// Create a simple saga with a delayed transition
 	actions := monotonic.ActionMap{
-		"start": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-			return &monotonic.ActionResult{
+		"start": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+			return monotonic.ActionResult{
 				NewState: "waiting",
 				Delay:    100 * time.Millisecond,
 			}, nil
 		},
-		"waiting": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-			return &monotonic.ActionResult{NewState: "done"}, nil
+		"waiting": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+			return monotonic.ActionResult{NewState: "done"}, nil
 		},
-		"done": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-			return &monotonic.ActionResult{Close: true}, nil
+		"done": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+			return monotonic.ActionResult{Close: true}, nil
 		},
 	}
 
@@ -198,7 +198,7 @@ func TestSagaDelayedTransition(t *testing.T) {
 
 	// First step should transition to "waiting" with delay
 	saga.Step(ctx)
-	if saga.State != "waiting" {
+	if saga.State() != "waiting" {
 		t.Errorf("expected state 'waiting', got %s", saga.State)
 	}
 
@@ -209,8 +209,8 @@ func TestSagaDelayedTransition(t *testing.T) {
 
 	// Step should be no-op when not ready
 	saga.Step(ctx)
-	if saga.State != "waiting" {
-		t.Errorf("expected state to remain 'waiting', got %s", saga.State)
+	if saga.State() != "waiting" {
+		t.Errorf("expected state to remain 'waiting', got %s", saga.State())
 	}
 
 	// Wait for delay
@@ -223,13 +223,13 @@ func TestSagaDelayedTransition(t *testing.T) {
 
 	// Step should now transition to done
 	saga.Step(ctx)
-	if saga.State != "done" {
-		t.Errorf("expected state 'done', got %s", saga.State)
+	if saga.State() != "done" {
+		t.Errorf("expected state 'done', got %s", saga.State())
 	}
 
 	// Step again to close
 	saga.Step(ctx)
-	if !saga.Closed {
+	if !saga.Closed() {
 		t.Error("expected saga to be closed")
 	}
 }

@@ -32,13 +32,8 @@ func (e *eventStream) catchUp(apply func(Event)) error {
 }
 
 // append adds a single event to the store
-func (e *eventStream) append(event Event) error {
-	return e.store.Append(e.ID.Type, e.ID.ID, event)
-}
-
-// appendMulti adds multiple events atomically to potentially multiple aggregates
-func (e *eventStream) appendMulti(events []AggregateEvent) error {
-	return e.store.AppendMulti(events)
+func (e *eventStream) append(events ...AggregateEvent) error {
+	return e.store.Append(events...)
 }
 
 // nextCounter returns the counter value for the next event

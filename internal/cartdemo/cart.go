@@ -50,7 +50,7 @@ func (c *Cart) Apply(event monotonic.Event) {
 	}
 }
 
-func (c *Cart) Validate(event monotonic.Event) error {
+func (c *Cart) Accept(event monotonic.Event) error {
 	switch event.Type {
 	case "item-added":
 		return nil

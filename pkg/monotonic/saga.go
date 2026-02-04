@@ -7,25 +7,18 @@ import (
 	"time"
 )
 
-// ActionFunc executes work for a saga state.
-// It receives the saga (for refs and current state) and store (to load aggregates).
-//
-// Return combinations:
-//   - (*ActionResult, nil) with Close=false → normal transition, continue stepping
-//   - (*ActionResult, nil) with Close=true  → close the saga (no other fields allowed)
-//   - (nil, err) → transient error, retry later
-//
-// When Close=true, NewState, Events, and Delay must be empty - the close
-// operation is its own atomic step with no other side effects.
-type ActionFunc func(ctx context.Context, saga *Saga, store Store) (*ActionResult, error)
+// ActionFunc executes work for a saga state
+// It returns an ActionResult, describing the outcome of the action
+// The outcome may be a state transition to a new state, or signalling to close the saga
+// Events can be returned to be appended atomically (all-or-nothing) with the saga state transition
+type ActionFunc func(ctx context.Context, saga *Saga, store Store) (ActionResult, error)
 
-// ActionMap maps state names to their action functions
 type ActionMap map[string]ActionFunc
 
 // ActionResult represents the outcome of a saga action
 type ActionResult struct {
 	// NewState is the state to transition to
-	// Must be empty if `Close` is true
+	// Must be blank if `Close` is true
 	NewState string
 
 	// Events are events to append to other aggregates atomically
@@ -44,8 +37,8 @@ type ActionResult struct {
 
 // sagaStartedPayload is stored in the saga-started event
 type sagaStartedPayload struct {
-	InitialState string                 `json:"initial_state"`
-	Refs         map[string]AggregateID `json:"refs"`
+	InitialState string          `json:"initial_state"`
+	Input        json.RawMessage `json:"input"`
 }
 
 // stateTransitionPayload is stored in state-transitioned events
@@ -61,10 +54,19 @@ type stateTransitionPayload struct {
 type Saga struct {
 	eventStream
 
-	State   string
-	Refs    map[string]AggregateID // named references to aggregates
-	ReadyAt time.Time              // earliest time the next step can run
-	Closed  bool                   // whether the saga is closed
+	// State is the current state of the saga
+	state string
+
+	// Input is a blob of initial data provided when starting the saga
+	// It does not change over the lifetime of the saga
+	// Used to store any data needed to drive the saga that doesn't belong in aggregate state, such as the identifiers for relevant aggregates themselves
+	input json.RawMessage
+
+	// ReadyAt is the earliest time the next step may run
+	readyAt time.Time
+
+	// Closed indicates whether the saga is closed
+	closed bool
 
 	actions ActionMap
 }
@@ -77,7 +79,7 @@ func NewSaga(
 	store Store,
 	sagaType, id string,
 	initialState string,
-	refs map[string]AggregateID,
+	input json.RawMessage,
 	actions ActionMap,
 ) (*Saga, error) {
 	saga := &Saga{
@@ -85,26 +87,30 @@ func NewSaga(
 			ID:    NewAggregateID(sagaType, id),
 			store: store,
 		},
-		State:   initialState,
-		Refs:    refs,
-		ReadyAt: time.Now(),
+		state:   initialState,
+		input:   input,
+		readyAt: time.Now(),
 		actions: actions,
 	}
 
 	// Persist the initial event
 	payload, _ := json.Marshal(sagaStartedPayload{
 		InitialState: initialState,
-		Refs:         refs,
+		Input:        input,
 	})
 
-	event := Event{
-		Type:       "saga-started",
-		Counter:    1,
-		AcceptedAt: time.Now(),
-		Payload:    payload,
+	event := AggregateEvent{
+		AggregateType: sagaType,
+		AggregateID:   id,
+		Event: Event{
+			Type:       "saga-started",
+			Counter:    1,
+			AcceptedAt: time.Now(),
+			Payload:    payload,
+		},
 	}
 
-	if err := store.Append(sagaType, id, event); err != nil {
+	if err := store.Append(event); err != nil {
 		return nil, fmt.Errorf("persist saga start: %w", err)
 	}
 	saga.counter = 1
@@ -139,43 +145,55 @@ func LoadSaga(store Store, sagaType, id string, actions ActionMap) (*Saga, error
 	return saga, nil
 }
 
+// Input returns the saga input data
+// Copied to prevent external modification
+func (s *Saga) Input() json.RawMessage {
+	var copyTo = make([]byte, len(s.input))
+	copy(copyTo, s.input)
+	return copyTo
+}
+
+func (s *Saga) State() string {
+	return s.state
+}
+
+func (s *Saga) Closed() bool {
+	return s.closed
+}
+
 func (s *Saga) apply(event Event) {
 	switch event.Type {
 	case "saga-started":
 		var payload sagaStartedPayload
 		json.Unmarshal(event.Payload, &payload)
-		s.State = payload.InitialState
-		s.Refs = payload.Refs
-		s.ReadyAt = event.AcceptedAt
+		s.state = payload.InitialState
+		s.input = payload.Input
+		s.readyAt = event.AcceptedAt
 
 	case "state-transitioned":
 		var payload stateTransitionPayload
 		json.Unmarshal(event.Payload, &payload)
-		s.State = payload.ToState
+		s.state = payload.ToState
 		if !payload.ReadyAt.IsZero() {
-			s.ReadyAt = payload.ReadyAt
+			s.readyAt = payload.ReadyAt
 		} else {
-			s.ReadyAt = event.AcceptedAt
+			s.readyAt = event.AcceptedAt
 		}
 
 	case "saga-closed":
-		s.Closed = true
+		s.closed = true
 	}
 }
 
 // IsReady returns true if the saga is ready to step (not delayed)
 func (s *Saga) IsReady() bool {
-	return time.Now().After(s.ReadyAt) || time.Now().Equal(s.ReadyAt)
+	return time.Now().After(s.readyAt) || time.Now().Equal(s.readyAt)
 }
 
-// Step executes the action for the current state.
-// Returns nil without doing anything if:
-//   - The saga is closed
-//   - The saga is delayed (ReadyAt is in the future)
-//   - No action is defined for the current state
+// Step executes an action for the current state, hopefully transitioning the saga into a new state
 func (s *Saga) Step(ctx context.Context) error {
 	// Check if already closed
-	if s.Closed {
+	if s.closed {
 		return nil
 	}
 
@@ -190,58 +208,64 @@ func (s *Saga) Step(ctx context.Context) error {
 	}
 
 	// Check again after catch-up (might have been closed by another process)
-	if s.Closed {
+	if s.closed {
 		return nil
 	}
 
 	// Get the action for current state
-	action, exists := s.actions[s.State]
+	action, exists := s.actions[s.state]
 	if !exists {
-		return nil // no action for this state, nothing to do
+		return fmt.Errorf("no action defined for saga state %q", s.state)
 	}
 
 	// Execute the action
 	result, actionErr := action(ctx, s, s.store)
-
-	// Handle transient errors
 	if actionErr != nil {
-		return actionErr
+		return fmt.Errorf("action: %w", actionErr)
 	}
 
-	// If no result, nothing to do
-	if result == nil {
-		return nil
-	}
-
-	// Handle close request
+	// Saga should be closed as a result of this action
 	if result.Close {
-		// Validate invariant: Close=true cannot have other fields set
 		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
 		return s.closeSaga()
 	}
 
-	// Handle state transition
-	return s.transition(result)
+	if result.NewState == "" {
+		return fmt.Errorf("action result new state is empty")
+	}
+
+	if result.Delay < 0 {
+		return fmt.Errorf("action result delay cannot be negative")
+	}
+
+	if err := s.transition(result); err != nil {
+		return fmt.Errorf("transition: %w", err)
+	}
+
+	return nil
 }
 
 // closeSaga appends a saga-closed event and marks the saga as closed in the store
 func (s *Saga) closeSaga() error {
-	closeEvent := Event{
-		Type:       "saga-closed",
-		Counter:    s.nextCounter(),
-		AcceptedAt: time.Now(),
+	closeEvent := AggregateEvent{
+		AggregateType: s.ID.Type,
+		AggregateID:   s.ID.ID,
+		Event: Event{
+			Type:       "saga-closed",
+			Counter:    s.nextCounter(),
+			AcceptedAt: time.Now(),
+		},
 	}
 
 	if err := s.append(closeEvent); err != nil {
 		return fmt.Errorf("saga close event: %w", err)
 	}
 
-	s.apply(closeEvent)
-	s.applied(closeEvent)
+	s.apply(closeEvent.Event)
+	s.applied(closeEvent.Event)
 
-	// Mark closed in store (for ListAggregates filtering)
 	if err := s.store.Close(s.ID.Type, s.ID.ID); err != nil {
 		return fmt.Errorf("saga store close: %w", err)
 	}
@@ -250,7 +274,7 @@ func (s *Saga) closeSaga() error {
 }
 
 // transition appends a state transition event and any extra events atomically
-func (s *Saga) transition(result *ActionResult) error {
+func (s *Saga) transition(result ActionResult) error {
 	// Calculate ready time for delayed transitions
 	readyAt := time.Now()
 	if result.Delay > 0 {
@@ -270,14 +294,12 @@ func (s *Saga) transition(result *ActionResult) error {
 		Payload:    payload,
 	}
 
-	// Combine with extra events
+	// Merge the saga state transition event with the other aggregate events
 	allEvents := []AggregateEvent{
 		{AggregateType: s.ID.Type, AggregateID: s.ID.ID, Event: sagaEvent},
 	}
 	allEvents = append(allEvents, result.Events...)
-
-	// Append atomically
-	if err := s.appendMulti(allEvents); err != nil {
+	if err := s.append(allEvents...); err != nil {
 		return fmt.Errorf("saga transition: %w", err)
 	}
 
@@ -297,7 +319,7 @@ func (s *Saga) Run(ctx context.Context) error {
 		}
 
 		// Check if closed
-		if s.Closed {
+		if s.closed {
 			return nil
 		}
 
@@ -307,7 +329,7 @@ func (s *Saga) Run(ctx context.Context) error {
 		}
 
 		// Check if we have an action for current state
-		if _, exists := s.actions[s.State]; !exists {
+		if _, exists := s.actions[s.state]; !exists {
 			return nil // no action, nothing to do
 		}
 
@@ -316,4 +338,3 @@ func (s *Saga) Run(ctx context.Context) error {
 		}
 	}
 }
-

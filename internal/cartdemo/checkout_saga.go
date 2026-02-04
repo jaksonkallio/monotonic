@@ -32,14 +32,17 @@ func CheckoutActions() monotonic.ActionMap {
 
 // StartCheckoutSaga creates a new checkout saga for a cart
 func StartCheckoutSaga(ctx context.Context, store monotonic.Store, sagaID string, cartID string) (*monotonic.Saga, error) {
+	input, err := json.Marshal(checkoutSagaInput{CartID: cartID})
+	if err != nil {
+		return nil, err
+	}
+
 	return monotonic.NewSaga(
 		store,
 		"checkout-saga",
 		sagaID,
 		CheckoutStarted,
-		map[string]monotonic.AggregateID{
-			"cart": monotonic.NewAggregateID("cart", cartID),
-		},
+		input,
 		CheckoutActions(),
 	)
 }
@@ -49,29 +52,42 @@ func LoadCheckoutSaga(store monotonic.Store, sagaID string) (*monotonic.Saga, er
 	return monotonic.LoadSaga(store, "checkout-saga", sagaID, CheckoutActions())
 }
 
-func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
+type checkoutSagaInput struct {
+	CartID string `json:"cart_id"`
+}
+
+func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
 	// Load the cart and prepare checkout-started event
-	cart, err := LoadCart(store, saga.Refs["cart"].ID)
-	if err != nil {
-		return nil, err
+	var input checkoutSagaInput
+	if err := json.Unmarshal(saga.Input(), &input); err != nil {
+		return monotonic.ActionResult{}, err
 	}
 
+	cart, err := LoadCart(store, input.CartID)
+	if err != nil {
+		return monotonic.ActionResult{}, err
+	}
 	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "checkout-started"})
 	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{}, err
 	}
 
-	return &monotonic.ActionResult{
+	return monotonic.ActionResult{
 		NewState: CheckoutReservingStock,
 		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
-func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-	// Load cart to get items
-	cart, err := LoadCart(store, saga.Refs["cart"].ID)
+func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+	var input checkoutSagaInput
+	if err := json.Unmarshal(saga.Input(), &input); err != nil {
+		return monotonic.ActionResult{}, err
+	}
+
+	// Load the cart
+	cart, err := LoadCart(store, input.CartID)
 	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{}, err
 	}
 
 	// Each item is a separate stock aggregate, so each gets counter=1
@@ -95,16 +111,23 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monot
 		})
 	}
 
-	return &monotonic.ActionResult{
+	return monotonic.ActionResult{
 		NewState: CheckoutCreatingToken,
 		Events:   events,
 	}, nil
 }
 
-func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, saga.Refs["cart"].ID)
+func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+	// Unmarshal saga input
+	var input checkoutSagaInput
+	if err := json.Unmarshal(saga.Input(), &input); err != nil {
+		return monotonic.ActionResult{}, err
+	}
+
+	// Load the cart
+	cart, err := LoadCart(store, input.CartID)
 	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{}, err
 	}
 
 	// Generate a payment token (in real code, this might call a payment service)
@@ -117,16 +140,28 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 		Payload: payload,
 	})
 	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{}, err
 	}
 
-	return &monotonic.ActionResult{
+	return monotonic.ActionResult{
 		NewState: CheckoutChargingPayment,
 		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
-func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
+func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
+	// Unmarshal saga input
+	var input checkoutSagaInput
+	if err := json.Unmarshal(saga.Input(), &input); err != nil {
+		return monotonic.ActionResult{}, err
+	}
+
+	// Load the cart
+	cart, err := LoadCart(store, input.CartID)
+	if err != nil {
+		return monotonic.ActionResult{}, err
+	}
+
 	// In real code:
 	// 1. Load cart to get payment token and total
 	// 2. Call external payment API with idempotency key
@@ -136,36 +171,30 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 	paymentSucceeded := true
 
 	if !paymentSucceeded {
-		return &monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
-	}
-
-	// Mark cart as paid
-	cart, err := LoadCart(store, saga.Refs["cart"].ID)
-	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
 	}
 
 	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "payment-charged"})
 	if err != nil {
-		return nil, err
+		return monotonic.ActionResult{}, err
 	}
 
 	// Transition to completed state (close happens in next step)
-	return &monotonic.ActionResult{
+	return monotonic.ActionResult{
 		NewState: CheckoutCompleted,
 		Events:   []monotonic.AggregateEvent{cartEvent},
 	}, nil
 }
 
-func checkoutPaymentFailed(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
+func checkoutPaymentFailed(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
 	// Retry payment after a delay
-	return &monotonic.ActionResult{
+	return monotonic.ActionResult{
 		NewState: CheckoutChargingPayment,
 		Delay:    1 * time.Minute,
 	}, nil
 }
 
-func checkoutComplete(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (*monotonic.ActionResult, error) {
+func checkoutComplete(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
 	// Close the saga - no other fields allowed
-	return &monotonic.ActionResult{Close: true}, nil
+	return monotonic.ActionResult{Close: true}, nil
 }
