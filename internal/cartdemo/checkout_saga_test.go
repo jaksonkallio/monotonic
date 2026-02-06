@@ -24,11 +24,15 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify initial state
-	if saga.State != CheckoutStarted {
-		t.Errorf("expected state %s, got %s", CheckoutStarted, saga.State)
+	if saga.State() != CheckoutStarted {
+		t.Errorf("expected state %s, got %s", CheckoutStarted, saga.State())
 	}
-	if saga.Refs["cart"].ID != "cart-123" {
-		t.Errorf("expected cart ref cart-123, got %s", saga.Refs["cart"].ID)
+	var sagaInput checkoutSagaInput
+	if err := saga.InputAs(&sagaInput); err != nil {
+		t.Fatalf("InputAs failed: %v", err)
+	}
+	if sagaInput.CartID != "cart-123" {
+		t.Errorf("expected cart ID cart-123, got %s", sagaInput.CartID)
 	}
 
 	// Step 1: started -> reserving_stock
@@ -36,8 +40,8 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 1 failed: %v", err)
 	}
-	if saga.State != CheckoutReservingStock {
-		t.Errorf("expected state %s, got %s", CheckoutReservingStock, saga.State)
+	if saga.State() != CheckoutReservingStock {
+		t.Errorf("expected state %s, got %s", CheckoutReservingStock, saga.State())
 	}
 
 	// Verify cart checkout-started event was created
@@ -51,8 +55,8 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 2 failed: %v", err)
 	}
-	if saga.State != CheckoutCreatingToken {
-		t.Errorf("expected state %s, got %s", CheckoutCreatingToken, saga.State)
+	if saga.State() != CheckoutCreatingToken {
+		t.Errorf("expected state %s, got %s", CheckoutCreatingToken, saga.State())
 	}
 
 	// Verify stock reservation events
@@ -70,8 +74,8 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 3 failed: %v", err)
 	}
-	if saga.State != CheckoutChargingPayment {
-		t.Errorf("expected state %s, got %s", CheckoutChargingPayment, saga.State)
+	if saga.State() != CheckoutChargingPayment {
+		t.Errorf("expected state %s, got %s", CheckoutChargingPayment, saga.State())
 	}
 
 	// Step 4: charging_payment -> completed
@@ -79,8 +83,8 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 4 failed: %v", err)
 	}
-	if saga.State != CheckoutCompleted {
-		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State)
+	if saga.State() != CheckoutCompleted {
+		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State())
 	}
 
 	// Step 5: close the saga
@@ -88,7 +92,7 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 5 failed: %v", err)
 	}
-	if !saga.Closed {
+	if !saga.Closed() {
 		t.Error("expected saga to be closed")
 	}
 
@@ -97,8 +101,8 @@ func TestCheckoutSaga(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step 6 failed: %v", err)
 	}
-	if saga.State != CheckoutCompleted {
-		t.Errorf("expected state to remain %s, got %s", CheckoutCompleted, saga.State)
+	if saga.State() != CheckoutCompleted {
+		t.Errorf("expected state to remain %s, got %s", CheckoutCompleted, saga.State())
 	}
 
 	// Verify saga events
@@ -129,11 +133,15 @@ func TestCheckoutSagaHydration(t *testing.T) {
 	}
 
 	// Should have same state
-	if saga2.State != CheckoutCreatingToken {
-		t.Errorf("expected state %s, got %s", CheckoutCreatingToken, saga2.State)
+	if saga2.State() != CheckoutCreatingToken {
+		t.Errorf("expected state %s, got %s", CheckoutCreatingToken, saga2.State())
 	}
-	if saga2.Refs["cart"].ID != "cart-456" {
-		t.Errorf("expected cart ref cart-456, got %s", saga2.Refs["cart"].ID)
+	var sagaInput checkoutSagaInput
+	if err := saga.InputAs(&sagaInput); err != nil {
+		t.Fatalf("InputAs failed: %v", err)
+	}
+	if sagaInput.CartID != "cart-456" {
+		t.Errorf("expected cart ID cart-456, got %s", sagaInput.CartID)
 	}
 	if saga2.Counter() != saga.Counter() {
 		t.Errorf("expected counter %d, got %d", saga.Counter(), saga2.Counter())
@@ -144,8 +152,8 @@ func TestCheckoutSagaHydration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Step from hydrated saga failed: %v", err)
 	}
-	if saga2.State != CheckoutChargingPayment {
-		t.Errorf("expected state %s, got %s", CheckoutChargingPayment, saga2.State)
+	if saga2.State() != CheckoutChargingPayment {
+		t.Errorf("expected state %s, got %s", CheckoutChargingPayment, saga2.State())
 	}
 }
 
@@ -199,7 +207,7 @@ func TestSagaDelayedTransition(t *testing.T) {
 	// First step should transition to "waiting" with delay
 	saga.Step(ctx)
 	if saga.State() != "waiting" {
-		t.Errorf("expected state 'waiting', got %s", saga.State)
+		t.Errorf("expected state 'waiting', got %s", saga.State())
 	}
 
 	// Saga should not be ready yet

@@ -153,6 +153,10 @@ func (s *Saga) Input() json.RawMessage {
 	return copyTo
 }
 
+func (s *Saga) InputAs(v any) error {
+	return json.Unmarshal(s.input, v)
+}
+
 func (s *Saga) State() string {
 	return s.state
 }
