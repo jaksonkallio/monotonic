@@ -5,10 +5,10 @@ import "fmt"
 // Store is the interface for event persistence
 type Store interface {
 	// Load returns all events for an aggregate in order
-	Load(aggregateType, aggregateID string) ([]Event, error)
+	Load(aggregateType, aggregateID string) ([]AcceptedEvent, error)
 
 	// LoadAfter returns events with counter > afterCounter
-	LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]Event, error)
+	LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
 
 	// Append adds new event(s) to the aggregate's event history atomically
 	// Either all events are appended at once or none are
@@ -33,15 +33,8 @@ type Store interface {
 // ErrAggregateClosed is returned when attempting to append to a closed aggregate
 var ErrAggregateClosed = fmt.Errorf("aggregate is closed")
 
-// AggregateEvent pairs an event with its target aggregate
-type AggregateEvent struct {
-	AggregateType string
-	AggregateID   string
-	Event         Event
-}
-
 type inMemoryStoredAggregate struct {
-	events []Event
+	events []AcceptedEvent
 	closed bool
 }
 
@@ -57,7 +50,7 @@ func NewInMemoryStore() *InMemoryStore {
 	}
 }
 
-func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]Event, error) {
+func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]AcceptedEvent, error) {
 	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
@@ -66,7 +59,7 @@ func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]Event, error)
 	return agg.events, nil
 }
 
-func (s *InMemoryStore) LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]Event, error) {
+func (s *InMemoryStore) LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
 	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {

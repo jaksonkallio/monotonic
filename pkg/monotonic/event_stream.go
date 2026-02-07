@@ -24,7 +24,7 @@ func (e *eventStream) catchUp(apply func(Event)) error {
 	}
 
 	for _, event := range events {
-		apply(event)
+		apply(event.Event)
 		e.counter = event.Counter
 	}
 
@@ -42,6 +42,6 @@ func (e *eventStream) nextCounter() int64 {
 }
 
 // applied marks an event as applied by updating the counter
-func (e *eventStream) applied(event Event) {
+func (e *eventStream) applied(event AcceptedEvent) {
 	e.counter = event.Counter
 }

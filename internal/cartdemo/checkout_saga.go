@@ -67,7 +67,7 @@ func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.St
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
-	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "checkout-started"})
+	cartEvent, err := cart.Accept(monotonic.Event{Type: "checkout-started"})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -135,7 +135,7 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 
 	// Store the token on the cart
 	payload, _ := json.Marshal(map[string]string{"token": token})
-	cartEvent, err := cart.PrepareEvent(monotonic.Event{
+	cartEvent, err := cart.Accept(monotonic.Event{
 		Type:    "payment-token-set",
 		Payload: payload,
 	})
@@ -174,7 +174,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 		return monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
 	}
 
-	cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "payment-charged"})
+	cartEvent, err := cart.Accept(monotonic.Event{Type: "payment-charged"})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}

@@ -1,6 +1,9 @@
 package monotonic
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 type AggregateID struct {
 	Type string
@@ -29,49 +32,62 @@ type AggregateBase struct {
 	self Logic
 }
 
-// Record validates and persists an event, then applies it to state
-// Before validating, it catches up on any events that may have been appended by other processes since we last loaded
-// This minimizes (but doesn't eliminate) optimistic concurrency conflicts
-func (b *AggregateBase) Record(event Event) error {
-	preparedEventAggregate, err := b.PrepareEvent(event)
+// AcceptThenApply applies the event to the aggregate after it has been accepted, effectively recording the event and updating the state in one step.
+func (b *AggregateBase) AcceptThenApply(events ...Event) error {
+	if len(events) == 0 {
+		// No-op
+		return nil
+	}
+
+	acceptedEvents, err := b.Accept(events...)
 	if err != nil {
-		return err
+		return fmt.Errorf("accept: %w", err)
 	}
 
-	if err := b.append(preparedEventAggregate); err != nil {
-		return err
-	}
+	for _, acceptedEvent := range acceptedEvents {
+		if err := b.append(AggregateEvent{
+			Event:         acceptedEvent,
+			AggregateType: b.ID.Type,
+			AggregateID:   b.ID.ID,
+		}); err != nil {
+			return err
+		}
 
-	b.self.Apply(preparedEventAggregate.Event)
-	b.applied(preparedEventAggregate.Event)
+		b.self.Apply(acceptedEvent.Event)
+		b.applied(acceptedEvent)
+	}
 
 	return nil
 }
 
-// PrepareEvent accepts an event and prepares it for atomic commit
-// This catches up on missed events, accepts, and sets the counter and timestamp
-// The event is NOT appended or applied yet
-//
-// Use this when you need to prepare events for multiple aggregates to be committed atomically
-// The returned AggregateEvent can be passed to Store.AppendMulti() or Store.Append
-func (b *AggregateBase) PrepareEvent(event Event) (AggregateEvent, error) {
-	// Catch up on any events we may have missed
+// Accept accepts events without applying yet
+// Use when you need to prepare events for multiple aggregates to be committed atomically, such as in a saga
+func (b *AggregateBase) Accept(events ...Event) ([]AcceptedEvent, error) {
+	if len(events) == 0 {
+		// No-op
+		return nil, nil
+	}
+
 	if err := b.catchUp(b.self.Apply); err != nil {
-		return AggregateEvent{}, err
+		return nil, err
 	}
 
-	if err := b.self.Accept(event); err != nil {
-		return AggregateEvent{}, err
+	// Capture the counter, all accepted events will be an incremental sequence from this value
+	acceptMultiCounter := b.nextCounter()
+
+	acceptedEvents := make([]AcceptedEvent, len(events))
+	for i, event := range events {
+		if err := b.self.Accept(event); err != nil {
+			return nil, fmt.Errorf("event %d: %w", i, err)
+		}
+		acceptedEvents[i] = AcceptedEvent{
+			Event:      event,
+			AcceptedAt: time.Now(),
+			Counter:    acceptMultiCounter + int64(i),
+		}
 	}
 
-	event.Counter = b.nextCounter()
-	event.AcceptedAt = time.Now()
-
-	return AggregateEvent{
-		AggregateType: b.ID.Type,
-		AggregateID:   b.ID.ID,
-		Event:         event,
-	}, nil
+	return acceptedEvents, nil
 }
 
 // Hydrate loads an aggregate from the store by replaying all events.
@@ -93,7 +109,7 @@ func Hydrate[T Logic](store Store, aggType, id string, init func(*AggregateBase)
 	base.self = agg
 
 	for _, e := range events {
-		agg.Apply(e)
+		agg.Apply(e.Event)
 		base.applied(e)
 	}
 

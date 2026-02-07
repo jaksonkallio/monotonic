@@ -335,9 +335,9 @@ func startCheckout(ctx context.Context, saga *monotonic.Saga, store monotonic.St
     }
 
     // Prepare an event for the cart aggregate
-    // PrepareEvent catches up the aggregate, validates,
+    // Accept catches up the aggregate, validates,
     // and assigns the next counter - but doesn't append or apply yet
-    cartEvent, err := cart.PrepareEvent(monotonic.Event{Type: "checkout-started"})
+    cartEvent, err := cart.Accept(monotonic.Event{Type: "checkout-started"})
     if err != nil {
         return nil, err
     }

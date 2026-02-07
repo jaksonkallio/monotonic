@@ -14,8 +14,8 @@ func TestCheckoutSaga(t *testing.T) {
 
 	// First, create a cart with items
 	cart, _ := LoadCart(store, "cart-123")
-	cart.Record(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"widget"}`)})
-	cart.Record(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"gadget"}`)})
+	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"widget"}`)})
+	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"gadget"}`)})
 
 	// Start a checkout saga for this cart
 	saga, err := StartCheckoutSaga(ctx, store, "checkout-1", "cart-123")
@@ -119,7 +119,7 @@ func TestCheckoutSagaHydration(t *testing.T) {
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-456")
-	cart.Record(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"thing"}`)})
+	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"thing"}`)})
 
 	// Start and run saga partway
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-2", "cart-456")
@@ -163,7 +163,7 @@ func TestCheckoutSagaRun(t *testing.T) {
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-789")
-	cart.Record(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"item"}`)})
+	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"item"}`)})
 
 	// Start saga and run to completion
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-3", "cart-789")
