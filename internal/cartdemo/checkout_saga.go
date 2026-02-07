@@ -31,7 +31,7 @@ func CheckoutActions() monotonic.ActionMap {
 }
 
 // StartCheckoutSaga creates a new checkout saga for a cart
-func StartCheckoutSaga(ctx context.Context, store monotonic.Store, sagaID string, cartID string) (*monotonic.Saga, error) {
+func StartCheckoutSaga(ctx context.Context, store monotonic.SagaStore, sagaID string, cartID string) (*monotonic.Saga, error) {
 	input, err := json.Marshal(checkoutSagaInput{CartID: cartID})
 	if err != nil {
 		return nil, err
@@ -48,7 +48,7 @@ func StartCheckoutSaga(ctx context.Context, store monotonic.Store, sagaID string
 }
 
 // LoadCheckoutSaga loads an existing checkout saga
-func LoadCheckoutSaga(store monotonic.Store, sagaID string) (*monotonic.Saga, error) {
+func LoadCheckoutSaga(store monotonic.SagaStore, sagaID string) (*monotonic.Saga, error) {
 	return monotonic.LoadSaga(store, "checkout-saga", sagaID, CheckoutActions())
 }
 
@@ -209,6 +209,6 @@ func checkoutPaymentFailed(ctx context.Context, saga *monotonic.Saga, store mono
 }
 
 func checkoutComplete(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
-	// Close the saga - no other fields allowed
-	return monotonic.ActionResult{Close: true}, nil
+	// Close the saga, no other fields allowed
+	return monotonic.ActionResult{Complete: true}, nil
 }

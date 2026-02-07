@@ -12,7 +12,7 @@ import (
 // Optimistic concurrency ensures only one driver succeeds per saga step
 // Either run the saga driver in a dedicated process (medium/large scales) or as a part of a monolithic service process (small/medium scales)
 type SagaDriver struct {
-	store    Store
+	store    SagaStore
 	sagaType string
 	actions  ActionMap
 	interval time.Duration
@@ -20,8 +20,8 @@ type SagaDriver struct {
 
 // SagaDriverConfig configures a SagaDriver
 type SagaDriverConfig struct {
-	// Store is the event store
-	Store Store
+	// Store is the saga store
+	Store SagaStore
 
 	// SagaType is the aggregate type for sagas to drive
 	SagaType string
@@ -69,9 +69,9 @@ func (d *SagaDriver) Run(ctx context.Context) error {
 // StepAll steps all sagas of the configured type once
 // Normally called repeatedly in `Run`, but also useful for testing purposes
 func (d *SagaDriver) StepAll(ctx context.Context) error {
-	ids, err := d.store.ListAggregates(d.sagaType)
+	ids, err := d.store.ListActiveSagas(d.sagaType)
 	if err != nil {
-		return fmt.Errorf("list aggregates: %w", err)
+		return fmt.Errorf("list active sagas: %w", err)
 	}
 
 	for _, id := range ids {
@@ -97,10 +97,10 @@ func (d *SagaDriver) stepSaga(ctx context.Context, id string) error {
 
 	// Handle crash recovery: if saga events show closed but store doesn't know,
 	// sync the store. This handles the case where we crashed between appending
-	// the saga-closed event and calling store.Close().
-	if saga.Closed() {
-		if err := d.store.Close(d.sagaType, id); err != nil {
-			return fmt.Errorf("close saga in store: %w", err)
+	// the saga-completed event and calling MarkSagaCompleted.
+	if saga.Completed() {
+		if err := d.store.MarkSagaCompleted(d.sagaType, id); err != nil {
+			return fmt.Errorf("mark saga completed: %w", err)
 		}
 		return nil
 	}

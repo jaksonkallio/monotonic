@@ -31,7 +31,7 @@ func TestSagaDriver(t *testing.T) {
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			atomic.AddInt32(&completedCalls, 1)
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -101,7 +101,7 @@ func TestSagaDriver(t *testing.T) {
 		if saga.state != "completed" {
 			t.Errorf("expected state 'completed', got %s", saga.state)
 		}
-		if !saga.closed {
+		if !saga.completed {
 			t.Error("expected saga to be closed")
 		}
 	}
@@ -117,7 +117,7 @@ func TestSagaDriverRun(t *testing.T) {
 			return ActionResult{NewState: "completed"}, nil
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -168,7 +168,7 @@ func TestSagaDriverRespectsDelay(t *testing.T) {
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			atomic.AddInt32(&calls, 1)
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -211,14 +211,14 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 			return ActionResult{NewState: "completed"}, nil
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Close: true}, nil // explicit close
+			return ActionResult{Complete: true}, nil // explicit close
 		},
 	}
 
 	saga, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
 
 	// Verify saga is listed
-	ids, _ := store.ListAggregates("test-saga")
+	ids, _ := store.ListActiveSagas("test-saga")
 	if len(ids) != 1 {
 		t.Errorf("expected 1 saga, got %d", len(ids))
 	}
@@ -233,7 +233,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 		t.Errorf("expected state 'completed', got %s", saga.state)
 	}
 
-	if saga.closed {
+	if saga.completed {
 		t.Error("saga should not be closed yet")
 	}
 
@@ -243,18 +243,18 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 		t.Fatalf("Step 2 failed: %v", err)
 	}
 
-	if !saga.closed {
-		t.Error("expected saga.Closed to be true")
+	if !saga.completed {
+		t.Error("expected saga.completed to be true")
 	}
 
 	// Saga should now be closed in store
-	closed, _ := store.IsClosed("test-saga", "saga-1")
-	if !closed {
-		t.Error("expected saga to be closed in store")
+	completed, _ := store.IsSagaCompleted("test-saga", "saga-1")
+	if !completed {
+		t.Error("expected saga to be completed in store")
 	}
 
-	// ListAggregates should not return closed sagas
-	ids, _ = store.ListAggregates("test-saga")
+	// ListAggregates should not return completed sagas
+	ids, _ = store.ListActiveSagas("test-saga")
 	if len(ids) != 0 {
 		t.Errorf("expected 0 sagas after closing, got %d", len(ids))
 	}
@@ -267,7 +267,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 	if loadedSaga.state != "completed" {
 		t.Errorf("expected loaded saga state 'completed', got %s", loadedSaga.state)
 	}
-	if !loadedSaga.closed {
+	if !loadedSaga.completed {
 		t.Error("expected loaded saga to be closed")
 	}
 
@@ -289,7 +289,7 @@ func TestSagaFailureThenClose(t *testing.T) {
 		},
 		"failed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			// Close the saga from failed state
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -311,7 +311,7 @@ func TestSagaFailureThenClose(t *testing.T) {
 		t.Fatalf("Step 2 failed: %v", err)
 	}
 
-	if !saga.closed {
+	if !saga.completed {
 		t.Error("expected saga to be closed")
 	}
 
@@ -320,7 +320,7 @@ func TestSagaFailureThenClose(t *testing.T) {
 	if loadedSaga.state != "failed" {
 		t.Errorf("expected loaded saga state 'failed', got %s", loadedSaga.state)
 	}
-	if !loadedSaga.closed {
+	if !loadedSaga.completed {
 		t.Error("expected loaded saga to be closed")
 	}
 }
@@ -341,7 +341,7 @@ func TestSagaTransientError(t *testing.T) {
 			return ActionResult{NewState: "completed"}, nil
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -376,7 +376,7 @@ func TestSagaTransientError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected success, got error: %v", err)
 	}
-	if !saga.closed {
+	if !saga.completed {
 		t.Error("expected saga to be closed")
 	}
 }
@@ -387,29 +387,29 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 
 	actions := ActionMap{
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 
-	// Create saga and manually append saga-closed event WITHOUT calling store.Close
+	// Create saga and manually append saga-completed event WITHOUT calling store.Close
 	// (simulating a crash after event append but before store.Close)
 	saga, _ := NewSaga(store, "test-saga", "saga-1", "completed", nil, actions)
 
-	// Manually append saga-closed event (bypassing saga.Step's store.Close call)
+	// Manually append saga-completed event (bypassing saga.Step's store.Close call)
 	closeEvent := AcceptedEvent{
-		Event:   Event{Type: "saga-closed"},
+		Event:   Event{Type: "saga-completed"},
 		Counter: saga.Counter() + 1,
 	}
 	store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})
 
 	// Saga event says closed, but store doesn't know yet
-	closed, _ := store.IsClosed("test-saga", "saga-1")
+	closed, _ := store.IsSagaCompleted("test-saga", "saga-1")
 	if closed {
 		t.Error("store should not know saga is closed yet (simulating crash)")
 	}
 
 	// ListAggregates still returns it
-	ids, _ := store.ListAggregates("test-saga")
+	ids, _ := store.ListActiveSagas("test-saga")
 	if len(ids) != 1 {
 		t.Errorf("expected 1 saga before driver recovery, got %d", len(ids))
 	}
@@ -424,13 +424,13 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 	driver.StepAll(ctx)
 
 	// Now saga should be closed in store
-	closed, _ = store.IsClosed("test-saga", "saga-1")
+	closed, _ = store.IsSagaCompleted("test-saga", "saga-1")
 	if !closed {
 		t.Error("expected driver to close saga in store")
 	}
 
 	// ListAggregates should no longer return it
-	ids, _ = store.ListAggregates("test-saga")
+	ids, _ = store.ListActiveSagas("test-saga")
 	if len(ids) != 0 {
 		t.Errorf("expected 0 sagas after driver recovery, got %d", len(ids))
 	}
@@ -447,7 +447,7 @@ func TestMultipleDriversConcurrency(t *testing.T) {
 		},
 		"completed": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			atomic.AddInt32(&calls, 1)
-			return ActionResult{Close: true}, nil
+			return ActionResult{Complete: true}, nil
 		},
 	}
 

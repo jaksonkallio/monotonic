@@ -87,12 +87,12 @@ func TestCheckoutSaga(t *testing.T) {
 		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State())
 	}
 
-	// Step 5: close the saga
+	// Step 5: complete the saga
 	err = saga.Step(ctx)
 	if err != nil {
 		t.Fatalf("Step 5 failed: %v", err)
 	}
-	if !saga.Closed() {
+	if !saga.Completed() {
 		t.Error("expected saga to be closed")
 	}
 
@@ -177,7 +177,7 @@ func TestCheckoutSagaRun(t *testing.T) {
 		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State())
 	}
 
-	if !saga.Closed() {
+	if !saga.Completed() {
 		t.Error("expected saga to be closed")
 	}
 }
@@ -198,7 +198,7 @@ func TestSagaDelayedTransition(t *testing.T) {
 			return monotonic.ActionResult{NewState: "done"}, nil
 		},
 		"done": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
-			return monotonic.ActionResult{Close: true}, nil
+			return monotonic.ActionResult{Complete: true}, nil
 		},
 	}
 
@@ -237,7 +237,7 @@ func TestSagaDelayedTransition(t *testing.T) {
 
 	// Step again to close
 	saga.Step(ctx)
-	if !saga.Closed() {
-		t.Error("expected saga to be closed")
+	if !saga.Completed() {
+		t.Error("expected saga to be completed")
 	}
 }

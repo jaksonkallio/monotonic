@@ -18,20 +18,20 @@ type ActionMap map[string]ActionFunc
 // ActionResult represents the outcome of a saga action
 type ActionResult struct {
 	// NewState is the state to transition to
-	// Must be blank if `Close` is true
+	// Must be blank if `Complete` is true
 	NewState string
 
 	// Events are events to append to other aggregates atomically
-	// Must be empty if `Close` is true
+	// Must be empty if `Complete` is true
 	Events []AggregateEvent
 
-	// Close indicates the saga should be closed
-	// Typical pattern: transition to some "completed" state, then have "completed" action return `Close` as true
-	// When true, other fields must be empty because closing implies that no other subsequent transitions or actions can occur
-	Close bool
+	// Complete indicates the saga should be completed
+	// Typical pattern: transition to some "completed" state, then have "completed" action return `Complete` as true
+	// When true, other fields must be empty because completing implies that no other subsequent transitions or actions can occur
+	Complete bool
 
 	// Delay before the next step can run
-	// Must be zero if `Close` is true
+	// Must be zero if `Complete` is true
 	Delay time.Duration
 }
 
@@ -53,6 +53,7 @@ type stateTransitionPayload struct {
 // all actual data lives in the aggregates themselves.
 type Saga struct {
 	eventStream
+	sagaStore SagaStore
 
 	// State is the current state of the saga
 	state string
@@ -65,8 +66,8 @@ type Saga struct {
 	// ReadyAt is the earliest time the next step may run
 	readyAt time.Time
 
-	// Closed indicates whether the saga is closed
-	closed bool
+	// Completed indicates whether the saga is completed
+	completed bool
 
 	actions ActionMap
 }
@@ -76,7 +77,7 @@ var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have
 
 // NewSaga creates and persists a new saga.
 func NewSaga(
-	store Store,
+	store SagaStore,
 	sagaType, id string,
 	initialState string,
 	input json.RawMessage,
@@ -87,10 +88,11 @@ func NewSaga(
 			ID:    NewAggregateID(sagaType, id),
 			store: store,
 		},
-		state:   initialState,
-		input:   input,
-		readyAt: time.Now(),
-		actions: actions,
+		sagaStore: store,
+		state:     initialState,
+		input:     input,
+		readyAt:   time.Now(),
+		actions:   actions,
 	}
 
 	// Persist the initial event
@@ -121,7 +123,7 @@ func NewSaga(
 }
 
 // LoadSaga hydrates a saga from the store.
-func LoadSaga(store Store, sagaType, id string, actions ActionMap) (*Saga, error) {
+func LoadSaga(store SagaStore, sagaType, id string, actions ActionMap) (*Saga, error) {
 	events, err := store.Load(sagaType, id)
 	if err != nil {
 		return nil, err
@@ -136,7 +138,8 @@ func LoadSaga(store Store, sagaType, id string, actions ActionMap) (*Saga, error
 			ID:    NewAggregateID(sagaType, id),
 			store: store,
 		},
-		actions: actions,
+		sagaStore: store,
+		actions:   actions,
 	}
 
 	for _, e := range events {
@@ -163,8 +166,8 @@ func (s *Saga) State() string {
 	return s.state
 }
 
-func (s *Saga) Closed() bool {
-	return s.closed
+func (s *Saga) Completed() bool {
+	return s.completed
 }
 
 func (s *Saga) apply(event AcceptedEvent) {
@@ -186,8 +189,8 @@ func (s *Saga) apply(event AcceptedEvent) {
 			s.readyAt = event.AcceptedAt
 		}
 
-	case "saga-closed":
-		s.closed = true
+	case "saga-completed":
+		s.completed = true
 	}
 }
 
@@ -199,7 +202,7 @@ func (s *Saga) IsReady() bool {
 // Step executes an action for the current state, hopefully transitioning the saga into a new state
 func (s *Saga) Step(ctx context.Context) error {
 	// Check if already closed
-	if s.closed {
+	if s.completed {
 		return nil
 	}
 
@@ -214,7 +217,7 @@ func (s *Saga) Step(ctx context.Context) error {
 	}
 
 	// Check again after catch-up (might have been closed by another process)
-	if s.closed {
+	if s.completed {
 		return nil
 	}
 
@@ -231,7 +234,7 @@ func (s *Saga) Step(ctx context.Context) error {
 	}
 
 	// Saga should be closed as a result of this action
-	if result.Close {
+	if result.Complete {
 		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
@@ -253,14 +256,14 @@ func (s *Saga) Step(ctx context.Context) error {
 	return nil
 }
 
-// closeSaga appends a saga-closed event and marks the saga as closed in the store
+// closeSaga appends a saga-completed event and marks the saga as closed in the store
 func (s *Saga) closeSaga() error {
 	closeEvent := AggregateEvent{
 		AggregateType: s.ID.Type,
 		AggregateID:   s.ID.ID,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type: "saga-closed",
+				Type: "saga-completed",
 			},
 			Counter:    s.nextCounter(),
 			AcceptedAt: time.Now(),
@@ -274,8 +277,8 @@ func (s *Saga) closeSaga() error {
 	s.apply(closeEvent.Event)
 	s.applied(closeEvent.Event)
 
-	if err := s.store.Close(s.ID.Type, s.ID.ID); err != nil {
-		return fmt.Errorf("saga store close: %w", err)
+	if err := s.sagaStore.MarkSagaCompleted(s.ID.Type, s.ID.ID); err != nil {
+		return fmt.Errorf("mark saga completed: %w", err)
 	}
 
 	return nil
@@ -329,7 +332,7 @@ func (s *Saga) Run(ctx context.Context) error {
 		}
 
 		// Check if closed
-		if s.closed {
+		if s.completed {
 			return nil
 		}
 

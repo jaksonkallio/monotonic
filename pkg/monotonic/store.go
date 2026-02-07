@@ -12,30 +12,29 @@ type Store interface {
 
 	// Append adds new event(s) to the aggregate's event history atomically
 	// Either all events are appended at once or none are
-	// Returns an error if any event could not be appended (e.g. counter mismatch, aggregate closed)
+	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
 	Append(events ...AggregateEvent) error
-
-	// ListAggregates returns all non-closed aggregate IDs of a given type.
-	// Used by saga drivers to discover sagas that need to be stepped.
-	ListAggregates(aggregateType string) ([]string, error)
-
-	// Close marks an aggregate as closed. Closed aggregates:
-	// - Cannot have more events appended (Append/AppendMulti returns error)
-	// - Are excluded from ListAggregates results
-	// - Can still be loaded and read
-	// This is idempotent - closing an already-closed aggregate is not an error.
-	Close(aggregateType, aggregateID string) error
-
-	// IsClosed returns whether an aggregate is closed.
-	IsClosed(aggregateType, aggregateID string) (bool, error)
 }
 
-// ErrAggregateClosed is returned when attempting to append to a closed aggregate
-var ErrAggregateClosed = fmt.Errorf("aggregate is closed")
+// SagaStore extends Store with saga lifecycle operations
+type SagaStore interface {
+	Store
+
+	// ListActiveSagas returns all saga IDs of a given type that have not been marked completed
+	ListActiveSagas(sagaType string) ([]string, error)
+
+	// MarkSagaCompleted marks a saga as completed
+	// Completed sagas cannot have more events appended and are not returned by `ListActiveSagas`
+	// Idempotent, marking an already completed saga is a no-op
+	MarkSagaCompleted(sagaType, sagaID string) error
+}
+
+// ErrSagaCompleted is returned when attempting to append to a completed saga
+var ErrSagaCompleted = fmt.Errorf("saga is completed")
 
 type inMemoryStoredAggregate struct {
-	events []AcceptedEvent
-	closed bool
+	events    []AcceptedEvent
+	completed bool // only used for sagas
 }
 
 // InMemoryStore is an in-memory implementation of the Store interface,
@@ -79,8 +78,8 @@ func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
 
-		if agg != nil && agg.closed {
-			return fmt.Errorf("%w: %s/%s", ErrAggregateClosed, ae.AggregateType, ae.AggregateID)
+		if agg != nil && agg.completed {
+			return fmt.Errorf("%w: %s/%s", ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
 		}
 
 		var expectedCounter int64 = 1
@@ -110,32 +109,32 @@ func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 	return nil
 }
 
-func (s *InMemoryStore) ListAggregates(aggregateType string) ([]string, error) {
+func (s *InMemoryStore) ListActiveSagas(sagaType string) ([]string, error) {
 	var ids []string
 	for aggID, agg := range s.aggregates {
-		if aggID.Type == aggregateType && !agg.closed {
+		if aggID.Type == sagaType && !agg.completed {
 			ids = append(ids, aggID.ID)
 		}
 	}
 	return ids, nil
 }
 
-func (s *InMemoryStore) Close(aggregateType, aggregateID string) error {
-	id := NewAggregateID(aggregateType, aggregateID)
+func (s *InMemoryStore) MarkSagaCompleted(sagaType, sagaID string) error {
+	id := NewAggregateID(sagaType, sagaID)
 	agg, exists := s.aggregates[id]
 	if !exists {
-		// Nothing to close, but that's fine (idempotent)
+		// Nothing to complete, but that's fine (idempotent)
 		return nil
 	}
-	agg.closed = true
+	agg.completed = true
 	return nil
 }
 
-func (s *InMemoryStore) IsClosed(aggregateType, aggregateID string) (bool, error) {
-	id := NewAggregateID(aggregateType, aggregateID)
+func (s *InMemoryStore) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
+	id := NewAggregateID(sagaType, sagaID)
 	agg, exists := s.aggregates[id]
 	if !exists {
 		return false, nil
 	}
-	return agg.closed, nil
+	return agg.completed, nil
 }
