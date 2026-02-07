@@ -12,7 +12,13 @@ func TestCheckoutSaga(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	ctx := context.Background()
 
-	// First, create a cart with items
+	// First, set up stock for the items
+	widgetStock, _ := LoadStock(store, "widget")
+	widgetStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
+	gadgetStock, _ := LoadStock(store, "gadget")
+	gadgetStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":5}`)})
+
+	// Create a cart with items
 	cart, _ := LoadCart(store, "cart-123")
 	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"widget"}`)})
 	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"gadget"}`)})
@@ -59,14 +65,14 @@ func TestCheckoutSaga(t *testing.T) {
 		t.Errorf("expected state %s, got %s", CheckoutCreatingToken, saga.State())
 	}
 
-	// Verify stock reservation events
-	widgetStock, _ := store.Load("stock", "widget")
-	gadgetStock, _ := store.Load("stock", "gadget")
-	if len(widgetStock) != 1 {
-		t.Errorf("expected 1 widget stock event, got %d", len(widgetStock))
+	// Verify stock reservation events (1 stock-added + 1 stock-reserved = 2 each)
+	widgetStockEvents, _ := store.Load("stock", "widget")
+	gadgetStockEvents, _ := store.Load("stock", "gadget")
+	if len(widgetStockEvents) != 2 {
+		t.Errorf("expected 2 widget stock events, got %d", len(widgetStockEvents))
 	}
-	if len(gadgetStock) != 1 {
-		t.Errorf("expected 1 gadget stock event, got %d", len(gadgetStock))
+	if len(gadgetStockEvents) != 2 {
+		t.Errorf("expected 2 gadget stock events, got %d", len(gadgetStockEvents))
 	}
 
 	// Step 3: creating_payment_token -> charging_payment
@@ -78,28 +84,47 @@ func TestCheckoutSaga(t *testing.T) {
 		t.Errorf("expected state %s, got %s", CheckoutChargingPayment, saga.State())
 	}
 
-	// Step 4: charging_payment -> completed
+	// Step 4: charging_payment -> confirming_stock
 	err = saga.Step(ctx)
 	if err != nil {
 		t.Fatalf("Step 4 failed: %v", err)
+	}
+	if saga.State() != CheckoutConfirmingStock {
+		t.Errorf("expected state %s, got %s", CheckoutConfirmingStock, saga.State())
+	}
+
+	// Step 5: confirming_stock -> completed
+	err = saga.Step(ctx)
+	if err != nil {
+		t.Fatalf("Step 5 failed: %v", err)
 	}
 	if saga.State() != CheckoutCompleted {
 		t.Errorf("expected state %s, got %s", CheckoutCompleted, saga.State())
 	}
 
-	// Step 5: complete the saga
+	// Verify stock reservations were confirmed (reservation tracking cleared)
+	finalWidgetStock, _ := LoadStock(store, "widget")
+	finalGadgetStock, _ := LoadStock(store, "gadget")
+	if finalWidgetStock.TotalReserved() != 0 {
+		t.Errorf("expected widget reservations to be confirmed, got %d reserved", finalWidgetStock.TotalReserved())
+	}
+	if finalGadgetStock.TotalReserved() != 0 {
+		t.Errorf("expected gadget reservations to be confirmed, got %d reserved", finalGadgetStock.TotalReserved())
+	}
+
+	// Step 6: complete the saga
 	err = saga.Step(ctx)
 	if err != nil {
-		t.Fatalf("Step 5 failed: %v", err)
+		t.Fatalf("Step 6 failed: %v", err)
 	}
 	if !saga.Completed() {
 		t.Error("expected saga to be closed")
 	}
 
-	// Step 6: closed saga, should be no-op
+	// Step 7: closed saga, should be no-op
 	err = saga.Step(ctx)
 	if err != nil {
-		t.Fatalf("Step 6 failed: %v", err)
+		t.Fatalf("Step 7 failed: %v", err)
 	}
 	if saga.State() != CheckoutCompleted {
 		t.Errorf("expected state to remain %s, got %s", CheckoutCompleted, saga.State())
@@ -107,15 +132,19 @@ func TestCheckoutSaga(t *testing.T) {
 
 	// Verify saga events
 	sagaEvents, _ := store.Load("checkout-saga", "checkout-1")
-	// 1 start + 4 transitions + 1 close = 6 events
-	if len(sagaEvents) != 6 {
-		t.Errorf("expected 6 saga events, got %d", len(sagaEvents))
+	// 1 start + 5 transitions + 1 close = 7 events
+	if len(sagaEvents) != 7 {
+		t.Errorf("expected 7 saga events, got %d", len(sagaEvents))
 	}
 }
 
 func TestCheckoutSagaHydration(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	ctx := context.Background()
+
+	// Set up stock
+	thingStock, _ := LoadStock(store, "thing")
+	thingStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-456")
@@ -160,6 +189,10 @@ func TestCheckoutSagaHydration(t *testing.T) {
 func TestCheckoutSagaRun(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	ctx := context.Background()
+
+	// Set up stock
+	itemStock, _ := LoadStock(store, "item")
+	itemStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-789")

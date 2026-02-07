@@ -20,9 +20,10 @@ type Logic interface {
 	// This cannot fail, the event had already been previously accepted
 	Apply(event AcceptedEvent)
 
-	// Accept checks if a new proposed event is valid given current state
+	// ShouldAccept checks if a new proposed event is valid given current state
 	// Return an error to reject the event
-	Accept(event Event) error
+	// Called internally by AggregateBase.Accept
+	ShouldAccept(event Event) error
 }
 
 // AggregateBase provides the infrastructure for aggregates.
@@ -86,7 +87,7 @@ func (b *AggregateBase) Accept(events ...Event) ([]AcceptedEvent, error) {
 
 	acceptedEvents := make([]AcceptedEvent, len(events))
 	for i, event := range events {
-		if err := b.self.Accept(event); err != nil {
+		if err := b.self.ShouldAccept(event); err != nil {
 			return nil, fmt.Errorf("event %d: %w", i, err)
 		}
 		acceptedEvents[i] = AcceptedEvent{
