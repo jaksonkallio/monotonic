@@ -67,14 +67,18 @@ func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.St
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
-	cartEvent, err := cart.Accept(monotonic.Event{Type: "checkout-started"})
+	acceptedEvents, err := cart.AggregateBase.Accept(monotonic.Event{Type: "checkout-started"})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
 
 	return monotonic.ActionResult{
 		NewState: CheckoutReservingStock,
-		Events:   []monotonic.AggregateEvent{cartEvent},
+		Events: []monotonic.AggregateEvent{{
+			AggregateType: "cart",
+			AggregateID:   input.CartID,
+			Event:         acceptedEvents[0],
+		}},
 	}, nil
 }
 
@@ -102,11 +106,13 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monot
 		events = append(events, monotonic.AggregateEvent{
 			AggregateType: "stock",
 			AggregateID:   item, // item SKU is the stock aggregate ID
-			Event: monotonic.Event{
-				Type:       "reserved",
+			Event: monotonic.AcceptedEvent{
+				Event: monotonic.Event{
+					Type:    "reserved",
+					Payload: payload,
+				},
 				Counter:    1, // each stock aggregate is new
 				AcceptedAt: time.Now(),
-				Payload:    payload,
 			},
 		})
 	}
@@ -135,7 +141,7 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 
 	// Store the token on the cart
 	payload, _ := json.Marshal(map[string]string{"token": token})
-	cartEvent, err := cart.Accept(monotonic.Event{
+	acceptedEvents, err := cart.AggregateBase.Accept(monotonic.Event{
 		Type:    "payment-token-set",
 		Payload: payload,
 	})
@@ -145,7 +151,11 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 
 	return monotonic.ActionResult{
 		NewState: CheckoutChargingPayment,
-		Events:   []monotonic.AggregateEvent{cartEvent},
+		Events: []monotonic.AggregateEvent{{
+			AggregateType: "cart",
+			AggregateID:   input.CartID,
+			Event:         acceptedEvents[0],
+		}},
 	}, nil
 }
 
@@ -174,7 +184,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 		return monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
 	}
 
-	cartEvent, err := cart.Accept(monotonic.Event{Type: "payment-charged"})
+	acceptedEvents, err := cart.AggregateBase.Accept(monotonic.Event{Type: "payment-charged"})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -182,7 +192,11 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 	// Transition to completed state (close happens in next step)
 	return monotonic.ActionResult{
 		NewState: CheckoutCompleted,
-		Events:   []monotonic.AggregateEvent{cartEvent},
+		Events: []monotonic.AggregateEvent{{
+			AggregateType: "cart",
+			AggregateID:   input.CartID,
+			Event:         acceptedEvents[0],
+		}},
 	}, nil
 }
 

@@ -18,7 +18,7 @@ func NewAggregateID(aggregateType, id string) AggregateID {
 type Logic interface {
 	// Apply applies an event to the aggregate's state
 	// This cannot fail, the event had already been previously accepted
-	Apply(event Event)
+	Apply(event AcceptedEvent)
 
 	// Accept checks if a new proposed event is valid given current state
 	// Return an error to reject the event
@@ -53,7 +53,7 @@ func (b *AggregateBase) AcceptThenApply(events ...Event) error {
 			return err
 		}
 
-		b.self.Apply(acceptedEvent.Event)
+		b.self.Apply(acceptedEvent)
 		b.applied(acceptedEvent)
 	}
 
@@ -109,7 +109,7 @@ func Hydrate[T Logic](store Store, aggType, id string, init func(*AggregateBase)
 	base.self = agg
 
 	for _, e := range events {
-		agg.Apply(e.Event)
+		agg.Apply(e)
 		base.applied(e)
 	}
 

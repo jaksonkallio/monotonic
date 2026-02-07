@@ -5,12 +5,14 @@ import (
 	"time"
 )
 
+// Event represents an pure, ephemeral event data
 type Event struct {
 	Type    string
 	Payload json.RawMessage
 }
 
-// AcceptedEvent represents an event that has been accepted with an assigned counter
+// AcceptedEvent represents an event that has been accepted in an event stream with an assigned counter
+// May or may not have been persisted or applied, depending on the context
 type AcceptedEvent struct {
 	Event
 	AcceptedAt time.Time

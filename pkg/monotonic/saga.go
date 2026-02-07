@@ -102,11 +102,13 @@ func NewSaga(
 	event := AggregateEvent{
 		AggregateType: sagaType,
 		AggregateID:   id,
-		Event: Event{
-			Type:       "saga-started",
+		Event: AcceptedEvent{
+			Event: Event{
+				Type:    "saga-started",
+				Payload: payload,
+			},
 			Counter:    1,
 			AcceptedAt: time.Now(),
-			Payload:    payload,
 		},
 	}
 
@@ -165,7 +167,7 @@ func (s *Saga) Closed() bool {
 	return s.closed
 }
 
-func (s *Saga) apply(event Event) {
+func (s *Saga) apply(event AcceptedEvent) {
 	switch event.Type {
 	case "saga-started":
 		var payload sagaStartedPayload
@@ -256,8 +258,10 @@ func (s *Saga) closeSaga() error {
 	closeEvent := AggregateEvent{
 		AggregateType: s.ID.Type,
 		AggregateID:   s.ID.ID,
-		Event: Event{
-			Type:       "saga-closed",
+		Event: AcceptedEvent{
+			Event: Event{
+				Type: "saga-closed",
+			},
 			Counter:    s.nextCounter(),
 			AcceptedAt: time.Now(),
 		},
@@ -291,11 +295,13 @@ func (s *Saga) transition(result ActionResult) error {
 		Delay:   result.Delay,
 	})
 
-	sagaEvent := Event{
-		Type:       "state-transitioned",
+	sagaEvent := AcceptedEvent{
+		Event: Event{
+			Type:    "state-transitioned",
+			Payload: payload,
+		},
 		Counter:    s.nextCounter(),
 		AcceptedAt: time.Now(),
-		Payload:    payload,
 	}
 
 	// Merge the saga state transition event with the other aggregate events

@@ -95,5 +95,15 @@ func (d *SagaDriver) stepSaga(ctx context.Context, id string) error {
 		return err
 	}
 
+	// Handle crash recovery: if saga events show closed but store doesn't know,
+	// sync the store. This handles the case where we crashed between appending
+	// the saga-closed event and calling store.Close().
+	if saga.Closed() {
+		if err := d.store.Close(d.sagaType, id); err != nil {
+			return fmt.Errorf("close saga in store: %w", err)
+		}
+		return nil
+	}
+
 	return saga.Step(ctx)
 }

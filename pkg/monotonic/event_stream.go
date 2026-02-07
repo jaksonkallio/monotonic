@@ -17,14 +17,14 @@ func (e *eventStream) Counter() int64 {
 
 // catchUp replays any events from the store that haven't been seen yet.
 // The apply function is called for each new event.
-func (e *eventStream) catchUp(apply func(Event)) error {
+func (e *eventStream) catchUp(apply func(AcceptedEvent)) error {
 	events, err := e.store.LoadAfter(e.ID.Type, e.ID.ID, e.counter)
 	if err != nil {
 		return fmt.Errorf("catch up: %w", err)
 	}
 
 	for _, event := range events {
-		apply(event.Event)
+		apply(event)
 		e.counter = event.Counter
 	}
 

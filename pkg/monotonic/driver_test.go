@@ -272,7 +272,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 	}
 
 	// Cannot append to closed saga
-	err = store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: Event{Type: "test", Counter: 4}})
+	err = store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: AcceptedEvent{Event: Event{Type: "test"}, Counter: 4}})
 	if err == nil {
 		t.Error("expected error when appending to closed saga")
 	}
@@ -396,8 +396,8 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 	saga, _ := NewSaga(store, "test-saga", "saga-1", "completed", nil, actions)
 
 	// Manually append saga-closed event (bypassing saga.Step's store.Close call)
-	closeEvent := Event{
-		Type:    "saga-closed",
+	closeEvent := AcceptedEvent{
+		Event:   Event{Type: "saga-closed"},
 		Counter: saga.Counter() + 1,
 	}
 	store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})

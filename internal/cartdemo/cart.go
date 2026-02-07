@@ -26,7 +26,7 @@ func LoadCart(store monotonic.Store, id string) (*Cart, error) {
 	})
 }
 
-func (c *Cart) Apply(event monotonic.Event) {
+func (c *Cart) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
 	case "item-added":
 		var payload struct {
