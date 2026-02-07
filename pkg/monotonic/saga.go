@@ -15,6 +15,22 @@ type ActionFunc func(ctx context.Context, saga *Saga, store Store) (ActionResult
 
 type ActionMap map[string]ActionFunc
 
+// TypedActionFunc is an action function with a typed input parameter.
+// Use with TypedAction to avoid manual input parsing in every action.
+type TypedActionFunc[I any] func(ctx context.Context, saga *Saga, input I, store Store) (ActionResult, error)
+
+// TypedAction wraps a TypedActionFunc to automatically parse the saga input.
+// This eliminates boilerplate input parsing from every action.
+func TypedAction[I any](fn TypedActionFunc[I]) ActionFunc {
+	return func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+		var input I
+		if err := saga.InputAs(&input); err != nil {
+			return ActionResult{}, fmt.Errorf("parse saga input: %w", err)
+		}
+		return fn(ctx, saga, input, store)
+	}
+}
+
 // ActionResult represents the outcome of a saga action
 type ActionResult struct {
 	// NewState is the state to transition to

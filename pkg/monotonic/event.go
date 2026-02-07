@@ -11,15 +11,17 @@ type Event struct {
 	Payload json.RawMessage
 }
 
+type Payload any
+
 // NewEvent creates an event with a typed payload
 // The payload will be marshaled to JSON and stored as raw bytes in the event
-func NewEvent[P any](eventType string, payload P) Event {
+func NewEvent[P Payload](eventType string, payload P) Event {
 	data, _ := json.Marshal(payload)
 	return Event{Type: eventType, Payload: data}
 }
 
 // ParsePayload unmarshals an event's payload into the specified type
-func ParsePayload[P any](event AcceptedEvent) (P, bool) {
+func ParsePayload[P Payload](event AcceptedEvent) (P, bool) {
 	var payload P
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		return payload, false
