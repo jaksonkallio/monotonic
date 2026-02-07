@@ -14,14 +14,14 @@ func TestCheckoutSaga(t *testing.T) {
 
 	// First, set up stock for the items
 	widgetStock, _ := LoadStock(store, "widget")
-	widgetStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
+	widgetStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
 	gadgetStock, _ := LoadStock(store, "gadget")
-	gadgetStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":5}`)})
+	gadgetStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 5}))
 
 	// Create a cart with items
 	cart, _ := LoadCart(store, "cart-123")
-	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"widget"}`)})
-	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"gadget"}`)})
+	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
+	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
 
 	// Start a checkout saga for this cart
 	saga, err := StartCheckoutSaga(ctx, store, "checkout-1", "cart-123")
@@ -144,11 +144,11 @@ func TestCheckoutSagaHydration(t *testing.T) {
 
 	// Set up stock
 	thingStock, _ := LoadStock(store, "thing")
-	thingStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
+	thingStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-456")
-	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"thing"}`)})
+	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "thing"}))
 
 	// Start and run saga partway
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-2", "cart-456")
@@ -192,11 +192,11 @@ func TestCheckoutSagaRun(t *testing.T) {
 
 	// Set up stock
 	itemStock, _ := LoadStock(store, "item")
-	itemStock.AcceptThenApply(monotonic.Event{Type: "stock-added", Payload: []byte(`{"quantity":10}`)})
+	itemStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
 
 	// Create cart
 	cart, _ := LoadCart(store, "cart-789")
-	cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: []byte(`{"item_name":"item"}`)})
+	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "item"}))
 
 	// Start saga and run to completion
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-3", "cart-789")

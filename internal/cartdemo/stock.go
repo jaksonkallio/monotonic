@@ -7,6 +7,28 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
+// Stock event types
+const (
+	EventStockAdded           = "stock-added"
+	EventStockReserved        = "stock-reserved"
+	EventReservationReleased  = "reservation-released"
+	EventReservationConfirmed = "reservation-confirmed"
+)
+
+// Stock event payloads
+type StockAddedPayload struct {
+	Quantity int `json:"quantity"`
+}
+
+type StockReservedPayload struct {
+	SagaID   string `json:"saga_id"`
+	Quantity int    `json:"quantity"`
+}
+
+type ReservationPayload struct {
+	SagaID string `json:"saga_id"`
+}
+
 // Stock represents inventory for a single SKU.
 // Each SKU has its own Stock aggregate.
 type Stock struct {
@@ -32,94 +54,76 @@ func LoadStock(store monotonic.Store, sku string) (*Stock, error) {
 
 func (s *Stock) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
-	case "stock-added":
-		var payload struct {
-			Quantity int `json:"quantity"`
+	case EventStockAdded:
+		if p, ok := monotonic.ParsePayload[StockAddedPayload](event); ok {
+			s.Available += p.Quantity
 		}
-		json.Unmarshal(event.Payload, &payload)
-		s.Available += payload.Quantity
 
-	case "stock-reserved":
-		var payload struct {
-			SagaID   string `json:"saga_id"`
-			Quantity int    `json:"quantity"`
+	case EventStockReserved:
+		if p, ok := monotonic.ParsePayload[StockReservedPayload](event); ok {
+			s.Available -= p.Quantity
+			s.Reserved[p.SagaID] += p.Quantity
 		}
-		json.Unmarshal(event.Payload, &payload)
-		s.Available -= payload.Quantity
-		s.Reserved[payload.SagaID] += payload.Quantity
 
-	case "reservation-released":
-		var payload struct {
-			SagaID string `json:"saga_id"`
+	case EventReservationReleased:
+		if p, ok := monotonic.ParsePayload[ReservationPayload](event); ok {
+			quantity := s.Reserved[p.SagaID]
+			s.Available += quantity
+			delete(s.Reserved, p.SagaID)
 		}
-		json.Unmarshal(event.Payload, &payload)
-		quantity := s.Reserved[payload.SagaID]
-		s.Available += quantity
-		delete(s.Reserved, payload.SagaID)
 
-	case "reservation-confirmed":
-		var payload struct {
-			SagaID string `json:"saga_id"`
+	case EventReservationConfirmed:
+		if p, ok := monotonic.ParsePayload[ReservationPayload](event); ok {
+			// Reservation becomes a sale, just remove from reserved tracking
+			delete(s.Reserved, p.SagaID)
 		}
-		json.Unmarshal(event.Payload, &payload)
-		// Reservation becomes a sale, just remove from reserved tracking
-		delete(s.Reserved, payload.SagaID)
 	}
 }
 
 func (s *Stock) ShouldAccept(event monotonic.Event) error {
 	switch event.Type {
-	case "stock-added":
-		var payload struct {
-			Quantity int `json:"quantity"`
-		}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	case EventStockAdded:
+		var p StockAddedPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
 			return err
 		}
-		if payload.Quantity <= 0 {
+		if p.Quantity <= 0 {
 			return errors.New("quantity must be positive")
 		}
 		return nil
 
-	case "stock-reserved":
-		var payload struct {
-			SagaID   string `json:"saga_id"`
-			Quantity int    `json:"quantity"`
-		}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	case EventStockReserved:
+		var p StockReservedPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
 			return err
 		}
-		if payload.Quantity <= 0 {
+		if p.Quantity <= 0 {
 			return errors.New("quantity must be positive")
 		}
-		if payload.SagaID == "" {
+		if p.SagaID == "" {
 			return errors.New("saga_id is required")
 		}
-		if s.Available < payload.Quantity {
+		if s.Available < p.Quantity {
 			return errors.New("insufficient stock")
 		}
 		return nil
 
-	case "reservation-released":
-		var payload struct {
-			SagaID string `json:"saga_id"`
-		}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	case EventReservationReleased:
+		var p ReservationPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
 			return err
 		}
-		if _, exists := s.Reserved[payload.SagaID]; !exists {
+		if _, exists := s.Reserved[p.SagaID]; !exists {
 			return errors.New("no reservation found for saga")
 		}
 		return nil
 
-	case "reservation-confirmed":
-		var payload struct {
-			SagaID string `json:"saga_id"`
-		}
-		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+	case EventReservationConfirmed:
+		var p ReservationPayload
+		if err := json.Unmarshal(event.Payload, &p); err != nil {
 			return err
 		}
-		if _, exists := s.Reserved[payload.SagaID]; !exists {
+		if _, exists := s.Reserved[p.SagaID]; !exists {
 			return errors.New("no reservation found for saga")
 		}
 		return nil

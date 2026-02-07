@@ -69,7 +69,7 @@ func checkoutStart(ctx context.Context, saga *monotonic.Saga, store monotonic.St
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
-	acceptedEvents, err := cart.Accept(monotonic.Event{Type: "checkout-started"})
+	acceptedEvents, err := cart.Accept(monotonic.Event{Type: EventCheckoutStarted})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -105,15 +105,10 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, store monot
 			return monotonic.ActionResult{}, err
 		}
 
-		payload, _ := json.Marshal(map[string]any{
-			"saga_id":  saga.ID.ID,
-			"quantity": 1,
-		})
-
-		acceptedEvents, err := stock.Accept(monotonic.Event{
-			Type:    "stock-reserved",
-			Payload: payload,
-		})
+		acceptedEvents, err := stock.Accept(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+			SagaID:   saga.ID.ID,
+			Quantity: 1,
+		}))
 		if err != nil {
 			return monotonic.ActionResult{}, err
 		}
@@ -148,11 +143,7 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, store
 	token := "tok_" + saga.ID.ID
 
 	// Store the token on the cart
-	payload, _ := json.Marshal(map[string]string{"token": token})
-	acceptedEvents, err := cart.Accept(monotonic.Event{
-		Type:    "payment-token-set",
-		Payload: payload,
-	})
+	acceptedEvents, err := cart.Accept(monotonic.NewEvent(EventPaymentTokenSet, PaymentTokenSetPayload{Token: token}))
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -192,7 +183,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, store mono
 		return monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
 	}
 
-	acceptedEvents, err := cart.Accept(monotonic.Event{Type: "payment-charged"})
+	acceptedEvents, err := cart.Accept(monotonic.Event{Type: EventPaymentCharged})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -229,14 +220,9 @@ func checkoutConfirmStock(ctx context.Context, saga *monotonic.Saga, store monot
 			return monotonic.ActionResult{}, err
 		}
 
-		payload, _ := json.Marshal(map[string]string{
-			"saga_id": saga.ID.ID,
-		})
-
-		acceptedEvents, err := stock.Accept(monotonic.Event{
-			Type:    "reservation-confirmed",
-			Payload: payload,
-		})
+		acceptedEvents, err := stock.Accept(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
+			SagaID: saga.ID.ID,
+		}))
 		if err != nil {
 			return monotonic.ActionResult{}, err
 		}

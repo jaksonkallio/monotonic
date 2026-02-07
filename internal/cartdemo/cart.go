@@ -1,11 +1,26 @@
 package cartdemo
 
 import (
-	"encoding/json"
 	"errors"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
+
+// Cart event types
+const (
+	EventItemAdded       = "item-added"
+	EventCheckoutStarted = "checkout-started"
+	EventPaymentTokenSet = "payment-token-set"
+	EventPaymentCharged  = "payment-charged"
+)
+
+type ItemAddedPayload struct {
+	ItemName string `json:"item_name"`
+}
+
+type PaymentTokenSetPayload struct {
+	Token string `json:"token"`
+}
 
 // Cart is an example aggregate demonstrating the framework pattern.
 // It embeds AggregateBase and uses plain Go fields for state.
@@ -28,34 +43,30 @@ func LoadCart(store monotonic.Store, id string) (*Cart, error) {
 
 func (c *Cart) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
-	case "item-added":
-		var payload struct {
-			ItemName string `json:"item_name"`
+	case EventItemAdded:
+		if p, ok := monotonic.ParsePayload[ItemAddedPayload](event); ok {
+			c.Items = append(c.Items, p.ItemName)
 		}
-		json.Unmarshal(event.Payload, &payload)
-		c.Items = append(c.Items, payload.ItemName)
 
-	case "checkout-started":
+	case EventCheckoutStarted:
 		c.CheckoutStarted = true
 
-	case "payment-token-set":
-		var payload struct {
-			Token string `json:"token"`
+	case EventPaymentTokenSet:
+		if p, ok := monotonic.ParsePayload[PaymentTokenSetPayload](event); ok {
+			c.PaymentToken = p.Token
 		}
-		json.Unmarshal(event.Payload, &payload)
-		c.PaymentToken = payload.Token
 
-	case "payment-charged":
+	case EventPaymentCharged:
 		c.PaymentCharged = true
 	}
 }
 
 func (c *Cart) ShouldAccept(event monotonic.Event) error {
 	switch event.Type {
-	case "item-added":
+	case EventItemAdded:
 		return nil
 
-	case "checkout-started":
+	case EventCheckoutStarted:
 		if c.CheckoutStarted {
 			return errors.New("checkout has already been started")
 		}
@@ -64,13 +75,13 @@ func (c *Cart) ShouldAccept(event monotonic.Event) error {
 		}
 		return nil
 
-	case "payment-token-set":
+	case EventPaymentTokenSet:
 		if !c.CheckoutStarted {
 			return errors.New("checkout has not been started")
 		}
 		return nil
 
-	case "payment-charged":
+	case EventPaymentCharged:
 		if c.PaymentToken == "" {
 			return errors.New("no payment token set")
 		}

@@ -20,10 +20,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Add stock
-	err = stock.AcceptThenApply(monotonic.Event{
-		Type:    "stock-added",
-		Payload: []byte(`{"quantity":100}`),
-	})
+	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 100}))
 	if err != nil {
 		t.Fatalf("stock-added failed: %v", err)
 	}
@@ -33,10 +30,10 @@ func TestStock(t *testing.T) {
 	}
 
 	// Reserve some stock
-	err = stock.AcceptThenApply(monotonic.Event{
-		Type:    "stock-reserved",
-		Payload: []byte(`{"saga_id":"checkout-1","quantity":10}`),
-	})
+	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+		SagaID:   "checkout-1",
+		Quantity: 10,
+	}))
 	if err != nil {
 		t.Fatalf("stock-reserved failed: %v", err)
 	}
@@ -49,19 +46,18 @@ func TestStock(t *testing.T) {
 	}
 
 	// Try to reserve more than available - should fail
-	err = stock.AcceptThenApply(monotonic.Event{
-		Type:    "stock-reserved",
-		Payload: []byte(`{"saga_id":"checkout-2","quantity":100}`),
-	})
+	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+		SagaID:   "checkout-2",
+		Quantity: 100,
+	}))
 	if err == nil {
 		t.Error("expected error when reserving more than available")
 	}
 
 	// Confirm the first reservation
-	err = stock.AcceptThenApply(monotonic.Event{
-		Type:    "reservation-confirmed",
-		Payload: []byte(`{"saga_id":"checkout-1"}`),
-	})
+	err = stock.AcceptThenApply(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
+		SagaID: "checkout-1",
+	}))
 	if err != nil {
 		t.Fatalf("reservation-confirmed failed: %v", err)
 	}
@@ -90,24 +86,20 @@ func TestStockRelease(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 
 	stock, _ := LoadStock(store, "gadget-001")
-	stock.AcceptThenApply(monotonic.Event{
-		Type:    "stock-added",
-		Payload: []byte(`{"quantity":50}`),
-	})
-	stock.AcceptThenApply(monotonic.Event{
-		Type:    "stock-reserved",
-		Payload: []byte(`{"saga_id":"order-1","quantity":20}`),
-	})
+	stock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 50}))
+	stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+		SagaID:   "order-1",
+		Quantity: 20,
+	}))
 
 	if stock.Available != 30 {
 		t.Errorf("expected 30 available, got %d", stock.Available)
 	}
 
 	// Release the reservation (e.g., order cancelled)
-	err := stock.AcceptThenApply(monotonic.Event{
-		Type:    "reservation-released",
-		Payload: []byte(`{"saga_id":"order-1"}`),
-	})
+	err := stock.AcceptThenApply(monotonic.NewEvent(EventReservationReleased, ReservationPayload{
+		SagaID: "order-1",
+	}))
 	if err != nil {
 		t.Fatalf("reservation-released failed: %v", err)
 	}
