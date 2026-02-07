@@ -33,8 +33,9 @@ func ParsePayload[P Payload](event AcceptedEvent) (P, bool) {
 // May or may not have been persisted or applied, depending on the context
 type AcceptedEvent struct {
 	Event
-	AcceptedAt time.Time
-	Counter    int64
+	AcceptedAt    time.Time
+	Counter       int64
+	GlobalCounter int64
 }
 
 // AggregateEvent pairs an event with its target aggregate

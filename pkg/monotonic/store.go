@@ -14,6 +14,10 @@ type Store interface {
 	// Either all events are appended at once or none are
 	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
 	Append(events ...AggregateEvent) error
+
+	// LoadEventsSince returns all events for the specified aggregate types with global counter > afterGlobalCounter, ordered by global counter.
+	// Used by projections to catch up on events across multiple aggregate types.
+	LoadEventsSince(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
 // SagaStore extends Store with saga lifecycle operations
@@ -40,12 +44,16 @@ type inMemoryStoredAggregate struct {
 // InMemoryStore is an in-memory implementation of the Store interface,
 // useful for testing and development.
 type InMemoryStore struct {
-	aggregates map[AggregateID]*inMemoryStoredAggregate
+	aggregates    map[AggregateID]*inMemoryStoredAggregate
+	globalEvents  []AggregateEvent // all events in global order
+	globalCounter int64            // next global counter to assign
 }
 
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{
-		aggregates: make(map[AggregateID]*inMemoryStoredAggregate),
+		aggregates:    make(map[AggregateID]*inMemoryStoredAggregate),
+		globalEvents:  []AggregateEvent{},
+		globalCounter: 1,
 	}
 }
 
@@ -104,9 +112,31 @@ func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 			s.aggregates[id] = agg
 		}
 		agg.events = append(agg.events, ae.Event)
+
+		// Track in global event log for projections with assigned global counter
+		globalEvent := ae
+		globalEvent.Event.GlobalCounter = s.globalCounter
+		s.globalEvents = append(s.globalEvents, globalEvent)
+		s.globalCounter++
 	}
 
 	return nil
+}
+
+func (s *InMemoryStore) LoadEventsSince(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
+	// Build a set for O(1) lookup
+	typeSet := make(map[string]bool, len(aggregateTypes))
+	for _, t := range aggregateTypes {
+		typeSet[t] = true
+	}
+
+	var result []AggregateEvent
+	for _, ae := range s.globalEvents {
+		if ae.Event.GlobalCounter > afterGlobalCounter && typeSet[ae.AggregateType] {
+			result = append(result, ae)
+		}
+	}
+	return result, nil
 }
 
 func (s *InMemoryStore) ListActiveSagas(sagaType string) ([]string, error) {
