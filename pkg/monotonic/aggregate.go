@@ -39,20 +39,29 @@ func (b *AggregateBase) AcceptThenApply(events ...Event) error {
 		return nil
 	}
 
+	// Accept all events atomically
 	acceptedEvents, err := b.Accept(events...)
 	if err != nil {
 		return fmt.Errorf("accept: %w", err)
 	}
 
-	for _, acceptedEvent := range acceptedEvents {
-		if err := b.append(AggregateEvent{
+	// Simple conversion from []AcceptedEvent to []AggregateEvent for appending to store
+	aggregateEvents := make([]AggregateEvent, len(acceptedEvents))
+	for i, acceptedEvent := range acceptedEvents {
+		aggregateEvents[i] = AggregateEvent{
 			Event:         acceptedEvent,
 			AggregateType: b.ID.Type,
 			AggregateID:   b.ID.ID,
-		}); err != nil {
-			return err
 		}
+	}
 
+	// Append all events atomically
+	if err := b.append(aggregateEvents...); err != nil {
+		return err
+	}
+
+	// Apply all accepted and appended events to local state
+	for _, acceptedEvent := range acceptedEvents {
 		b.self.Apply(acceptedEvent)
 		b.applied(acceptedEvent)
 	}
