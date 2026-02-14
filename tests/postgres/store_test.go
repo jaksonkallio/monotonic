@@ -325,7 +325,7 @@ func TestSagaLifecycle(t *testing.T) {
 		AggregateType: "checkout",
 		AggregateID:   "saga-1",
 		Event: monotonic.AcceptedEvent{
-			Event:      monotonic.Event{Type: "saga-started"},
+			Event:      monotonic.Event{Type: monotonic.SagaStartedEvent},
 			Counter:    1,
 			AcceptedAt: time.Now(),
 		},

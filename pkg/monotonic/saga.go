@@ -43,25 +43,42 @@ type ActionResult struct {
 
 	// Complete indicates the saga should be completed
 	// Typical pattern: transition to some "completed" state, then have "completed" action return `Complete` as true
-	// When true, other fields must be empty because completing implies that no other subsequent transitions or actions can occur
+	// When true, NewState, Events, and Delay must be empty because completing implies that no other subsequent transitions or actions can occur
 	Complete bool
 
 	// Delay before the next step can run
 	// Must be zero if `Complete` is true
 	Delay time.Duration
+
+	// SagaFailureReason is an optional message explaining why the saga failed
+	// May be non-empty only when `Complete` is true
+	// An empty string on a completed saga indicates successful completion
+	SagaFailureReason string
 }
 
-// sagaStartedPayload is stored in the saga-started event
-type sagaStartedPayload struct {
+// Saga event type constants
+const (
+	EventTypeStarted           = "saga-started"
+	EventTypeStateTransitioned = "state-transitioned"
+	EventTypeCompleted         = "saga-completed"
+)
+
+// SagaStartedPayload is stored in the saga-started event
+type SagaStartedPayload struct {
 	InitialState string          `json:"initial_state"`
 	Input        json.RawMessage `json:"input"`
 }
 
-// stateTransitionPayload is stored in state-transitioned events
-type stateTransitionPayload struct {
+// SagaStateTransitionPayload is stored in state-transitioned events
+type SagaStateTransitionPayload struct {
 	ToState string        `json:"to_state"`
 	ReadyAt time.Time     `json:"ready_at,omitempty"`
 	Delay   time.Duration `json:"delay,omitempty"`
+}
+
+// SagaCompletedPayload is stored in the saga-completed event
+type SagaCompletedPayload struct {
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 // Saga is a state machine that coordinates multiple aggregates.
@@ -84,6 +101,10 @@ type Saga struct {
 
 	// Completed indicates whether the saga is completed
 	completed bool
+
+	// SagaFailureReason is the reason the saga failed, if it failed
+	// Empty string indicates successful completion (or not yet completed)
+	sagaFailureReason string
 
 	actions ActionMap
 }
@@ -114,7 +135,7 @@ func NewSaga(
 	}
 
 	// Persist the initial event
-	payload, _ := json.Marshal(sagaStartedPayload{
+	payload, _ := json.Marshal(SagaStartedPayload{
 		InitialState: initialState,
 		Input:        input,
 	})
@@ -124,7 +145,7 @@ func NewSaga(
 		AggregateID:   id,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type:    "saga-started",
+				Type:    EventTypeStarted,
 				Payload: payload,
 			},
 			Counter:    1,
@@ -188,27 +209,36 @@ func (s *Saga) Completed() bool {
 	return s.completed
 }
 
+// SagaFailureReason returns the failure reason if the saga completed with a failure.
+// Returns empty string for successful completions or sagas that haven't completed yet.
+func (s *Saga) SagaFailureReason() string {
+	return s.sagaFailureReason
+}
+
 func (s *Saga) apply(event AcceptedEvent) {
 	switch event.Type {
-	case "saga-started":
-		var payload sagaStartedPayload
-		json.Unmarshal(event.Payload, &payload)
-		s.state = payload.InitialState
-		s.input = payload.Input
-		s.readyAt = event.AcceptedAt
-
-	case "state-transitioned":
-		var payload stateTransitionPayload
-		json.Unmarshal(event.Payload, &payload)
-		s.state = payload.ToState
-		if !payload.ReadyAt.IsZero() {
-			s.readyAt = payload.ReadyAt
-		} else {
+	case EventTypeStarted:
+		if payload, ok := ParsePayload[SagaStartedPayload](event); ok {
+			s.state = payload.InitialState
+			s.input = payload.Input
 			s.readyAt = event.AcceptedAt
 		}
 
-	case "saga-completed":
+	case EventTypeStateTransitioned:
+		if payload, ok := ParsePayload[SagaStateTransitionPayload](event); ok {
+			s.state = payload.ToState
+			if !payload.ReadyAt.IsZero() {
+				s.readyAt = payload.ReadyAt
+			} else {
+				s.readyAt = event.AcceptedAt
+			}
+		}
+
+	case EventTypeCompleted:
 		s.completed = true
+		if payload, ok := ParsePayload[SagaCompletedPayload](event); ok {
+			s.sagaFailureReason = payload.FailureReason
+		}
 	}
 }
 
@@ -248,7 +278,11 @@ func (s *Saga) Step(ctx context.Context) error {
 		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
-		return s.closeSaga(ctx)
+		return s.closeSaga(ctx, result.SagaFailureReason)
+	}
+
+	if result.SagaFailureReason != "" {
+		return fmt.Errorf("SagaFailureReason can only be set when Complete is true")
 	}
 
 	if result.NewState == "" {
@@ -267,13 +301,18 @@ func (s *Saga) Step(ctx context.Context) error {
 }
 
 // closeSaga appends a saga-completed event and marks the saga as closed in the store
-func (s *Saga) closeSaga(ctx context.Context) error {
+func (s *Saga) closeSaga(ctx context.Context, failureReason string) error {
+	payload, _ := json.Marshal(SagaCompletedPayload{
+		FailureReason: failureReason,
+	})
+
 	closeEvent := AggregateEvent{
 		AggregateType: s.ID.Type,
 		AggregateID:   s.ID.ID,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type: "saga-completed",
+				Type:    EventTypeCompleted,
+				Payload: payload,
 			},
 			Counter:    s.nextCounter(),
 			AcceptedAt: time.Now(),
@@ -302,7 +341,7 @@ func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 		readyAt = readyAt.Add(result.Delay)
 	}
 
-	payload, _ := json.Marshal(stateTransitionPayload{
+	payload, _ := json.Marshal(SagaStateTransitionPayload{
 		ToState: result.NewState,
 		ReadyAt: readyAt,
 		Delay:   result.Delay,
@@ -310,7 +349,7 @@ func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 
 	sagaEvent := AcceptedEvent{
 		Event: Event{
-			Type:    "state-transitioned",
+			Type:    EventTypeStateTransitioned,
 			Payload: payload,
 		},
 		Counter:    s.nextCounter(),

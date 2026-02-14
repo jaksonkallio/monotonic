@@ -325,6 +325,93 @@ func TestSagaFailureThenClose(t *testing.T) {
 	}
 }
 
+func TestSagaFailureReason(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	failureMsg := "payment gateway unreachable after 3 retries"
+
+	actions := ActionMap{
+		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			return ActionResult{
+				Complete:          true,
+				SagaFailureReason: failureMsg,
+			}, nil
+		},
+	}
+
+	saga, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
+
+	err := saga.Step(ctx)
+	if err != nil {
+		t.Fatalf("Step failed: %v", err)
+	}
+
+	if !saga.Completed() {
+		t.Error("expected saga to be completed")
+	}
+	if saga.SagaFailureReason() != failureMsg {
+		t.Errorf("expected failure reason %q, got %q", failureMsg, saga.SagaFailureReason())
+	}
+
+	// Verify failure reason survives hydration
+	loaded, err := LoadSaga(store, "test-saga", "saga-1", actions)
+	if err != nil {
+		t.Fatalf("LoadSaga failed: %v", err)
+	}
+	if !loaded.Completed() {
+		t.Error("expected loaded saga to be completed")
+	}
+	if loaded.SagaFailureReason() != failureMsg {
+		t.Errorf("expected loaded failure reason %q, got %q", failureMsg, loaded.SagaFailureReason())
+	}
+}
+
+func TestSagaSuccessfulCompletionHasNoFailureReason(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	actions := ActionMap{
+		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			return ActionResult{Complete: true}, nil
+		},
+	}
+
+	saga, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
+	saga.Step(ctx)
+
+	if saga.SagaFailureReason() != "" {
+		t.Errorf("expected empty failure reason for successful completion, got %q", saga.SagaFailureReason())
+	}
+
+	// Verify after hydration
+	loaded, _ := LoadSaga(store, "test-saga", "saga-1", actions)
+	if loaded.SagaFailureReason() != "" {
+		t.Errorf("expected empty failure reason after hydration, got %q", loaded.SagaFailureReason())
+	}
+}
+
+func TestSagaFailureReasonRejectsWithoutComplete(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	actions := ActionMap{
+		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			return ActionResult{
+				NewState:          "next",
+				SagaFailureReason: "should not be allowed",
+			}, nil
+		},
+	}
+
+	saga, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
+
+	err := saga.Step(ctx)
+	if err == nil {
+		t.Error("expected error when SagaFailureReason is set without Complete")
+	}
+}
+
 func TestSagaTransientError(t *testing.T) {
 	store := NewInMemoryStore()
 	ctx := context.Background()
@@ -397,7 +484,7 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 
 	// Manually append saga-completed event (bypassing saga.Step's store.Close call)
 	closeEvent := AcceptedEvent{
-		Event:   Event{Type: "saga-completed"},
+		Event:   Event{Type: EventTypeCompleted},
 		Counter: saga.Counter() + 1,
 	}
 	store.Append(ctx, AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})
