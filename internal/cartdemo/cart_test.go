@@ -44,7 +44,7 @@ func TestCartCatchUp(t *testing.T) {
 	}
 
 	// Verify the store has both events
-	events, _ := store.Load("cart", "user-123")
+	events, _ := store.LoadAggregateEvents("cart", "user-123", 0)
 	if len(events) != 2 {
 		t.Errorf("store: expected 2 events, got %d", len(events))
 	}

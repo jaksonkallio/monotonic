@@ -39,7 +39,7 @@ func NewProjectionFrom(store Store, logic ProjectionLogic, fromGlobalCounter int
 // Update loads and applies all events since the last processed global counter.
 // Returns the number of events processed.
 func (p *Projection) Update() (int, error) {
-	events, err := p.store.LoadEventsSince(p.logic.AggregateTypes(), p.globalCounter)
+	events, err := p.store.LoadGlobalEvents(p.logic.AggregateTypes(), p.globalCounter)
 	if err != nil {
 		return 0, err
 	}

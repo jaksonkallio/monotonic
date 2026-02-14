@@ -140,7 +140,7 @@ func NewSaga(
 
 // LoadSaga hydrates a saga from the store.
 func LoadSaga(store SagaStore, sagaType, id string, actions ActionMap) (*Saga, error) {
-	events, err := store.Load(sagaType, id)
+	events, err := store.LoadAggregateEvents(sagaType, id, 0)
 	if err != nil {
 		return nil, err
 	}

@@ -51,7 +51,7 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify cart checkout-started event was created
-	cartEvents, _ := store.Load("cart", "cart-123")
+	cartEvents, _ := store.LoadAggregateEvents("cart", "cart-123", 0)
 	if len(cartEvents) != 3 { // 2 item-added + 1 checkout-started
 		t.Errorf("expected 3 cart events, got %d", len(cartEvents))
 	}
@@ -66,8 +66,8 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify stock reservation events (1 stock-added + 1 stock-reserved = 2 each)
-	widgetStockEvents, _ := store.Load("stock", "widget")
-	gadgetStockEvents, _ := store.Load("stock", "gadget")
+	widgetStockEvents, _ := store.LoadAggregateEvents("stock", "widget", 0)
+	gadgetStockEvents, _ := store.LoadAggregateEvents("stock", "gadget", 0)
 	if len(widgetStockEvents) != 2 {
 		t.Errorf("expected 2 widget stock events, got %d", len(widgetStockEvents))
 	}
@@ -131,7 +131,7 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify saga events
-	sagaEvents, _ := store.Load("checkout-saga", "checkout-1")
+	sagaEvents, _ := store.LoadAggregateEvents("checkout-saga", "checkout-1", 0)
 	// 1 start + 5 transitions + 1 close = 7 events
 	if len(sagaEvents) != 7 {
 		t.Errorf("expected 7 saga events, got %d", len(sagaEvents))
