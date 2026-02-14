@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -144,14 +145,34 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	return tx.Commit(ctx)
 }
 
-func (s *Store) LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
-	rows, err := s.pool.Query(ctx,
+func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.AggregateID, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
+	// Build dynamic WHERE clause: each filter becomes a condition OR-ed together
+	// $1 is always afterGlobalCounter
+	args := []any{afterGlobalCounter}
+	var conditions []string
+	for _, f := range filters {
+		if f.ID == "" {
+			args = append(args, f.Type)
+			conditions = append(conditions, fmt.Sprintf("aggregate_type = $%d", len(args)))
+		} else {
+			args = append(args, f.Type, f.ID)
+			conditions = append(conditions, fmt.Sprintf("(aggregate_type = $%d AND aggregate_id = $%d)", len(args)-1, len(args)))
+		}
+	}
+
+	filterClause := "FALSE"
+	if len(conditions) > 0 {
+		filterClause = strings.Join(conditions, " OR ")
+	}
+
+	query := fmt.Sprintf(
 		`SELECT aggregate_type, aggregate_id, counter, global_counter, event_type, payload, accepted_at
 		 FROM events
-		 WHERE aggregate_type = ANY($1) AND global_counter > $2
-		 ORDER BY global_counter`,
-		aggregateTypes, afterGlobalCounter,
+		 WHERE (%s) AND global_counter > $1
+		 ORDER BY global_counter`, filterClause,
 	)
+
+	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("load global events: %w", err)
 	}

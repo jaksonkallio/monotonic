@@ -17,9 +17,10 @@ type Store interface {
 	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
 	Append(ctx context.Context, events ...AggregateEvent) error
 
-	// LoadGlobalEvents returns all events for the specified aggregate types with global counter > afterGlobalCounter, ordered by global counter.
-	// Used by projections to catch up on events across multiple aggregate types.
-	LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
+	// LoadGlobalEvents returns all events matching the given filters with global counter > afterGlobalCounter, ordered by global counter.
+	// Each filter is an AggregateID: if ID is empty, all aggregates of that type match; if ID is set, only that specific aggregate matches.
+	// Filters are OR-ed together.
+	LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
 // SagaStore extends Store with saga lifecycle operations
@@ -123,20 +124,20 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	return nil
 }
 
-func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Build a set for O(1) lookup
-	typeSet := make(map[string]bool, len(aggregateTypes))
-	for _, t := range aggregateTypes {
-		typeSet[t] = true
-	}
-
 	var result []AggregateEvent
 	for _, ae := range s.globalEvents {
-		if ae.Event.GlobalCounter > afterGlobalCounter && typeSet[ae.AggregateType] {
-			result = append(result, ae)
+		if ae.Event.GlobalCounter <= afterGlobalCounter {
+			continue
+		}
+		for _, f := range filters {
+			if ae.AggregateType == f.Type && (f.ID == "" || ae.AggregateID == f.ID) {
+				result = append(result, ae)
+				break
+			}
 		}
 	}
 	return result, nil

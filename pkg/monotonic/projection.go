@@ -10,8 +10,9 @@ type ProjectionLogic interface {
 	// Apply processes an event and updates the projection's state.
 	Apply(event AggregateEvent)
 
-	// AggregateTypes returns the aggregate types this projection subscribes to.
-	AggregateTypes() []string
+	// AggregateFilters returns the filters for which aggregates this projection subscribes to.
+	// Each filter is an AggregateID: if ID is empty, all aggregates of that type match; if ID is set, only that specific aggregate matches.
+	AggregateFilters() []AggregateID
 }
 
 // Projection manages catching up on events for a ProjectionLogic implementation.
@@ -48,7 +49,7 @@ func (p *Projection) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.logic.AggregateTypes(), p.globalCounter)
+	events, err := p.store.LoadGlobalEvents(ctx, p.logic.AggregateFilters(), p.globalCounter)
 	if err != nil {
 		return 0, err
 	}
