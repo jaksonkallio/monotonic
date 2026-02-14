@@ -484,7 +484,7 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 
 	// Manually append saga-completed event (bypassing saga.Step's store.Close call)
 	closeEvent := AcceptedEvent{
-		Event:   Event{Type: "saga-completed"},
+		Event:   Event{Type: EventTypeCompleted},
 		Counter: saga.Counter() + 1,
 	}
 	store.Append(ctx, AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})

@@ -56,21 +56,28 @@ type ActionResult struct {
 	SagaFailureReason string
 }
 
-// sagaStartedPayload is stored in the saga-started event
-type sagaStartedPayload struct {
+// Saga event type constants
+const (
+	EventTypeStarted           = "saga-started"
+	EventTypeStateTransitioned = "state-transitioned"
+	EventTypeCompleted         = "saga-completed"
+)
+
+// SagaStartedPayload is stored in the saga-started event
+type SagaStartedPayload struct {
 	InitialState string          `json:"initial_state"`
 	Input        json.RawMessage `json:"input"`
 }
 
-// stateTransitionPayload is stored in state-transitioned events
-type stateTransitionPayload struct {
+// SagaStateTransitionPayload is stored in state-transitioned events
+type SagaStateTransitionPayload struct {
 	ToState string        `json:"to_state"`
 	ReadyAt time.Time     `json:"ready_at,omitempty"`
 	Delay   time.Duration `json:"delay,omitempty"`
 }
 
-// sagaCompletedPayload is stored in the saga-completed event
-type sagaCompletedPayload struct {
+// SagaCompletedPayload is stored in the saga-completed event
+type SagaCompletedPayload struct {
 	FailureReason string `json:"failure_reason,omitempty"`
 }
 
@@ -128,7 +135,7 @@ func NewSaga(
 	}
 
 	// Persist the initial event
-	payload, _ := json.Marshal(sagaStartedPayload{
+	payload, _ := json.Marshal(SagaStartedPayload{
 		InitialState: initialState,
 		Input:        input,
 	})
@@ -138,7 +145,7 @@ func NewSaga(
 		AggregateID:   id,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type:    "saga-started",
+				Type:    EventTypeStarted,
 				Payload: payload,
 			},
 			Counter:    1,
@@ -210,15 +217,15 @@ func (s *Saga) SagaFailureReason() string {
 
 func (s *Saga) apply(event AcceptedEvent) {
 	switch event.Type {
-	case "saga-started":
-		if payload, ok := ParsePayload[sagaStartedPayload](event); ok {
+	case EventTypeStarted:
+		if payload, ok := ParsePayload[SagaStartedPayload](event); ok {
 			s.state = payload.InitialState
 			s.input = payload.Input
 			s.readyAt = event.AcceptedAt
 		}
 
-	case "state-transitioned":
-		if payload, ok := ParsePayload[stateTransitionPayload](event); ok {
+	case EventTypeStateTransitioned:
+		if payload, ok := ParsePayload[SagaStateTransitionPayload](event); ok {
 			s.state = payload.ToState
 			if !payload.ReadyAt.IsZero() {
 				s.readyAt = payload.ReadyAt
@@ -227,9 +234,9 @@ func (s *Saga) apply(event AcceptedEvent) {
 			}
 		}
 
-	case "saga-completed":
+	case EventTypeCompleted:
 		s.completed = true
-		if payload, ok := ParsePayload[sagaCompletedPayload](event); ok {
+		if payload, ok := ParsePayload[SagaCompletedPayload](event); ok {
 			s.sagaFailureReason = payload.FailureReason
 		}
 	}
@@ -295,7 +302,7 @@ func (s *Saga) Step(ctx context.Context) error {
 
 // closeSaga appends a saga-completed event and marks the saga as closed in the store
 func (s *Saga) closeSaga(ctx context.Context, failureReason string) error {
-	payload, _ := json.Marshal(sagaCompletedPayload{
+	payload, _ := json.Marshal(SagaCompletedPayload{
 		FailureReason: failureReason,
 	})
 
@@ -304,7 +311,7 @@ func (s *Saga) closeSaga(ctx context.Context, failureReason string) error {
 		AggregateID:   s.ID.ID,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type:    "saga-completed",
+				Type:    EventTypeCompleted,
 				Payload: payload,
 			},
 			Counter:    s.nextCounter(),
@@ -334,7 +341,7 @@ func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 		readyAt = readyAt.Add(result.Delay)
 	}
 
-	payload, _ := json.Marshal(stateTransitionPayload{
+	payload, _ := json.Marshal(SagaStateTransitionPayload{
 		ToState: result.NewState,
 		ReadyAt: readyAt,
 		Delay:   result.Delay,
@@ -342,7 +349,7 @@ func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 
 	sagaEvent := AcceptedEvent{
 		Event: Event{
-			Type:    "state-transitioned",
+			Type:    EventTypeStateTransitioned,
 			Payload: payload,
 		},
 		Counter:    s.nextCounter(),
