@@ -1,3 +1,4 @@
+// Package monotonic provides a lightweight framework for building event-sourced aggregates with monotonic state changes
 package monotonic
 
 import (
@@ -103,7 +104,7 @@ func (b *AggregateBase) Accept(events ...Event) ([]AcceptedEvent, error) {
 // Hydrate loads an aggregate from the store by replaying all events.
 // The init function should create a new aggregate instance with the base embedded.
 func Hydrate[T Logic](store Store, aggType, id string, init func(*AggregateBase) T) (T, error) {
-	events, err := store.Load(aggType, id)
+	events, err := store.LoadAggregateEvents(aggType, id, 0)
 	if err != nil {
 		var zero T
 		return zero, err

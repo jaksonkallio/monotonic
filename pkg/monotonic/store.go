@@ -4,20 +4,18 @@ import "fmt"
 
 // Store is the interface for event persistence
 type Store interface {
-	// Load returns all events for an aggregate in order
-	Load(aggregateType, aggregateID string) ([]AcceptedEvent, error)
-
-	// LoadAfter returns events with counter > afterCounter
-	LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
+	// LoadAggregateEvents returns events for an aggregate in order.
+	// Only events with counter > afterCounter are returned. Pass 0 to load all events.
+	LoadAggregateEvents(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
 
 	// Append adds new event(s) to the aggregate's event history atomically
 	// Either all events are appended at once or none are
 	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
 	Append(events ...AggregateEvent) error
 
-	// LoadEventsSince returns all events for the specified aggregate types with global counter > afterGlobalCounter, ordered by global counter.
+	// LoadGlobalEvents returns all events for the specified aggregate types with global counter > afterGlobalCounter, ordered by global counter.
 	// Used by projections to catch up on events across multiple aggregate types.
-	LoadEventsSince(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
+	LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
 // SagaStore extends Store with saga lifecycle operations
@@ -57,16 +55,7 @@ func NewInMemoryStore() *InMemoryStore {
 	}
 }
 
-func (s *InMemoryStore) Load(aggregateType, aggregateID string) ([]AcceptedEvent, error) {
-	id := NewAggregateID(aggregateType, aggregateID)
-	agg, exists := s.aggregates[id]
-	if !exists {
-		return nil, nil // New aggregate, no events yet
-	}
-	return agg.events, nil
-}
-
-func (s *InMemoryStore) LoadAfter(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
+func (s *InMemoryStore) LoadAggregateEvents(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
 	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
@@ -123,7 +112,7 @@ func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 	return nil
 }
 
-func (s *InMemoryStore) LoadEventsSince(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
 	// Build a set for O(1) lookup
 	typeSet := make(map[string]bool, len(aggregateTypes))
 	for _, t := range aggregateTypes {
