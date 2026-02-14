@@ -60,12 +60,12 @@ func LoadCheckoutSaga(store monotonic.SagaStore, sagaID string) (*monotonic.Saga
 }
 
 func checkoutStart(ctx context.Context, saga *monotonic.Saga, input checkoutSagaInput, store monotonic.Store) (monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, input.CartID)
+	cart, err := LoadCart(ctx, store, input.CartID)
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
 
-	acceptedEvents, err := cart.Accept(monotonic.Event{Type: EventCheckoutStarted})
+	acceptedEvents, err := cart.Accept(ctx,monotonic.Event{Type: EventCheckoutStarted})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -81,7 +81,7 @@ func checkoutStart(ctx context.Context, saga *monotonic.Saga, input checkoutSaga
 }
 
 func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, input checkoutSagaInput, store monotonic.Store) (monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, input.CartID)
+	cart, err := LoadCart(ctx, store, input.CartID)
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -89,12 +89,12 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, input check
 	events := []monotonic.AggregateEvent{}
 
 	for _, sku := range cart.Items {
-		stock, err := LoadStock(store, sku)
+		stock, err := LoadStock(ctx, store, sku)
 		if err != nil {
 			return monotonic.ActionResult{}, err
 		}
 
-		acceptedEvents, err := stock.Accept(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+		acceptedEvents, err := stock.Accept(ctx,monotonic.NewEvent(EventStockReserved, StockReservedPayload{
 			SagaID:   saga.ID.ID,
 			Quantity: 1,
 		}))
@@ -116,7 +116,7 @@ func checkoutReserveStock(ctx context.Context, saga *monotonic.Saga, input check
 }
 
 func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, input checkoutSagaInput, store monotonic.Store) (monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, input.CartID)
+	cart, err := LoadCart(ctx, store, input.CartID)
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -124,7 +124,7 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, input
 	// Generate a payment token (in real code, this might call a payment service)
 	token := "tok_" + saga.ID.ID
 
-	acceptedEvents, err := cart.Accept(monotonic.NewEvent(EventPaymentTokenSet, PaymentTokenSetPayload{Token: token}))
+	acceptedEvents, err := cart.Accept(ctx,monotonic.NewEvent(EventPaymentTokenSet, PaymentTokenSetPayload{Token: token}))
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -140,7 +140,7 @@ func checkoutCreatePaymentToken(ctx context.Context, saga *monotonic.Saga, input
 }
 
 func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, input checkoutSagaInput, store monotonic.Store) (monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, input.CartID)
+	cart, err := LoadCart(ctx, store, input.CartID)
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -157,7 +157,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, input chec
 		return monotonic.ActionResult{NewState: CheckoutPaymentFailed}, nil
 	}
 
-	acceptedEvents, err := cart.Accept(monotonic.Event{Type: EventPaymentCharged})
+	acceptedEvents, err := cart.Accept(ctx,monotonic.Event{Type: EventPaymentCharged})
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -173,7 +173,7 @@ func checkoutChargePayment(ctx context.Context, saga *monotonic.Saga, input chec
 }
 
 func checkoutConfirmStock(ctx context.Context, saga *monotonic.Saga, input checkoutSagaInput, store monotonic.Store) (monotonic.ActionResult, error) {
-	cart, err := LoadCart(store, input.CartID)
+	cart, err := LoadCart(ctx, store, input.CartID)
 	if err != nil {
 		return monotonic.ActionResult{}, err
 	}
@@ -181,12 +181,12 @@ func checkoutConfirmStock(ctx context.Context, saga *monotonic.Saga, input check
 	events := []monotonic.AggregateEvent{}
 
 	for _, sku := range cart.Items {
-		stock, err := LoadStock(store, sku)
+		stock, err := LoadStock(ctx, store, sku)
 		if err != nil {
 			return monotonic.ActionResult{}, err
 		}
 
-		acceptedEvents, err := stock.Accept(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
+		acceptedEvents, err := stock.Accept(ctx,monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
 			SagaID: saga.ID.ID,
 		}))
 		if err != nil {

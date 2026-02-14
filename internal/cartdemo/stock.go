@@ -1,6 +1,7 @@
 package cartdemo
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 
@@ -43,8 +44,8 @@ type Stock struct {
 }
 
 // LoadStock hydrates a Stock aggregate from the store
-func LoadStock(store monotonic.Store, sku string) (*Stock, error) {
-	return monotonic.Hydrate(store, "stock", sku, func(base *monotonic.AggregateBase) *Stock {
+func LoadStock(ctx context.Context, store monotonic.Store, sku string) (*Stock, error) {
+	return monotonic.Hydrate(ctx, store, "stock", sku, func(base *monotonic.AggregateBase) *Stock {
 		return &Stock{
 			AggregateBase: base,
 			Reserved:      make(map[string]int),

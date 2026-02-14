@@ -218,7 +218,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 	saga, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
 
 	// Verify saga is listed
-	ids, _ := store.ListActiveSagas("test-saga")
+	ids, _ := store.ListActiveSagas(ctx, "test-saga")
 	if len(ids) != 1 {
 		t.Errorf("expected 1 saga, got %d", len(ids))
 	}
@@ -254,7 +254,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 	}
 
 	// ListAggregates should not return completed sagas
-	ids, _ = store.ListActiveSagas("test-saga")
+	ids, _ = store.ListActiveSagas(ctx, "test-saga")
 	if len(ids) != 0 {
 		t.Errorf("expected 0 sagas after closing, got %d", len(ids))
 	}
@@ -272,7 +272,7 @@ func TestSagaClosesOnExplicitClose(t *testing.T) {
 	}
 
 	// Cannot append to closed saga
-	err = store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: AcceptedEvent{Event: Event{Type: "test"}, Counter: 4}})
+	err = store.Append(ctx, AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: AcceptedEvent{Event: Event{Type: "test"}, Counter: 4}})
 	if err == nil {
 		t.Error("expected error when appending to closed saga")
 	}
@@ -400,7 +400,7 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 		Event:   Event{Type: "saga-completed"},
 		Counter: saga.Counter() + 1,
 	}
-	store.Append(AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})
+	store.Append(ctx, AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})
 
 	// Saga event says closed, but store doesn't know yet
 	closed, _ := store.IsSagaCompleted("test-saga", "saga-1")
@@ -409,7 +409,7 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 	}
 
 	// ListAggregates still returns it
-	ids, _ := store.ListActiveSagas("test-saga")
+	ids, _ := store.ListActiveSagas(ctx, "test-saga")
 	if len(ids) != 1 {
 		t.Errorf("expected 1 saga before driver recovery, got %d", len(ids))
 	}
@@ -430,7 +430,7 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 	}
 
 	// ListAggregates should no longer return it
-	ids, _ = store.ListActiveSagas("test-saga")
+	ids, _ = store.ListActiveSagas(ctx, "test-saga")
 	if len(ids) != 0 {
 		t.Errorf("expected 0 sagas after driver recovery, got %d", len(ids))
 	}

@@ -1,5 +1,7 @@
 package monotonic
 
+import "context"
+
 // ProjectionLogic defines how a projection processes events.
 type ProjectionLogic interface {
 	// Apply processes an event and updates the projection's state.
@@ -38,8 +40,8 @@ func NewProjectionFrom(store Store, logic ProjectionLogic, fromGlobalCounter int
 
 // Update loads and applies all events since the last processed global counter.
 // Returns the number of events processed.
-func (p *Projection) Update() (int, error) {
-	events, err := p.store.LoadGlobalEvents(p.logic.AggregateTypes(), p.globalCounter)
+func (p *Projection) Update(ctx context.Context) (int, error) {
+	events, err := p.store.LoadGlobalEvents(ctx, p.logic.AggregateTypes(), p.globalCounter)
 	if err != nil {
 		return 0, err
 	}

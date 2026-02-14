@@ -99,6 +99,8 @@ func NewSaga(
 	input json.RawMessage,
 	actions ActionMap,
 ) (*Saga, error) {
+	ctx := context.Background()
+
 	saga := &Saga{
 		eventStream: eventStream{
 			ID:    NewAggregateID(sagaType, id),
@@ -130,7 +132,7 @@ func NewSaga(
 		},
 	}
 
-	if err := store.Append(event); err != nil {
+	if err := store.Append(ctx, event); err != nil {
 		return nil, fmt.Errorf("persist saga start: %w", err)
 	}
 	saga.counter = 1
@@ -140,7 +142,7 @@ func NewSaga(
 
 // LoadSaga hydrates a saga from the store.
 func LoadSaga(store SagaStore, sagaType, id string, actions ActionMap) (*Saga, error) {
-	events, err := store.LoadAggregateEvents(sagaType, id, 0)
+	events, err := store.LoadAggregateEvents(context.Background(), sagaType, id, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +230,7 @@ func (s *Saga) Step(ctx context.Context) error {
 	}
 
 	// Catch up on any missed events
-	if err := s.catchUp(s.apply); err != nil {
+	if err := s.catchUp(ctx, s.apply); err != nil {
 		return err
 	}
 
@@ -254,7 +256,7 @@ func (s *Saga) Step(ctx context.Context) error {
 		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
-		return s.closeSaga()
+		return s.closeSaga(ctx)
 	}
 
 	if result.NewState == "" {
@@ -265,7 +267,7 @@ func (s *Saga) Step(ctx context.Context) error {
 		return fmt.Errorf("action result delay cannot be negative")
 	}
 
-	if err := s.transition(result); err != nil {
+	if err := s.transition(ctx, result); err != nil {
 		return fmt.Errorf("transition: %w", err)
 	}
 
@@ -273,7 +275,7 @@ func (s *Saga) Step(ctx context.Context) error {
 }
 
 // closeSaga appends a saga-completed event and marks the saga as closed in the store
-func (s *Saga) closeSaga() error {
+func (s *Saga) closeSaga(ctx context.Context) error {
 	closeEvent := AggregateEvent{
 		AggregateType: s.ID.Type,
 		AggregateID:   s.ID.ID,
@@ -286,14 +288,14 @@ func (s *Saga) closeSaga() error {
 		},
 	}
 
-	if err := s.append(closeEvent); err != nil {
+	if err := s.append(ctx, closeEvent); err != nil {
 		return fmt.Errorf("saga close event: %w", err)
 	}
 
 	s.apply(closeEvent.Event)
 	s.applied(closeEvent.Event)
 
-	if err := s.sagaStore.MarkSagaCompleted(s.ID.Type, s.ID.ID); err != nil {
+	if err := s.sagaStore.MarkSagaCompleted(ctx, s.ID.Type, s.ID.ID); err != nil {
 		return fmt.Errorf("mark saga completed: %w", err)
 	}
 
@@ -301,7 +303,7 @@ func (s *Saga) closeSaga() error {
 }
 
 // transition appends a state transition event and any extra events atomically
-func (s *Saga) transition(result ActionResult) error {
+func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 	// Calculate ready time for delayed transitions
 	readyAt := time.Now()
 	if result.Delay > 0 {
@@ -328,7 +330,7 @@ func (s *Saga) transition(result ActionResult) error {
 		{AggregateType: s.ID.Type, AggregateID: s.ID.ID, Event: sagaEvent},
 	}
 	allEvents = append(allEvents, result.Events...)
-	if err := s.append(allEvents...); err != nil {
+	if err := s.append(ctx, allEvents...); err != nil {
 		return fmt.Errorf("saga transition: %w", err)
 	}
 

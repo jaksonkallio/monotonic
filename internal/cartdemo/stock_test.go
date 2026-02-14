@@ -1,6 +1,7 @@
 package cartdemo
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
@@ -8,9 +9,10 @@ import (
 
 func TestStock(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
 	// Load stock for a new SKU (starts empty)
-	stock, err := LoadStock(store, "widget-001")
+	stock, err := LoadStock(ctx, store, "widget-001")
 	if err != nil {
 		t.Fatalf("LoadStock failed: %v", err)
 	}
@@ -20,7 +22,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Add stock
-	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 100}))
+	err = stock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 100}))
 	if err != nil {
 		t.Fatalf("stock-added failed: %v", err)
 	}
@@ -30,7 +32,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Reserve some stock
-	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+	err = stock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockReserved, StockReservedPayload{
 		SagaID:   "checkout-1",
 		Quantity: 10,
 	}))
@@ -46,7 +48,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Try to reserve more than available - should fail
-	err = stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+	err = stock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockReserved, StockReservedPayload{
 		SagaID:   "checkout-2",
 		Quantity: 100,
 	}))
@@ -55,7 +57,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Confirm the first reservation
-	err = stock.AcceptThenApply(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
+	err = stock.AcceptThenApply(ctx, monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{
 		SagaID: "checkout-1",
 	}))
 	if err != nil {
@@ -70,7 +72,7 @@ func TestStock(t *testing.T) {
 	}
 
 	// Hydrate and verify state persists
-	stock2, err := LoadStock(store, "widget-001")
+	stock2, err := LoadStock(ctx, store, "widget-001")
 	if err != nil {
 		t.Fatalf("LoadStock for hydration failed: %v", err)
 	}
@@ -84,10 +86,11 @@ func TestStock(t *testing.T) {
 
 func TestStockRelease(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
-	stock, _ := LoadStock(store, "gadget-001")
-	stock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 50}))
-	stock.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{
+	stock, _ := LoadStock(ctx, store, "gadget-001")
+	stock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 50}))
+	stock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockReserved, StockReservedPayload{
 		SagaID:   "order-1",
 		Quantity: 20,
 	}))
@@ -97,7 +100,7 @@ func TestStockRelease(t *testing.T) {
 	}
 
 	// Release the reservation (e.g., order cancelled)
-	err := stock.AcceptThenApply(monotonic.NewEvent(EventReservationReleased, ReservationPayload{
+	err := stock.AcceptThenApply(ctx, monotonic.NewEvent(EventReservationReleased, ReservationPayload{
 		SagaID: "order-1",
 	}))
 	if err != nil {

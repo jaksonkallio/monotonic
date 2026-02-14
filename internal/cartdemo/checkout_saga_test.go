@@ -13,15 +13,15 @@ func TestCheckoutSaga(t *testing.T) {
 	ctx := context.Background()
 
 	// First, set up stock for the items
-	widgetStock, _ := LoadStock(store, "widget")
-	widgetStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
-	gadgetStock, _ := LoadStock(store, "gadget")
-	gadgetStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 5}))
+	widgetStock, _ := LoadStock(ctx, store, "widget")
+	widgetStock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
+	gadgetStock, _ := LoadStock(ctx, store, "gadget")
+	gadgetStock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 5}))
 
 	// Create a cart with items
-	cart, _ := LoadCart(store, "cart-123")
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
+	cart, _ := LoadCart(ctx, store, "cart-123")
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
 
 	// Start a checkout saga for this cart
 	saga, err := StartCheckoutSaga(ctx, store, "checkout-1", "cart-123")
@@ -51,7 +51,7 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify cart checkout-started event was created
-	cartEvents, _ := store.LoadAggregateEvents("cart", "cart-123", 0)
+	cartEvents, _ := store.LoadAggregateEvents(ctx, "cart", "cart-123", 0)
 	if len(cartEvents) != 3 { // 2 item-added + 1 checkout-started
 		t.Errorf("expected 3 cart events, got %d", len(cartEvents))
 	}
@@ -66,8 +66,8 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify stock reservation events (1 stock-added + 1 stock-reserved = 2 each)
-	widgetStockEvents, _ := store.LoadAggregateEvents("stock", "widget", 0)
-	gadgetStockEvents, _ := store.LoadAggregateEvents("stock", "gadget", 0)
+	widgetStockEvents, _ := store.LoadAggregateEvents(ctx, "stock", "widget", 0)
+	gadgetStockEvents, _ := store.LoadAggregateEvents(ctx, "stock", "gadget", 0)
 	if len(widgetStockEvents) != 2 {
 		t.Errorf("expected 2 widget stock events, got %d", len(widgetStockEvents))
 	}
@@ -103,8 +103,8 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify stock reservations were confirmed (reservation tracking cleared)
-	finalWidgetStock, _ := LoadStock(store, "widget")
-	finalGadgetStock, _ := LoadStock(store, "gadget")
+	finalWidgetStock, _ := LoadStock(ctx, store, "widget")
+	finalGadgetStock, _ := LoadStock(ctx, store, "gadget")
 	if finalWidgetStock.TotalReserved() != 0 {
 		t.Errorf("expected widget reservations to be confirmed, got %d reserved", finalWidgetStock.TotalReserved())
 	}
@@ -131,7 +131,7 @@ func TestCheckoutSaga(t *testing.T) {
 	}
 
 	// Verify saga events
-	sagaEvents, _ := store.LoadAggregateEvents("checkout-saga", "checkout-1", 0)
+	sagaEvents, _ := store.LoadAggregateEvents(ctx, "checkout-saga", "checkout-1", 0)
 	// 1 start + 5 transitions + 1 close = 7 events
 	if len(sagaEvents) != 7 {
 		t.Errorf("expected 7 saga events, got %d", len(sagaEvents))
@@ -143,12 +143,12 @@ func TestCheckoutSagaHydration(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up stock
-	thingStock, _ := LoadStock(store, "thing")
-	thingStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
+	thingStock, _ := LoadStock(ctx, store, "thing")
+	thingStock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
 
 	// Create cart
-	cart, _ := LoadCart(store, "cart-456")
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "thing"}))
+	cart, _ := LoadCart(ctx, store, "cart-456")
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "thing"}))
 
 	// Start and run saga partway
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-2", "cart-456")
@@ -191,12 +191,12 @@ func TestCheckoutSagaRun(t *testing.T) {
 	ctx := context.Background()
 
 	// Set up stock
-	itemStock, _ := LoadStock(store, "item")
-	itemStock.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
+	itemStock, _ := LoadStock(ctx, store, "item")
+	itemStock.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 10}))
 
 	// Create cart
-	cart, _ := LoadCart(store, "cart-789")
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "item"}))
+	cart, _ := LoadCart(ctx, store, "cart-789")
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "item"}))
 
 	// Start saga and run to completion
 	saga, _ := StartCheckoutSaga(ctx, store, "checkout-3", "cart-789")

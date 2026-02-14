@@ -2,6 +2,7 @@
 package monotonic
 
 import (
+	"context"
 	"fmt"
 	"time"
 )
@@ -35,14 +36,14 @@ type AggregateBase struct {
 }
 
 // AcceptThenApply applies the event to the aggregate after it has been accepted, effectively recording the event and updating the state in one step.
-func (b *AggregateBase) AcceptThenApply(events ...Event) error {
+func (b *AggregateBase) AcceptThenApply(ctx context.Context, events ...Event) error {
 	if len(events) == 0 {
 		// No-op
 		return nil
 	}
 
 	// Accept all events atomically
-	acceptedEvents, err := b.Accept(events...)
+	acceptedEvents, err := b.Accept(ctx, events...)
 	if err != nil {
 		return fmt.Errorf("accept: %w", err)
 	}
@@ -58,7 +59,7 @@ func (b *AggregateBase) AcceptThenApply(events ...Event) error {
 	}
 
 	// Append all events atomically
-	if err := b.append(aggregateEvents...); err != nil {
+	if err := b.append(ctx, aggregateEvents...); err != nil {
 		return err
 	}
 
@@ -73,13 +74,13 @@ func (b *AggregateBase) AcceptThenApply(events ...Event) error {
 
 // Accept accepts events without applying yet
 // Use when you need to prepare events for multiple aggregates to be committed atomically, such as in a saga
-func (b *AggregateBase) Accept(events ...Event) ([]AcceptedEvent, error) {
+func (b *AggregateBase) Accept(ctx context.Context, events ...Event) ([]AcceptedEvent, error) {
 	if len(events) == 0 {
 		// No-op
 		return nil, nil
 	}
 
-	if err := b.catchUp(b.self.Apply); err != nil {
+	if err := b.catchUp(ctx, b.self.Apply); err != nil {
 		return nil, err
 	}
 
@@ -103,8 +104,8 @@ func (b *AggregateBase) Accept(events ...Event) ([]AcceptedEvent, error) {
 
 // Hydrate loads an aggregate from the store by replaying all events.
 // The init function should create a new aggregate instance with the base embedded.
-func Hydrate[T Logic](store Store, aggType, id string, init func(*AggregateBase) T) (T, error) {
-	events, err := store.LoadAggregateEvents(aggType, id, 0)
+func Hydrate[T Logic](ctx context.Context, store Store, aggType, id string, init func(*AggregateBase) T) (T, error) {
+	events, err := store.LoadAggregateEvents(ctx, aggType, id, 0)
 	if err != nil {
 		var zero T
 		return zero, err

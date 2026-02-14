@@ -1,21 +1,24 @@
 package monotonic
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // Store is the interface for event persistence
 type Store interface {
 	// LoadAggregateEvents returns events for an aggregate in order.
 	// Only events with counter > afterCounter are returned. Pass 0 to load all events.
-	LoadAggregateEvents(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
+	LoadAggregateEvents(ctx context.Context, aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
 
 	// Append adds new event(s) to the aggregate's event history atomically
 	// Either all events are appended at once or none are
 	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
-	Append(events ...AggregateEvent) error
+	Append(ctx context.Context, events ...AggregateEvent) error
 
 	// LoadGlobalEvents returns all events for the specified aggregate types with global counter > afterGlobalCounter, ordered by global counter.
 	// Used by projections to catch up on events across multiple aggregate types.
-	LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
+	LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
 // SagaStore extends Store with saga lifecycle operations
@@ -23,12 +26,12 @@ type SagaStore interface {
 	Store
 
 	// ListActiveSagas returns all saga IDs of a given type that have not been marked completed
-	ListActiveSagas(sagaType string) ([]string, error)
+	ListActiveSagas(ctx context.Context, sagaType string) ([]string, error)
 
 	// MarkSagaCompleted marks a saga as completed
 	// Completed sagas cannot have more events appended and are not returned by `ListActiveSagas`
 	// Idempotent, marking an already completed saga is a no-op
-	MarkSagaCompleted(sagaType, sagaID string) error
+	MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error
 }
 
 // ErrSagaCompleted is returned when attempting to append to a completed saga
@@ -55,7 +58,7 @@ func NewInMemoryStore() *InMemoryStore {
 	}
 }
 
-func (s *InMemoryStore) LoadAggregateEvents(aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
+func (s *InMemoryStore) LoadAggregateEvents(ctx context.Context, aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
 	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
@@ -70,7 +73,7 @@ func (s *InMemoryStore) LoadAggregateEvents(aggregateType, aggregateID string, a
 	return agg.events[afterCounter:], nil
 }
 
-func (s *InMemoryStore) Append(events ...AggregateEvent) error {
+func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) error {
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
@@ -112,7 +115,7 @@ func (s *InMemoryStore) Append(events ...AggregateEvent) error {
 	return nil
 }
 
-func (s *InMemoryStore) LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
 	// Build a set for O(1) lookup
 	typeSet := make(map[string]bool, len(aggregateTypes))
 	for _, t := range aggregateTypes {
@@ -128,7 +131,7 @@ func (s *InMemoryStore) LoadGlobalEvents(aggregateTypes []string, afterGlobalCou
 	return result, nil
 }
 
-func (s *InMemoryStore) ListActiveSagas(sagaType string) ([]string, error) {
+func (s *InMemoryStore) ListActiveSagas(ctx context.Context, sagaType string) ([]string, error) {
 	var ids []string
 	for aggID, agg := range s.aggregates {
 		if aggID.Type == sagaType && !agg.completed {
@@ -138,7 +141,7 @@ func (s *InMemoryStore) ListActiveSagas(sagaType string) ([]string, error) {
 	return ids, nil
 }
 
-func (s *InMemoryStore) MarkSagaCompleted(sagaType, sagaID string) error {
+func (s *InMemoryStore) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
 	id := NewAggregateID(sagaType, sagaID)
 	agg, exists := s.aggregates[id]
 	if !exists {

@@ -1,6 +1,7 @@
 package cartdemo
 
 import (
+	"context"
 	"errors"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
@@ -35,8 +36,8 @@ type Cart struct {
 }
 
 // LoadCart hydrates a Cart aggregate from the store
-func LoadCart(store monotonic.Store, id string) (*Cart, error) {
-	return monotonic.Hydrate(store, "cart", id, func(base *monotonic.AggregateBase) *Cart {
+func LoadCart(ctx context.Context, store monotonic.Store, id string) (*Cart, error) {
+	return monotonic.Hydrate(ctx, store, "cart", id, func(base *monotonic.AggregateBase) *Cart {
 		return &Cart{AggregateBase: base}
 	})
 }

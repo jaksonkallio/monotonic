@@ -1,6 +1,7 @@
 package cartdemo
 
 import (
+	"context"
 	"testing"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
@@ -56,39 +57,40 @@ func (p *OrderStatsProjection) Apply(event monotonic.AggregateEvent) {
 
 func TestProjection(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
 	// Set up some stock
-	widget, _ := LoadStock(store, "widget")
-	widget.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 100}))
+	widget, _ := LoadStock(ctx, store, "widget")
+	widget.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 100}))
 
-	gadget, _ := LoadStock(store, "gadget")
-	gadget.AcceptThenApply(monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 50}))
+	gadget, _ := LoadStock(ctx, store, "gadget")
+	gadget.AcceptThenApply(ctx, monotonic.NewEvent(EventStockAdded, StockAddedPayload{Quantity: 50}))
 
 	// Create a cart and go through checkout
-	cart, _ := LoadCart(store, "cart-1")
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
+	cart, _ := LoadCart(ctx, store, "cart-1")
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
 
 	// Simulate checkout steps (normally done by saga, but we'll do directly for testing)
-	cart.AcceptThenApply(monotonic.Event{Type: EventCheckoutStarted})
+	cart.AcceptThenApply(ctx, monotonic.Event{Type: EventCheckoutStarted})
 
 	// Reserve stock
-	widget.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{SagaID: "saga-1", Quantity: 1}))
-	gadget.AcceptThenApply(monotonic.NewEvent(EventStockReserved, StockReservedPayload{SagaID: "saga-1", Quantity: 1}))
+	widget.AcceptThenApply(ctx, monotonic.NewEvent(EventStockReserved, StockReservedPayload{SagaID: "saga-1", Quantity: 1}))
+	gadget.AcceptThenApply(ctx, monotonic.NewEvent(EventStockReserved, StockReservedPayload{SagaID: "saga-1", Quantity: 1}))
 
 	// Payment
-	cart.AcceptThenApply(monotonic.NewEvent(EventPaymentTokenSet, PaymentTokenSetPayload{Token: "tok_123"}))
-	cart.AcceptThenApply(monotonic.Event{Type: EventPaymentCharged})
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventPaymentTokenSet, PaymentTokenSetPayload{Token: "tok_123"}))
+	cart.AcceptThenApply(ctx, monotonic.Event{Type: EventPaymentCharged})
 
 	// Confirm reservations
-	widget.AcceptThenApply(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{SagaID: "saga-1"}))
-	gadget.AcceptThenApply(monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{SagaID: "saga-1"}))
+	widget.AcceptThenApply(ctx, monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{SagaID: "saga-1"}))
+	gadget.AcceptThenApply(ctx, monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{SagaID: "saga-1"}))
 
 	// Create projection and catch up
 	stats := NewOrderStatsProjection()
 	projection := monotonic.NewProjection(store, stats)
 
-	processed, err := projection.Update()
+	processed, err := projection.Update(ctx)
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
@@ -115,11 +117,11 @@ func TestProjection(t *testing.T) {
 	}
 
 	// Add more events and catch up again
-	cart2, _ := LoadCart(store, "cart-2")
-	cart2.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
-	cart2.AcceptThenApply(monotonic.Event{Type: EventCheckoutStarted})
+	cart2, _ := LoadCart(ctx, store, "cart-2")
+	cart2.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
+	cart2.AcceptThenApply(ctx, monotonic.Event{Type: EventCheckoutStarted})
 
-	processed, err = projection.Update()
+	processed, err = projection.Update(ctx)
 	if err != nil {
 		t.Fatalf("second CatchUp failed: %v", err)
 	}
@@ -140,28 +142,29 @@ func TestProjection(t *testing.T) {
 
 func TestProjectionFromCounter(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
 	// Create some events
-	cart, _ := LoadCart(store, "cart-1")
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
-	cart.AcceptThenApply(monotonic.Event{Type: EventCheckoutStarted})
-	cart.AcceptThenApply(monotonic.Event{Type: EventPaymentCharged})
+	cart, _ := LoadCart(ctx, store, "cart-1")
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
+	cart.AcceptThenApply(ctx, monotonic.Event{Type: EventCheckoutStarted})
+	cart.AcceptThenApply(ctx, monotonic.Event{Type: EventPaymentCharged})
 
 	// Create projection and catch up
 	stats1 := NewOrderStatsProjection()
 	proj1 := monotonic.NewProjection(store, stats1)
-	proj1.Update()
+	proj1.Update(ctx)
 
 	savedCounter := proj1.GlobalCounter()
 
 	// Add more events
-	cart.AcceptThenApply(monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
+	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
 
 	// Create a new projection starting from saved counter (simulating resume)
 	stats2 := NewOrderStatsProjection()
 	proj2 := monotonic.NewProjectionFrom(store, stats2, savedCounter)
 
-	processed, _ := proj2.Update()
+	processed, _ := proj2.Update(ctx)
 
 	// Should only process the new event
 	if processed != 1 {
