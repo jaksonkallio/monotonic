@@ -3,6 +3,7 @@ package monotonic
 import (
 	"context"
 	"fmt"
+	"sync"
 )
 
 // Store is the interface for event persistence
@@ -42,9 +43,10 @@ type inMemoryStoredAggregate struct {
 	completed bool // only used for sagas
 }
 
-// InMemoryStore is an in-memory implementation of the Store interface,
-// useful for testing and development.
+// InMemoryStore is an in-memory implementation of the Store interface
+// Useful for testing and development
 type InMemoryStore struct {
+	mu            sync.Mutex
 	aggregates    map[AggregateID]*inMemoryStoredAggregate
 	globalEvents  []AggregateEvent // all events in global order
 	globalCounter int64            // next global counter to assign
@@ -59,6 +61,9 @@ func NewInMemoryStore() *InMemoryStore {
 }
 
 func (s *InMemoryStore) LoadAggregateEvents(ctx context.Context, aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	id := NewAggregateID(aggregateType, aggregateID)
 	agg, exists := s.aggregates[id]
 	if !exists {
@@ -74,6 +79,9 @@ func (s *InMemoryStore) LoadAggregateEvents(ctx context.Context, aggregateType, 
 }
 
 func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
@@ -116,6 +124,9 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 }
 
 func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]AggregateEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// Build a set for O(1) lookup
 	typeSet := make(map[string]bool, len(aggregateTypes))
 	for _, t := range aggregateTypes {
@@ -132,6 +143,9 @@ func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, aggregateTypes []s
 }
 
 func (s *InMemoryStore) ListActiveSagas(ctx context.Context, sagaType string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var ids []string
 	for aggID, agg := range s.aggregates {
 		if aggID.Type == sagaType && !agg.completed {
@@ -142,6 +156,9 @@ func (s *InMemoryStore) ListActiveSagas(ctx context.Context, sagaType string) ([
 }
 
 func (s *InMemoryStore) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	id := NewAggregateID(sagaType, sagaID)
 	agg, exists := s.aggregates[id]
 	if !exists {
@@ -153,6 +170,9 @@ func (s *InMemoryStore) MarkSagaCompleted(ctx context.Context, sagaType, sagaID 
 }
 
 func (s *InMemoryStore) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	id := NewAggregateID(sagaType, sagaID)
 	agg, exists := s.aggregates[id]
 	if !exists {
