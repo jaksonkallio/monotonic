@@ -3,6 +3,7 @@ package monotonic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -70,6 +71,23 @@ func (b *AggregateBase) AcceptThenApply(ctx context.Context, events ...Event) er
 	}
 
 	return nil
+}
+
+func (b *AggregateBase) AcceptThenApplyRetryable(ctx context.Context, retry Retry, events ...Event) error {
+	var lastAttemptErr error
+	for attemptCounter := 0; ; attemptCounter++ {
+		if err := retry.WaitForNextAttempt(ctx, attemptCounter); err != nil {
+			if errors.Is(err, ErrMaxAttemptsExceeded) {
+				return fmt.Errorf("%w, last attempt error: %w", err, lastAttemptErr)
+			}
+			return fmt.Errorf("wait for next attempt: %w", err)
+		}
+
+		lastAttemptErr = b.AcceptThenApply(ctx, events...)
+		if lastAttemptErr == nil {
+			return nil
+		}
+	}
 }
 
 // Accept accepts events without applying yet
