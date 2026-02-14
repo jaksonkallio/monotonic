@@ -22,8 +22,11 @@ func NewOrderStatsProjection() *OrderStatsProjection {
 	}
 }
 
-func (p *OrderStatsProjection) AggregateTypes() []string {
-	return []string{"cart", "stock"}
+func (p *OrderStatsProjection) AggregateFilters() []monotonic.AggregateID {
+	return []monotonic.AggregateID{
+		{Type: "cart"},
+		{Type: "stock"},
+	}
 }
 
 func (p *OrderStatsProjection) Apply(event monotonic.AggregateEvent) {

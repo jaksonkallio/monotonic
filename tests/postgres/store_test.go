@@ -258,7 +258,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load only cart events
-	events, err := store.LoadGlobalEvents(ctx,[]string{"cart"}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}}, 0)
 	if err != nil {
 		t.Fatalf("load global cart: %v", err)
 	}
@@ -270,7 +270,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load both types
-	events, err = store.LoadGlobalEvents(ctx,[]string{"cart", "stock"}, 0)
+	events, err = store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}, {Type: "stock"}}, 0)
 	if err != nil {
 		t.Fatalf("load global both: %v", err)
 	}
@@ -285,7 +285,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 
 	// Load with afterGlobalCounter filter
 	afterGC := events[0].Event.GlobalCounter
-	events, err = store.LoadGlobalEvents(ctx,[]string{"cart", "stock"}, afterGC)
+	events, err = store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}, {Type: "stock"}}, afterGC)
 	if err != nil {
 		t.Fatalf("load global after: %v", err)
 	}
@@ -612,7 +612,7 @@ func TestGlobalCounterOrdering(t *testing.T) {
 		}
 	}
 
-	events, err := store.LoadGlobalEvents(ctx,[]string{"cart"}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}}, 0)
 	if err != nil {
 		t.Fatalf("load global: %v", err)
 	}
