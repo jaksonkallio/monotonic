@@ -43,12 +43,17 @@ type ActionResult struct {
 
 	// Complete indicates the saga should be completed
 	// Typical pattern: transition to some "completed" state, then have "completed" action return `Complete` as true
-	// When true, other fields must be empty because completing implies that no other subsequent transitions or actions can occur
+	// When true, NewState, Events, and Delay must be empty because completing implies that no other subsequent transitions or actions can occur
 	Complete bool
 
 	// Delay before the next step can run
 	// Must be zero if `Complete` is true
 	Delay time.Duration
+
+	// SagaFailureReason is an optional message explaining why the saga failed
+	// May be non-empty only when `Complete` is true
+	// An empty string on a completed saga indicates successful completion
+	SagaFailureReason string
 }
 
 // sagaStartedPayload is stored in the saga-started event
@@ -62,6 +67,11 @@ type stateTransitionPayload struct {
 	ToState string        `json:"to_state"`
 	ReadyAt time.Time     `json:"ready_at,omitempty"`
 	Delay   time.Duration `json:"delay,omitempty"`
+}
+
+// sagaCompletedPayload is stored in the saga-completed event
+type sagaCompletedPayload struct {
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 // Saga is a state machine that coordinates multiple aggregates.
@@ -84,6 +94,10 @@ type Saga struct {
 
 	// Completed indicates whether the saga is completed
 	completed bool
+
+	// SagaFailureReason is the reason the saga failed, if it failed
+	// Empty string indicates successful completion (or not yet completed)
+	sagaFailureReason string
 
 	actions ActionMap
 }
@@ -188,27 +202,36 @@ func (s *Saga) Completed() bool {
 	return s.completed
 }
 
+// SagaFailureReason returns the failure reason if the saga completed with a failure.
+// Returns empty string for successful completions or sagas that haven't completed yet.
+func (s *Saga) SagaFailureReason() string {
+	return s.sagaFailureReason
+}
+
 func (s *Saga) apply(event AcceptedEvent) {
 	switch event.Type {
 	case "saga-started":
-		var payload sagaStartedPayload
-		json.Unmarshal(event.Payload, &payload)
-		s.state = payload.InitialState
-		s.input = payload.Input
-		s.readyAt = event.AcceptedAt
+		if payload, ok := ParsePayload[sagaStartedPayload](event); ok {
+			s.state = payload.InitialState
+			s.input = payload.Input
+			s.readyAt = event.AcceptedAt
+		}
 
 	case "state-transitioned":
-		var payload stateTransitionPayload
-		json.Unmarshal(event.Payload, &payload)
-		s.state = payload.ToState
-		if !payload.ReadyAt.IsZero() {
-			s.readyAt = payload.ReadyAt
-		} else {
-			s.readyAt = event.AcceptedAt
+		if payload, ok := ParsePayload[stateTransitionPayload](event); ok {
+			s.state = payload.ToState
+			if !payload.ReadyAt.IsZero() {
+				s.readyAt = payload.ReadyAt
+			} else {
+				s.readyAt = event.AcceptedAt
+			}
 		}
 
 	case "saga-completed":
 		s.completed = true
+		if payload, ok := ParsePayload[sagaCompletedPayload](event); ok {
+			s.sagaFailureReason = payload.FailureReason
+		}
 	}
 }
 
@@ -248,7 +271,11 @@ func (s *Saga) Step(ctx context.Context) error {
 		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
 			return ErrInvalidCloseResult
 		}
-		return s.closeSaga(ctx)
+		return s.closeSaga(ctx, result.SagaFailureReason)
+	}
+
+	if result.SagaFailureReason != "" {
+		return fmt.Errorf("SagaFailureReason can only be set when Complete is true")
 	}
 
 	if result.NewState == "" {
@@ -267,13 +294,18 @@ func (s *Saga) Step(ctx context.Context) error {
 }
 
 // closeSaga appends a saga-completed event and marks the saga as closed in the store
-func (s *Saga) closeSaga(ctx context.Context) error {
+func (s *Saga) closeSaga(ctx context.Context, failureReason string) error {
+	payload, _ := json.Marshal(sagaCompletedPayload{
+		FailureReason: failureReason,
+	})
+
 	closeEvent := AggregateEvent{
 		AggregateType: s.ID.Type,
 		AggregateID:   s.ID.ID,
 		Event: AcceptedEvent{
 			Event: Event{
-				Type: "saga-completed",
+				Type:    "saga-completed",
+				Payload: payload,
 			},
 			Counter:    s.nextCounter(),
 			AcceptedAt: time.Now(),
