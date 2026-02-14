@@ -1,6 +1,9 @@
 package monotonic
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // eventStream provides low-level event storage and replay functionality.
 // Both AggregateBase and Saga embed this to share common event handling code.
@@ -17,8 +20,8 @@ func (e *eventStream) Counter() int64 {
 
 // catchUp replays any events from the store that haven't been seen yet.
 // The apply function is called for each new event.
-func (e *eventStream) catchUp(apply func(AcceptedEvent)) error {
-	events, err := e.store.LoadAggregateEvents(e.ID.Type, e.ID.ID, e.counter)
+func (e *eventStream) catchUp(ctx context.Context, apply func(AcceptedEvent)) error {
+	events, err := e.store.LoadAggregateEvents(ctx, e.ID.Type, e.ID.ID, e.counter)
 	if err != nil {
 		return fmt.Errorf("catch up: %w", err)
 	}
@@ -31,9 +34,9 @@ func (e *eventStream) catchUp(apply func(AcceptedEvent)) error {
 	return nil
 }
 
-// append adds a single event to the store
-func (e *eventStream) append(events ...AggregateEvent) error {
-	return e.store.Append(events...)
+// append adds events to the store
+func (e *eventStream) append(ctx context.Context, events ...AggregateEvent) error {
+	return e.store.Append(ctx, events...)
 }
 
 // nextCounter returns the counter value for the next event

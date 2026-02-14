@@ -69,7 +69,7 @@ func (d *SagaDriver) Run(ctx context.Context) error {
 // StepAll steps all sagas of the configured type once
 // Normally called repeatedly in `Run`, but also useful for testing purposes
 func (d *SagaDriver) StepAll(ctx context.Context) error {
-	ids, err := d.store.ListActiveSagas(d.sagaType)
+	ids, err := d.store.ListActiveSagas(ctx, d.sagaType)
 	if err != nil {
 		return fmt.Errorf("list active sagas: %w", err)
 	}
@@ -99,7 +99,7 @@ func (d *SagaDriver) stepSaga(ctx context.Context, id string) error {
 	// sync the store. This handles the case where we crashed between appending
 	// the saga-completed event and calling MarkSagaCompleted.
 	if saga.Completed() {
-		if err := d.store.MarkSagaCompleted(d.sagaType, id); err != nil {
+		if err := d.store.MarkSagaCompleted(ctx, d.sagaType, id); err != nil {
 			return fmt.Errorf("mark saga completed: %w", err)
 		}
 		return nil

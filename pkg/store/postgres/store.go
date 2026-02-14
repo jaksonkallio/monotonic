@@ -54,8 +54,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 	return err
 }
 
-func (s *Store) LoadAggregateEvents(aggregateType, aggregateID string, afterCounter int64) ([]monotonic.AcceptedEvent, error) {
-	rows, err := s.pool.Query(context.Background(),
+func (s *Store) LoadAggregateEvents(ctx context.Context, aggregateType, aggregateID string, afterCounter int64) ([]monotonic.AcceptedEvent, error) {
+	rows, err := s.pool.Query(ctx,
 		`SELECT counter, global_counter, event_type, payload, accepted_at
 		 FROM events
 		 WHERE aggregate_type = $1 AND aggregate_id = $2 AND counter > $3
@@ -82,16 +82,16 @@ func (s *Store) LoadAggregateEvents(aggregateType, aggregateID string, afterCoun
 	return events, rows.Err()
 }
 
-func (s *Store) Append(events ...monotonic.AggregateEvent) error {
+func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	tx, err := s.pool.Begin(context.Background())
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
-	defer tx.Rollback(context.Background())
+	defer tx.Rollback(ctx)
 
 	// Collect distinct aggregates to check saga completion
 	type aggKey struct{ typ, id string }
@@ -106,7 +106,7 @@ func (s *Store) Append(events ...monotonic.AggregateEvent) error {
 
 		// Check saga completion with row-level lock
 		var completed bool
-		err := tx.QueryRow(context.Background(),
+		err := tx.QueryRow(ctx,
 			`SELECT completed FROM sagas WHERE saga_type = $1 AND saga_id = $2 FOR UPDATE`,
 			ae.AggregateType, ae.AggregateID,
 		).Scan(&completed)
@@ -120,7 +120,7 @@ func (s *Store) Append(events ...monotonic.AggregateEvent) error {
 
 	// Insert all events; rely on UNIQUE constraint for counter conflicts
 	for _, ae := range events {
-		_, err := tx.Exec(context.Background(),
+		_, err := tx.Exec(ctx,
 			`INSERT INTO events (aggregate_type, aggregate_id, counter, event_type, payload, accepted_at)
 			 VALUES ($1, $2, $3, $4, $5, $6)`,
 			ae.AggregateType, ae.AggregateID,
@@ -131,7 +131,7 @@ func (s *Store) Append(events ...monotonic.AggregateEvent) error {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
 				// Unique violation on (aggregate_type, aggregate_id, counter)
-				expected, _ := currentMaxCounter(context.Background(), tx, ae.AggregateType, ae.AggregateID)
+				expected, _ := currentMaxCounter(ctx, tx, ae.AggregateType, ae.AggregateID)
 				return fmt.Errorf(
 					"event counter mismatch for %s/%s: expected %d, got %d",
 					ae.AggregateType, ae.AggregateID, expected+1, ae.Event.Counter,
@@ -141,11 +141,11 @@ func (s *Store) Append(events ...monotonic.AggregateEvent) error {
 		}
 	}
 
-	return tx.Commit(context.Background())
+	return tx.Commit(ctx)
 }
 
-func (s *Store) LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
-	rows, err := s.pool.Query(context.Background(),
+func (s *Store) LoadGlobalEvents(ctx context.Context, aggregateTypes []string, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
+	rows, err := s.pool.Query(ctx,
 		`SELECT aggregate_type, aggregate_id, counter, global_counter, event_type, payload, accepted_at
 		 FROM events
 		 WHERE aggregate_type = ANY($1) AND global_counter > $2
@@ -176,8 +176,8 @@ func (s *Store) LoadGlobalEvents(aggregateTypes []string, afterGlobalCounter int
 	return result, rows.Err()
 }
 
-func (s *Store) ListActiveSagas(sagaType string) ([]string, error) {
-	rows, err := s.pool.Query(context.Background(),
+func (s *Store) ListActiveSagas(ctx context.Context, sagaType string) ([]string, error) {
+	rows, err := s.pool.Query(ctx,
 		`SELECT saga_id FROM sagas WHERE saga_type = $1 AND completed = FALSE`,
 		sagaType,
 	)
@@ -197,8 +197,8 @@ func (s *Store) ListActiveSagas(sagaType string) ([]string, error) {
 	return ids, rows.Err()
 }
 
-func (s *Store) MarkSagaCompleted(sagaType, sagaID string) error {
-	_, err := s.pool.Exec(context.Background(),
+func (s *Store) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
+	_, err := s.pool.Exec(ctx,
 		`INSERT INTO sagas (saga_type, saga_id, completed) VALUES ($1, $2, TRUE)
 		 ON CONFLICT (saga_type, saga_id) DO UPDATE SET completed = TRUE`,
 		sagaType, sagaID,

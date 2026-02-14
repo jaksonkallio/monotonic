@@ -1,5 +1,10 @@
 package monotonic
 
+import (
+	"context"
+	"sync"
+)
+
 // ProjectionLogic defines how a projection processes events.
 type ProjectionLogic interface {
 	// Apply processes an event and updates the projection's state.
@@ -11,6 +16,7 @@ type ProjectionLogic interface {
 
 // Projection manages catching up on events for a ProjectionLogic implementation.
 type Projection struct {
+	mu            sync.Mutex
 	store         Store
 	logic         ProjectionLogic
 	globalCounter int64
@@ -38,8 +44,11 @@ func NewProjectionFrom(store Store, logic ProjectionLogic, fromGlobalCounter int
 
 // Update loads and applies all events since the last processed global counter.
 // Returns the number of events processed.
-func (p *Projection) Update() (int, error) {
-	events, err := p.store.LoadGlobalEvents(p.logic.AggregateTypes(), p.globalCounter)
+func (p *Projection) Update(ctx context.Context) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	events, err := p.store.LoadGlobalEvents(ctx, p.logic.AggregateTypes(), p.globalCounter)
 	if err != nil {
 		return 0, err
 	}
@@ -55,5 +64,8 @@ func (p *Projection) Update() (int, error) {
 // GlobalCounter returns the last processed global counter.
 // Useful for persisting projection progress.
 func (p *Projection) GlobalCounter() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
 	return p.globalCounter
 }

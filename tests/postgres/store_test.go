@@ -74,6 +74,7 @@ func testStore(t *testing.T) *pgstore.Store {
 
 func TestAppendAndLoad(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	events := []monotonic.AggregateEvent{
 		{
@@ -96,13 +97,13 @@ func TestAppendAndLoad(t *testing.T) {
 		},
 	}
 
-	err := store.Append(events...)
+	err := store.Append(ctx,events...)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
 
 	// Load all events
-	loaded, err := store.LoadAggregateEvents("cart", "cart-1", 0)
+	loaded, err := store.LoadAggregateEvents(ctx,"cart", "cart-1", 0)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -123,7 +124,7 @@ func TestAppendAndLoad(t *testing.T) {
 	}
 
 	// Load with afterCounter filter
-	loaded, err = store.LoadAggregateEvents("cart", "cart-1", 1)
+	loaded, err = store.LoadAggregateEvents(ctx,"cart", "cart-1", 1)
 	if err != nil {
 		t.Fatalf("load after counter: %v", err)
 	}
@@ -137,9 +138,10 @@ func TestAppendAndLoad(t *testing.T) {
 
 func TestAppendCounterMismatch(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Append first event
-	err := store.Append(monotonic.AggregateEvent{
+	err := store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -153,7 +155,7 @@ func TestAppendCounterMismatch(t *testing.T) {
 	}
 
 	// Append with wrong counter (1 again instead of 2)
-	err = store.Append(monotonic.AggregateEvent{
+	err = store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -174,9 +176,10 @@ func TestAppendCounterMismatch(t *testing.T) {
 
 func TestAppendAtomicity(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Append first event to cart-1
-	err := store.Append(monotonic.AggregateEvent{
+	err := store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -191,7 +194,7 @@ func TestAppendAtomicity(t *testing.T) {
 
 	// Try to append two events where the second has a bad counter
 	// Both should fail (atomicity)
-	err = store.Append(
+	err = store.Append(ctx,
 		monotonic.AggregateEvent{
 			AggregateType: "cart",
 			AggregateID:   "cart-2",
@@ -216,7 +219,7 @@ func TestAppendAtomicity(t *testing.T) {
 	}
 
 	// cart-2 should NOT have been persisted (transaction rolled back)
-	events, err := store.LoadAggregateEvents("cart", "cart-2", 0)
+	events, err := store.LoadAggregateEvents(ctx,"cart", "cart-2", 0)
 	if err != nil {
 		t.Fatalf("load cart-2: %v", err)
 	}
@@ -227,9 +230,10 @@ func TestAppendAtomicity(t *testing.T) {
 
 func TestLoadGlobalEvents(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Append events to different aggregates
-	err := store.Append(
+	err := store.Append(ctx,
 		monotonic.AggregateEvent{
 			AggregateType: "cart",
 			AggregateID:   "cart-1",
@@ -254,7 +258,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load only cart events
-	events, err := store.LoadGlobalEvents([]string{"cart"}, 0)
+	events, err := store.LoadGlobalEvents(ctx,[]string{"cart"}, 0)
 	if err != nil {
 		t.Fatalf("load global cart: %v", err)
 	}
@@ -266,7 +270,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load both types
-	events, err = store.LoadGlobalEvents([]string{"cart", "stock"}, 0)
+	events, err = store.LoadGlobalEvents(ctx,[]string{"cart", "stock"}, 0)
 	if err != nil {
 		t.Fatalf("load global both: %v", err)
 	}
@@ -281,7 +285,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 
 	// Load with afterGlobalCounter filter
 	afterGC := events[0].Event.GlobalCounter
-	events, err = store.LoadGlobalEvents([]string{"cart", "stock"}, afterGC)
+	events, err = store.LoadGlobalEvents(ctx,[]string{"cart", "stock"}, afterGC)
 	if err != nil {
 		t.Fatalf("load global after: %v", err)
 	}
@@ -292,8 +296,9 @@ func TestLoadGlobalEvents(t *testing.T) {
 
 func TestLoadNonexistentAggregate(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
-	events, err := store.LoadAggregateEvents("cart", "nonexistent", 0)
+	events, err := store.LoadAggregateEvents(ctx,"cart", "nonexistent", 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -304,9 +309,10 @@ func TestLoadNonexistentAggregate(t *testing.T) {
 
 func TestSagaLifecycle(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Initially no active sagas
-	ids, err := store.ListActiveSagas("checkout")
+	ids, err := store.ListActiveSagas(ctx,"checkout")
 	if err != nil {
 		t.Fatalf("list active: %v", err)
 	}
@@ -315,7 +321,7 @@ func TestSagaLifecycle(t *testing.T) {
 	}
 
 	// Create saga by appending its first event
-	err = store.Append(monotonic.AggregateEvent{
+	err = store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "checkout",
 		AggregateID:   "saga-1",
 		Event: monotonic.AcceptedEvent{
@@ -338,7 +344,7 @@ func TestSagaLifecycle(t *testing.T) {
 	}
 
 	// Mark completed
-	err = store.MarkSagaCompleted("checkout", "saga-1")
+	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
 	if err != nil {
 		t.Fatalf("mark completed: %v", err)
 	}
@@ -352,13 +358,13 @@ func TestSagaLifecycle(t *testing.T) {
 	}
 
 	// Idempotent: marking again should not error
-	err = store.MarkSagaCompleted("checkout", "saga-1")
+	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
 	if err != nil {
 		t.Fatalf("idempotent mark completed: %v", err)
 	}
 
 	// Cannot append to completed saga
-	err = store.Append(monotonic.AggregateEvent{
+	err = store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "checkout",
 		AggregateID:   "saga-1",
 		Event: monotonic.AcceptedEvent{
@@ -377,6 +383,7 @@ func TestSagaLifecycle(t *testing.T) {
 
 func TestListActiveSagas(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Insert saga rows directly via MarkSagaCompleted won't create active ones,
 	// so we need to create active sagas by inserting into the sagas table.
@@ -404,7 +411,7 @@ func TestListActiveSagas(t *testing.T) {
 		t.Fatalf("new saga 2: %v", err)
 	}
 
-	ids, err := store.ListActiveSagas("checkout")
+	ids, err := store.ListActiveSagas(ctx,"checkout")
 	if err != nil {
 		t.Fatalf("list active: %v", err)
 	}
@@ -413,19 +420,19 @@ func TestListActiveSagas(t *testing.T) {
 	// if they have a row in the sagas table with completed=false.
 	// NewSaga appends events but doesn't insert into sagas table.
 	// So let's verify events were appended at least.
-	events1, _ := store.LoadAggregateEvents("checkout", "saga-1", 0)
-	events2, _ := store.LoadAggregateEvents("checkout", "saga-2", 0)
+	events1, _ := store.LoadAggregateEvents(ctx,"checkout", "saga-1", 0)
+	events2, _ := store.LoadAggregateEvents(ctx,"checkout", "saga-2", 0)
 	if len(events1) == 0 || len(events2) == 0 {
 		t.Fatal("expected saga events to be persisted")
 	}
 
 	// Mark saga-1 as completed, then verify listing
-	err = store.MarkSagaCompleted("checkout", "saga-1")
+	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
 	if err != nil {
 		t.Fatalf("mark completed: %v", err)
 	}
 
-	ids, err = store.ListActiveSagas("checkout")
+	ids, err = store.ListActiveSagas(ctx,"checkout")
 	if err != nil {
 		t.Fatalf("list after completion: %v", err)
 	}
@@ -439,6 +446,7 @@ func TestListActiveSagas(t *testing.T) {
 
 func TestPayloadRoundtrip(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	type ItemPayload struct {
 		Name  string `json:"name"`
@@ -448,7 +456,7 @@ func TestPayloadRoundtrip(t *testing.T) {
 	payload := ItemPayload{Name: "widget", Count: 5}
 	payloadBytes, _ := json.Marshal(payload)
 
-	err := store.Append(monotonic.AggregateEvent{
+	err := store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -461,7 +469,7 @@ func TestPayloadRoundtrip(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	events, err := store.LoadAggregateEvents("cart", "cart-1", 0)
+	events, err := store.LoadAggregateEvents(ctx,"cart", "cart-1", 0)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -480,8 +488,9 @@ func TestPayloadRoundtrip(t *testing.T) {
 
 func TestNilPayload(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
-	err := store.Append(monotonic.AggregateEvent{
+	err := store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -494,7 +503,7 @@ func TestNilPayload(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	events, err := store.LoadAggregateEvents("cart", "cart-1", 0)
+	events, err := store.LoadAggregateEvents(ctx,"cart", "cart-1", 0)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -508,8 +517,9 @@ func TestNilPayload(t *testing.T) {
 
 func TestMultipleAggregatesInSingleAppend(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
-	err := store.Append(
+	err := store.Append(ctx,
 		monotonic.AggregateEvent{
 			AggregateType: "cart",
 			AggregateID:   "cart-1",
@@ -533,8 +543,8 @@ func TestMultipleAggregatesInSingleAppend(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	cartEvents, _ := store.LoadAggregateEvents("cart", "cart-1", 0)
-	stockEvents, _ := store.LoadAggregateEvents("stock", "stock-1", 0)
+	cartEvents, _ := store.LoadAggregateEvents(ctx,"cart", "cart-1", 0)
+	stockEvents, _ := store.LoadAggregateEvents(ctx,"stock", "stock-1", 0)
 
 	if len(cartEvents) != 1 {
 		t.Errorf("expected 1 cart event, got %d", len(cartEvents))
@@ -546,10 +556,11 @@ func TestMultipleAggregatesInSingleAppend(t *testing.T) {
 
 func TestTimestampPreserved(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	now := time.Now().Truncate(time.Microsecond) // Postgres has microsecond precision
 
-	err := store.Append(monotonic.AggregateEvent{
+	err := store.Append(ctx,monotonic.AggregateEvent{
 		AggregateType: "cart",
 		AggregateID:   "cart-1",
 		Event: monotonic.AcceptedEvent{
@@ -562,7 +573,7 @@ func TestTimestampPreserved(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	events, _ := store.LoadAggregateEvents("cart", "cart-1", 0)
+	events, _ := store.LoadAggregateEvents(ctx,"cart", "cart-1", 0)
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
@@ -573,8 +584,9 @@ func TestTimestampPreserved(t *testing.T) {
 
 func TestAppendEmpty(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
-	err := store.Append()
+	err := store.Append(ctx)
 	if err != nil {
 		t.Fatalf("append empty should not error: %v", err)
 	}
@@ -582,10 +594,11 @@ func TestAppendEmpty(t *testing.T) {
 
 func TestGlobalCounterOrdering(t *testing.T) {
 	store := testStore(t)
+	ctx := context.Background()
 
 	// Append events in separate calls to get distinct global counters
 	for i := 1; i <= 5; i++ {
-		err := store.Append(monotonic.AggregateEvent{
+		err := store.Append(ctx,monotonic.AggregateEvent{
 			AggregateType: "cart",
 			AggregateID:   fmt.Sprintf("cart-%d", i),
 			Event: monotonic.AcceptedEvent{
@@ -599,7 +612,7 @@ func TestGlobalCounterOrdering(t *testing.T) {
 		}
 	}
 
-	events, err := store.LoadGlobalEvents([]string{"cart"}, 0)
+	events, err := store.LoadGlobalEvents(ctx,[]string{"cart"}, 0)
 	if err != nil {
 		t.Fatalf("load global: %v", err)
 	}

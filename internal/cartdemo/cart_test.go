@@ -1,6 +1,7 @@
 package cartdemo
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
@@ -9,16 +10,17 @@ import (
 
 func TestCartCatchUp(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
 	// Process A loads cart
-	cartA, _ := LoadCart(store, "user-123")
+	cartA, _ := LoadCart(ctx, store, "user-123")
 
 	// Process B loads the same cart
-	cartB, _ := LoadCart(store, "user-123")
+	cartB, _ := LoadCart(ctx, store, "user-123")
 
 	// Process A adds an item
 	payload, _ := json.Marshal(map[string]string{"item_name": "Widget"})
-	cartA.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: payload})
+	cartA.AcceptThenApply(ctx, monotonic.Event{Type: "item-added", Payload: payload})
 
 	// cartA sees the item, cartB doesn't (yet)
 	if len(cartA.Items) != 1 {
@@ -30,7 +32,7 @@ func TestCartCatchUp(t *testing.T) {
 
 	// Process B proposes another event - this should catch up first
 	payload, _ = json.Marshal(map[string]string{"item_name": "Gadget"})
-	err := cartB.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: payload})
+	err := cartB.AcceptThenApply(ctx, monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
 		t.Fatalf("cartB Record failed: %v", err)
 	}
@@ -44,7 +46,7 @@ func TestCartCatchUp(t *testing.T) {
 	}
 
 	// Verify the store has both events
-	events, _ := store.LoadAggregateEvents("cart", "user-123", 0)
+	events, _ := store.LoadAggregateEvents(ctx, "cart", "user-123", 0)
 	if len(events) != 2 {
 		t.Errorf("store: expected 2 events, got %d", len(events))
 	}
@@ -52,9 +54,10 @@ func TestCartCatchUp(t *testing.T) {
 
 func TestCart(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
+	ctx := context.Background()
 
 	// Load a new cart (no events yet)
-	cart, err := LoadCart(store, "user-123")
+	cart, err := LoadCart(ctx, store, "user-123")
 	if err != nil {
 		t.Fatalf("LoadCart failed: %v", err)
 	}
@@ -68,14 +71,14 @@ func TestCart(t *testing.T) {
 	}
 
 	// Try to checkout empty cart - should fail
-	err = cart.AcceptThenApply(monotonic.Event{Type: "checkout-started"})
+	err = cart.AcceptThenApply(ctx, monotonic.Event{Type: "checkout-started"})
 	if err == nil {
 		t.Error("expected error when checking out empty cart")
 	}
 
 	// Add an item
 	payload, _ := json.Marshal(map[string]string{"item_name": "Widget"})
-	err = cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: payload})
+	err = cart.AcceptThenApply(ctx, monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
 		t.Fatalf("Record item-added failed: %v", err)
 	}
@@ -90,13 +93,13 @@ func TestCart(t *testing.T) {
 
 	// Add another item
 	payload, _ = json.Marshal(map[string]string{"item_name": "Gadget"})
-	err = cart.AcceptThenApply(monotonic.Event{Type: "item-added", Payload: payload})
+	err = cart.AcceptThenApply(ctx, monotonic.Event{Type: "item-added", Payload: payload})
 	if err != nil {
 		t.Fatalf("Record item-added failed: %v", err)
 	}
 
 	// Start checkout - should succeed now
-	err = cart.AcceptThenApply(monotonic.Event{Type: "checkout-started"})
+	err = cart.AcceptThenApply(ctx, monotonic.Event{Type: "checkout-started"})
 	if err != nil {
 		t.Fatalf("Record checkout-started failed: %v", err)
 	}
@@ -106,7 +109,7 @@ func TestCart(t *testing.T) {
 	}
 
 	// Try to start checkout again - should fail
-	err = cart.AcceptThenApply(monotonic.Event{Type: "checkout-started"})
+	err = cart.AcceptThenApply(ctx, monotonic.Event{Type: "checkout-started"})
 	if err == nil {
 		t.Error("expected error when starting checkout twice")
 	}
@@ -117,7 +120,7 @@ func TestCart(t *testing.T) {
 	}
 
 	// Test hydration - load the same cart fresh and verify state is rebuilt
-	cart2, err := LoadCart(store, "user-123")
+	cart2, err := LoadCart(ctx, store, "user-123")
 	if err != nil {
 		t.Fatalf("LoadCart (hydrate) failed: %v", err)
 	}
