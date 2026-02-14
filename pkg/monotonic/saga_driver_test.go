@@ -436,6 +436,71 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 	}
 }
 
+func TestStepRespectsDelayAfterCatchUp(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	var waitingCalls int32
+	actions := ActionMap{
+		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			return ActionResult{
+				NewState: "waiting",
+				Delay:    1 * time.Hour, // long delay
+			}, nil
+		},
+		"waiting": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			atomic.AddInt32(&waitingCalls, 1)
+			return ActionResult{NewState: "done"}, nil
+		},
+		"done": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
+			return ActionResult{Complete: true}, nil
+		},
+	}
+
+	// Process 1: create and step saga to "waiting" with delay
+	saga1, _ := NewSaga(store, "test-saga", "saga-1", "started", nil, actions)
+	saga1.Step(ctx)
+	if saga1.State() != "waiting" {
+		t.Fatalf("expected 'waiting', got %s", saga1.State())
+	}
+
+	// Process 2: load same saga (simulating a second process that hasn't caught up)
+	saga2, _ := LoadSaga(store, "test-saga", "saga-1", actions)
+
+	// saga2 is already caught up from LoadSaga, but let's simulate:
+	// Create a saga that is behind and needs to catch up to the delayed state.
+	// We do this by creating a saga at "started" state and having catchUp discover
+	// the transition to "waiting" with a delay.
+	saga3 := &Saga{
+		eventStream: eventStream{
+			ID:    NewAggregateID("test-saga", "saga-1"),
+			store: store,
+		},
+		sagaStore: store,
+		state:     "started",
+		readyAt:   time.Now(),
+		actions:   actions,
+		// counter is 0, so catchUp will replay all events
+	}
+
+	// Step should catch up (discovering the transition to "waiting" with delay)
+	// and then NOT execute the "waiting" action because it's delayed
+	saga3.Step(ctx)
+
+	if atomic.LoadInt32(&waitingCalls) != 0 {
+		t.Error("expected 'waiting' action to NOT be called (delay not elapsed)")
+	}
+	if saga3.State() != "waiting" {
+		t.Errorf("expected state 'waiting' after catch-up, got %s", saga3.State())
+	}
+
+	// Verify saga2 also respects delay
+	saga2.Step(ctx)
+	if atomic.LoadInt32(&waitingCalls) != 0 {
+		t.Error("expected 'waiting' action to NOT be called on saga2 (delay not elapsed)")
+	}
+}
+
 func TestMultipleDriversConcurrency(t *testing.T) {
 	store := NewInMemoryStore()
 

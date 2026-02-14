@@ -219,23 +219,15 @@ func (s *Saga) IsReady() bool {
 
 // Step executes an action for the current state, hopefully transitioning the saga into a new state
 func (s *Saga) Step(ctx context.Context) error {
-	// Check if already closed
-	if s.completed {
-		return nil
-	}
-
-	// Check if delayed
-	if !s.IsReady() {
-		return nil
-	}
-
 	// Catch up on any missed events
 	if err := s.catchUp(ctx, s.apply); err != nil {
 		return err
 	}
 
-	// Check again after catch-up (might have been closed by another process)
 	if s.completed {
+		return nil
+	}
+	if !s.IsReady() {
 		return nil
 	}
 
