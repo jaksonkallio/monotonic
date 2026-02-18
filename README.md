@@ -2,7 +2,7 @@
   <img src="./docs/logo.png" alt="Monotonic" />
 </p>
 
-A lightweight event-sourcing framework for Go with aggregates, sagas, and projections.
+A lightweight event-sourcing framework for Go with aggregates, sagas, and projections. It's designed for small-to-medium scale projects that want the benefits of event sourcing without the complexity of distributed infrastructure or orchestration.
 
 Simple example below, see [docs/getting-started.md](./docs/getting-started.md) for a deep dive.
 
