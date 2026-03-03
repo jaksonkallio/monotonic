@@ -94,9 +94,10 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	}
 	defer tx.Rollback(ctx)
 
-	// Collect distinct aggregates to check saga completion
+	// Collect distinct aggregates to check saga completion and load current counters
 	type aggKey struct{ typ, id string }
 	checked := make(map[aggKey]bool)
+	currentCounters := make(map[aggKey]int64)
 
 	for _, ae := range events {
 		key := aggKey{ae.AggregateType, ae.AggregateID}
@@ -117,9 +118,34 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 		if err == nil && completed {
 			return fmt.Errorf("%w: %s/%s", monotonic.ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
 		}
+
+		// Load current max counter for validation
+		maxCounter, err := currentMaxCounter(ctx, tx, ae.AggregateType, ae.AggregateID)
+		if err != nil {
+			return fmt.Errorf("get current counter: %w", err)
+		}
+		currentCounters[key] = maxCounter
 	}
 
-	// Insert all events; rely on UNIQUE constraint for counter conflicts
+	// Validate all event counters are sequential before inserting
+	eventsInBatch := make(map[aggKey]int64)
+
+	for _, ae := range events {
+		key := aggKey{ae.AggregateType, ae.AggregateID}
+
+		expectedCounter := currentCounters[key] + 1 + eventsInBatch[key]
+
+		if ae.Event.Counter != expectedCounter {
+			return fmt.Errorf(
+				"event counter mismatch for %s/%s: expected %d, got %d",
+				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
+			)
+		}
+
+		eventsInBatch[key]++
+	}
+
+	// Insert all events (counters already validated above)
 	for _, ae := range events {
 		_, err := tx.Exec(ctx,
 			`INSERT INTO events (aggregate_type, aggregate_id, counter, event_type, payload, accepted_at)
@@ -131,11 +157,11 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 		if err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				// Unique violation on (aggregate_type, aggregate_id, counter)
-				expected, _ := currentMaxCounter(ctx, tx, ae.AggregateType, ae.AggregateID)
+				// UNIQUE constraint violation (should be rare now that we pre-validate)
+				// This can still happen due to concurrent transactions
 				return fmt.Errorf(
-					"event counter mismatch for %s/%s: expected %d, got %d",
-					ae.AggregateType, ae.AggregateID, expected+1, ae.Event.Counter,
+					"event counter conflict for %s/%s counter %d (concurrent write detected)",
+					ae.AggregateType, ae.AggregateID, ae.Event.Counter,
 				)
 			}
 			return fmt.Errorf("insert event: %w", err)
