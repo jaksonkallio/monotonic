@@ -62,12 +62,13 @@ func TestMain(m *testing.M) {
 }
 
 // testStore returns a store backed by the shared container, truncating tables for isolation.
-func testStore(t *testing.T) *pgstore.Store {
-	t.Helper()
+// Works with both *testing.T and *testing.B
+func testStore(tb testing.TB) *pgstore.Store {
+	tb.Helper()
 
 	_, err := sharedPool.Exec(context.Background(), "TRUNCATE events, sagas RESTART IDENTITY")
 	if err != nil {
-		t.Fatalf("truncate: %v", err)
+		tb.Fatalf("truncate: %v", err)
 	}
 
 	return sharedStore
@@ -322,11 +323,11 @@ func TestSagaLifecycle(t *testing.T) {
 	}
 
 	// Create saga by appending its first event
-	err = store.Append(ctx,monotonic.AggregateEvent{
+	err = store.Append(ctx, monotonic.AggregateEvent{
 		AggregateType: "checkout",
 		AggregateID:   "saga-1",
 		Event: monotonic.AcceptedEvent{
-			Event:      monotonic.Event{Type: monotonic.SagaStartedEvent},
+			Event:      monotonic.Event{Type: monotonic.EventTypeStarted},
 			Counter:    1,
 			AcceptedAt: time.Now(),
 		},

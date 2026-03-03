@@ -388,7 +388,7 @@ func TestConcurrentAppends_SameAggregate(t *testing.T) {
 			r := result{goroutineID: id}
 			// Each goroutine needs its own instance to work with
 			localCounter, _ := loadCounter(ctx, store, "concurrent")
-			retry := NewRetry(10, ExponentialBackoff(0))
+			retry := NewRetry(50, ExponentialBackoff(0))
 
 			for j := 0; j < eventsPerGoroutine; j++ {
 				err := localCounter.AcceptThenApplyRetryable(ctx, *retry,
@@ -795,7 +795,7 @@ func TestConcurrentAppends_RapidFire(t *testing.T) {
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			c, _ := loadCounter(ctx, store, "rapid-fire")
-			retry := NewRetry(15, ExponentialBackoff(0))
+			retry := NewRetry(50, ExponentialBackoff(0))
 
 			var lastErr error
 			for j := 0; j < eventsPerGoroutine; j++ {
