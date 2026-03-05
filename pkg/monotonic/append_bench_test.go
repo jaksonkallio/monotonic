@@ -79,6 +79,7 @@ func BenchmarkAppend_Concurrent(b *testing.B) {
 			store := NewInMemoryStore()
 			ctx := context.Background()
 
+			b.SetParallelism(concurrency)
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				// Each goroutine gets its own aggregate to avoid conflicts
@@ -149,12 +150,12 @@ func BenchmarkAccept_SingleEvent(b *testing.B) {
 
 // Benchmark global event loading
 func BenchmarkLoadGlobalEvents(b *testing.B) {
-	store := NewInMemoryStore()
 	ctx := context.Background()
 
 	// Pre-populate with events across multiple aggregates
 	for _, totalEvents := range []int{100, 1000, 10000} {
 		b.Run(fmt.Sprintf("total-events-%d", totalEvents), func(b *testing.B) {
+			store := NewInMemoryStore()
 			numAggregates := 10
 			eventsPerAggregate := totalEvents / numAggregates
 

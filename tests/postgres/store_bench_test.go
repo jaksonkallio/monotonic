@@ -134,12 +134,12 @@ func BenchmarkPostgres_Append_HighContention(b *testing.B) {
 
 // Benchmark global event loading from PostgreSQL
 func BenchmarkPostgres_LoadGlobalEvents(b *testing.B) {
-	store := testStore(b)
 	ctx := context.Background()
 
 	// Pre-populate with events across multiple aggregates
 	for _, totalEvents := range []int{100, 1000} {
 		b.Run(fmt.Sprintf("total-events-%d", totalEvents), func(b *testing.B) {
+			store := testStore(b)
 			numAggregates := 10
 			eventsPerAggregate := totalEvents / numAggregates
 
