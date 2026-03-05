@@ -83,6 +83,9 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Track how many events seen for each aggregate in this batch, necessary for expected counts
+	eventsInBatch := make(map[AggregateID]int64)
+
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
@@ -96,15 +99,19 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 			expectedCounter = int64(len(agg.events)) + 1
 		}
 
+		expectedCounter += eventsInBatch[id]
+
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
 				"event counter mismatch for %s/%s: expected %d, got %d",
 				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
+
+		eventsInBatch[id]++
 	}
 
-	// Phase 2: All counters valid, commit all events
+	// Commit
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg, exists := s.aggregates[id]
