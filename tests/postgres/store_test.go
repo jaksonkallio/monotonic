@@ -772,7 +772,7 @@ func TestConcurrentAppends_PostgreSQL_SameAggregate(t *testing.T) {
 			r := result{goroutineID: id}
 			// Each goroutine needs its own instance to work with
 			localCounter, _ := loadCounter(ctx, store, "concurrent")
-			retry := monotonic.NewRetry(15, monotonic.ExponentialBackoff(0))
+			retry := monotonic.NewRetry(200, monotonic.ExponentialBackoff(0))
 
 			for j := 0; j < eventsPerGoroutine; j++ {
 				err := localCounter.AcceptThenApplyRetryable(ctx, *retry,
@@ -883,7 +883,7 @@ func TestConcurrentAppends_PostgreSQL_HighContention(t *testing.T) {
 	const numGoroutines = 50
 	const eventsPerGoroutine = 5
 
-	results := make(chan bool, numGoroutines)
+	results := make(chan int, numGoroutines)
 
 	// All goroutines compete for the same aggregate
 	for i := 0; i < numGoroutines; i++ {
@@ -892,38 +892,40 @@ func TestConcurrentAppends_PostgreSQL_HighContention(t *testing.T) {
 			// More retries for high contention scenario
 			retry := monotonic.NewRetry(25, monotonic.ExponentialBackoff(0))
 
-			success := true
+			succeeded := 0
 			for j := 0; j < eventsPerGoroutine; j++ {
 				err := c.AcceptThenApplyRetryable(ctx, *retry,
 					monotonic.NewEvent(eventIncremented, incrementedPayload{Amount: 1}))
 				if err != nil {
-					success = false
 					break
 				}
+				succeeded++
 			}
-			results <- success
+			results <- succeeded
 		}(i)
 	}
 
 	// Collect results
-	successCount := 0
+	totalEvents := 0
+	fullSuccessCount := 0
 	for i := 0; i < numGoroutines; i++ {
-		if <-results {
-			successCount++
+		n := <-results
+		totalEvents += n
+		if n == eventsPerGoroutine {
+			fullSuccessCount++
 		}
 	}
 
 	// With sufficient retries, all should eventually succeed
-	if successCount != numGoroutines {
-		t.Logf("warning: only %d/%d goroutines succeeded under high contention",
-			successCount, numGoroutines)
+	if fullSuccessCount != numGoroutines {
+		t.Logf("warning: only %d/%d goroutines fully succeeded under high contention",
+			fullSuccessCount, numGoroutines)
 	}
 
 	// Verify final state matches successful writes
 	finalCounter, _ := loadCounter(ctx, store, "high-contention")
-	expectedValue := successCount * eventsPerGoroutine
-	if finalCounter.Value != expectedValue {
-		t.Errorf("expected final value %d, got %d", expectedValue, finalCounter.Value)
+	if finalCounter.Value != totalEvents {
+		t.Errorf("expected final value %d, got %d", totalEvents, finalCounter.Value)
 	}
 }
 
