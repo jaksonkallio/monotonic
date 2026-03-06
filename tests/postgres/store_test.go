@@ -66,7 +66,7 @@ func TestMain(m *testing.M) {
 func testStore(tb testing.TB) *pgstore.Store {
 	tb.Helper()
 
-	_, err := sharedPool.Exec(context.Background(), "TRUNCATE events, sagas RESTART IDENTITY")
+	_, err := sharedPool.Exec(context.Background(), "TRUNCATE events RESTART IDENTITY")
 	if err != nil {
 		tb.Fatalf("truncate: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestSagaLifecycle(t *testing.T) {
 		t.Fatalf("append saga event: %v", err)
 	}
 
-	// Saga not yet in sagas table (only gets there via MarkSagaCompleted or explicit insert)
+	// Saga should not be completed yet (no saga-completed event)
 	completed, err := store.IsSagaCompleted("checkout", "saga-1")
 	if err != nil {
 		t.Fatalf("is completed: %v", err)
@@ -345,33 +345,41 @@ func TestSagaLifecycle(t *testing.T) {
 		t.Error("saga should not be completed yet")
 	}
 
-	// Mark completed
-	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
+	// Complete the saga by appending a saga-completed event
+	err = store.Append(ctx, monotonic.AggregateEvent{
+		AggregateType: "checkout",
+		AggregateID:   "saga-1",
+		Event: monotonic.AcceptedEvent{
+			Event:      monotonic.Event{Type: monotonic.EventTypeCompleted},
+			Counter:    2,
+			AcceptedAt: time.Now(),
+		},
+	})
 	if err != nil {
-		t.Fatalf("mark completed: %v", err)
+		t.Fatalf("append completed event: %v", err)
 	}
 
 	completed, err = store.IsSagaCompleted("checkout", "saga-1")
 	if err != nil {
-		t.Fatalf("is completed after mark: %v", err)
+		t.Fatalf("is completed after event: %v", err)
 	}
 	if !completed {
 		t.Error("expected saga to be completed")
 	}
 
-	// Idempotent: marking again should not error
-	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
+	// MarkSagaCompleted is a no-op but should not error
+	err = store.MarkSagaCompleted(ctx, "checkout", "saga-1")
 	if err != nil {
-		t.Fatalf("idempotent mark completed: %v", err)
+		t.Fatalf("mark completed no-op: %v", err)
 	}
 
 	// Cannot append to completed saga
-	err = store.Append(ctx,monotonic.AggregateEvent{
+	err = store.Append(ctx, monotonic.AggregateEvent{
 		AggregateType: "checkout",
 		AggregateID:   "saga-1",
 		Event: monotonic.AcceptedEvent{
 			Event:      monotonic.Event{Type: "another-event"},
-			Counter:    2,
+			Counter:    3,
 			AcceptedAt: time.Now(),
 		},
 	})
@@ -413,36 +421,34 @@ func TestListActiveSagas(t *testing.T) {
 		t.Fatalf("new saga 2: %v", err)
 	}
 
-	ids, err := store.ListActiveSagas(ctx,"checkout")
+	// Both sagas should appear as active (saga-started event exists, no saga-completed event)
+	ids, err := store.ListActiveSagas(ctx, "checkout")
 	if err != nil {
 		t.Fatalf("list active: %v", err)
 	}
-
-	// Sagas are active (not completed). But they only show up in ListActiveSagas
-	// if they have a row in the sagas table with completed=false.
-	// NewSaga appends events but doesn't insert into sagas table.
-	// So let's verify events were appended at least.
-	events1, _ := store.LoadAggregateEvents(ctx,"checkout", "saga-1", 0)
-	events2, _ := store.LoadAggregateEvents(ctx,"checkout", "saga-2", 0)
-	if len(events1) == 0 || len(events2) == 0 {
-		t.Fatal("expected saga events to be persisted")
+	if len(ids) != 2 {
+		t.Fatalf("expected 2 active sagas, got %d", len(ids))
 	}
 
-	// Mark saga-1 as completed, then verify listing
-	err = store.MarkSagaCompleted(ctx,"checkout", "saga-1")
+	// Complete saga-1 by running it to completion
+	saga1, err := monotonic.LoadSaga(store, "checkout", "saga-1", actions)
 	if err != nil {
-		t.Fatalf("mark completed: %v", err)
+		t.Fatalf("load saga-1: %v", err)
+	}
+	if err := saga1.Run(ctx); err != nil {
+		t.Fatalf("run saga-1: %v", err)
 	}
 
-	ids, err = store.ListActiveSagas(ctx,"checkout")
+	// Now only saga-2 should be active
+	ids, err = store.ListActiveSagas(ctx, "checkout")
 	if err != nil {
 		t.Fatalf("list after completion: %v", err)
 	}
-	// saga-1 is completed, saga-2 has no row in sagas table
-	for _, id := range ids {
-		if id == "saga-1" {
-			t.Error("completed saga-1 should not appear in active list")
-		}
+	if len(ids) != 1 {
+		t.Fatalf("expected 1 active saga, got %d", len(ids))
+	}
+	if ids[0] != "saga-2" {
+		t.Errorf("expected saga-2, got %s", ids[0])
 	}
 }
 
