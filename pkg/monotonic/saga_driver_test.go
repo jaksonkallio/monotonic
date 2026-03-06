@@ -159,7 +159,7 @@ func TestSagaDriverRespectsDelay(t *testing.T) {
 			atomic.AddInt32(&calls, 1)
 			return ActionResult{
 				NewState: "waiting",
-				Delay:    100 * time.Millisecond,
+				ReadyAt:  time.Now().Add(100 * time.Millisecond),
 			}, nil
 		},
 		"waiting": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
@@ -532,7 +532,7 @@ func TestStepRespectsDelayAfterCatchUp(t *testing.T) {
 		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			return ActionResult{
 				NewState: "waiting",
-				Delay:    1 * time.Hour, // long delay
+				ReadyAt:  time.Now().Add(1 * time.Hour), // far future
 			}, nil
 		},
 		"waiting": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {

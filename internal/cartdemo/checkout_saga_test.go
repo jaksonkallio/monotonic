@@ -224,7 +224,7 @@ func TestSagaDelayedTransition(t *testing.T) {
 		"start": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
 			return monotonic.ActionResult{
 				NewState: "waiting",
-				Delay:    100 * time.Millisecond,
+				ReadyAt:  time.Now().Add(100 * time.Millisecond),
 			}, nil
 		},
 		"waiting": func(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
