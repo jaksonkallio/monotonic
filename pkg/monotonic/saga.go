@@ -71,9 +71,8 @@ type SagaStartedPayload struct {
 
 // SagaStateTransitionPayload is stored in state-transitioned events
 type SagaStateTransitionPayload struct {
-	ToState string        `json:"to_state"`
-	ReadyAt time.Time     `json:"ready_at,omitempty"`
-	Delay   time.Duration `json:"delay,omitempty"`
+	ToState string    `json:"to_state"`
+	ReadyAt time.Time `json:"ready_at,omitempty"`
 }
 
 // SagaCompletedPayload is stored in the saga-completed event
@@ -354,7 +353,6 @@ func (s *Saga) transition(ctx context.Context, result ActionResult) error {
 	payload, _ := json.Marshal(SagaStateTransitionPayload{
 		ToState: result.NewState,
 		ReadyAt: readyAt,
-		Delay:   result.Delay,
 	})
 
 	sagaEvent := AcceptedEvent{
