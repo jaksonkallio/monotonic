@@ -111,6 +111,7 @@ type Saga struct {
 
 // ErrInvalidCloseResult is returned when ActionResult has Close=true with other fields set
 var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have NewState, Events, or Delay")
+var ErrSagaAlreadyExists = fmt.Errorf("saga already exists")
 
 // NewSaga creates and persists a new saga.
 func NewSaga(
@@ -132,6 +133,15 @@ func NewSaga(
 		input:     input,
 		readyAt:   time.Now(),
 		actions:   actions,
+	}
+
+	// Check if a saga with this ID already exists
+	existing, err := store.LoadAggregateEvents(ctx, sagaType, id, 0)
+	if err != nil {
+		return nil, fmt.Errorf("check existing saga: %w", err)
+	}
+	if len(existing) > 0 {
+		return nil, fmt.Errorf("%w: %s/%s", ErrSagaAlreadyExists, sagaType, id)
 	}
 
 	// Persist the initial event
