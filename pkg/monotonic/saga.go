@@ -31,28 +31,34 @@ func TypedAction[I any](fn TypedActionFunc[I]) ActionFunc {
 	}
 }
 
-// ActionResult represents the outcome of a saga action
+// ActionResult represents the outcome of a saga action.
+//
+// Three possible outcomes:
+//   - State transition: set NewState (and optionally Events, Delay)
+//   - Completion: set Complete to true (and optionally SagaFailureReason)
+//   - No progress: leave NewState empty and Complete false. No event is persisted.
+//     Use this when waiting on external state. Optionally set Delay to avoid busy-polling.
 type ActionResult struct {
-	// NewState is the state to transition to
-	// Must be blank if `Complete` is true
+	// NewState is the state to transition to.
+	// Must be blank if `Complete` is true.
+	// If blank and `Complete` is false, the step is a no-op (no event persisted).
 	NewState string
 
-	// Events are events to append to other aggregates atomically
-	// Must be empty if `Complete` is true
+	// Events are events to append to other aggregates atomically with the state transition.
+	// Must be empty if `Complete` is true or if NewState is blank.
 	Events []AggregateEvent
 
-	// Complete indicates the saga should be completed
-	// Typical pattern: transition to some "completed" state, then have "completed" action return `Complete` as true
-	// When true, NewState, Events, and Delay must be empty because completing implies that no other subsequent transitions or actions can occur
+	// Complete indicates the saga should be completed.
+	// When true, NewState, Events, and Delay must be empty.
 	Complete bool
 
-	// Delay before the next step can run
-	// Must be zero if `Complete` is true
+	// Delay before the next step can run.
+	// Must be zero if `Complete` is true or if NewState is blank.
 	Delay time.Duration
 
-	// SagaFailureReason is an optional message explaining why the saga failed
-	// May be non-empty only when `Complete` is true
-	// An empty string on a completed saga indicates successful completion
+	// SagaFailureReason is an optional message explaining why the saga failed.
+	// May be non-empty only when `Complete` is true.
+	// An empty string on a completed saga indicates successful completion.
 	SagaFailureReason string
 }
 
@@ -294,8 +300,16 @@ func (s *Saga) Step(ctx context.Context) error {
 		return fmt.Errorf("SagaFailureReason can only be set when Complete is true")
 	}
 
+	// No new state: action chose not to progress (e.g. waiting on external state).
+	// No event is persisted.
 	if result.NewState == "" {
-		return fmt.Errorf("action result new state is empty")
+		if len(result.Events) > 0 {
+			return fmt.Errorf("action result cannot have Events without a state transition")
+		}
+		if result.Delay > 0 {
+			return fmt.Errorf("action result cannot have Delay without a state transition")
+		}
+		return nil
 	}
 
 	if result.Delay < 0 {

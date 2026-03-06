@@ -82,7 +82,7 @@ func (d *SagaDriver) StepAll(ctx context.Context) error {
 		if err := d.stepSaga(ctx, id); err != nil {
 			slog.Error("failed to step saga", "sagaType", d.sagaType, "id", id, "error", err)
 		} else {
-			slog.Info("stepped saga", "sagaType", d.sagaType, "id", id)
+			slog.Debug("stepped saga", "sagaType", d.sagaType, "id", id)
 		}
 	}
 
