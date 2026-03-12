@@ -48,6 +48,14 @@ func (s *Store) Migrate(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS idx_events_saga_lifecycle
 			ON events (aggregate_type, aggregate_id, event_type);
 
+		CREATE INDEX IF NOT EXISTS idx_events_saga_started
+			ON events (event_type, aggregate_type, aggregate_id)
+			WHERE event_type = 'saga-started';
+
+		CREATE INDEX IF NOT EXISTS idx_events_saga_completed
+			ON events (event_type, aggregate_type, aggregate_id)
+			WHERE event_type = 'saga-completed';
+
 		CREATE OR REPLACE VIEW sagas AS
 		SELECT
 			e.aggregate_type AS saga_type,
