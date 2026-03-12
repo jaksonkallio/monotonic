@@ -114,8 +114,8 @@ type Saga struct {
 	actions ActionMap
 }
 
-// ErrInvalidCloseResult is returned when ActionResult has Close=true with other fields set
-var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have NewState, Events, or ReadyAt")
+// ErrInvalidCompleteResult is returned when ActionResult has Complete=true with other fields set
+var ErrInvalidCompleteResult = fmt.Errorf("ActionResult with Complete=true cannot have NewState, Events, or ReadyAt")
 var ErrSagaAlreadyExists = fmt.Errorf("saga already exists")
 
 // NewSaga creates and persists a new saga.
@@ -291,7 +291,7 @@ func (s *Saga) Step(ctx context.Context) error {
 	// Saga should be closed as a result of this action
 	if result.Complete {
 		if result.NewState != "" || len(result.Events) > 0 || !result.ReadyAt.IsZero() {
-			return ErrInvalidCloseResult
+			return ErrInvalidCompleteResult
 		}
 		return s.closeSaga(ctx, result.SagaFailureReason)
 	}
