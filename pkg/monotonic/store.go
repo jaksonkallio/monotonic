@@ -133,6 +133,14 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 			}
 		}
 
+		// Mark sagas as completed when saga-completed event is appended
+		if ae.Event.Type == EventTypeCompleted {
+			if _, ok := s.sagas[id]; !ok {
+				s.sagas[id] = &inMemorySaga{}
+			}
+			s.sagas[id].completed = true
+		}
+
 		// Track in global event log for projections with assigned global counter
 		globalEvent := ae
 		globalEvent.Event.GlobalCounter = s.globalCounter
