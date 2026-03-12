@@ -39,6 +39,9 @@ type SagaStore interface {
 // ErrSagaCompleted is returned when attempting to append to a completed saga
 var ErrSagaCompleted = fmt.Errorf("saga is completed")
 
+// ErrCounterConflict is returned when an event's counter conflicts with an existing event
+var ErrCounterConflict = fmt.Errorf("event counter conflict")
+
 type inMemoryStoredAggregate struct {
 	events []AcceptedEvent
 }
@@ -108,8 +111,8 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
-				"event counter mismatch for %s/%s: expected %d, got %d",
-				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
+				"%w for %s/%s: expected %d, got %d",
+				ErrCounterConflict, ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
 

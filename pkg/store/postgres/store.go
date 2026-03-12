@@ -157,8 +157,8 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
-				"event counter mismatch for %s/%s: expected %d, got %d",
-				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
+				"%w for %s/%s: expected %d, got %d",
+				monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
 
@@ -180,8 +180,8 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 				// UNIQUE constraint violation (should be rare now that we pre-validate)
 				// This can still happen due to concurrent transactions
 				return fmt.Errorf(
-					"event counter conflict for %s/%s counter %d (concurrent write detected)",
-					ae.AggregateType, ae.AggregateID, ae.Event.Counter,
+					"%w for %s/%s counter %d (concurrent write detected)",
+					monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, ae.Event.Counter,
 				)
 			}
 			return fmt.Errorf("insert event: %w", err)

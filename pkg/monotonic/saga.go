@@ -3,6 +3,7 @@ package monotonic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -140,15 +141,6 @@ func NewSaga(
 		actions:   actions,
 	}
 
-	// Check if a saga with this ID already exists
-	existing, err := store.LoadAggregateEvents(ctx, sagaType, id, 0)
-	if err != nil {
-		return nil, fmt.Errorf("check existing saga: %w", err)
-	}
-	if len(existing) > 0 {
-		return nil, fmt.Errorf("%w: %s/%s", ErrSagaAlreadyExists, sagaType, id)
-	}
-
 	// Persist the initial event
 	payload, _ := json.Marshal(SagaStartedPayload{
 		InitialState: initialState,
@@ -169,6 +161,10 @@ func NewSaga(
 	}
 
 	if err := store.Append(ctx, event); err != nil {
+		// A counter conflict on counter=1 means a saga already exists
+		if errors.Is(err, ErrCounterConflict) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrSagaAlreadyExists, sagaType, id)
+		}
 		return nil, fmt.Errorf("persist saga start: %w", err)
 	}
 	saga.counter = 1
