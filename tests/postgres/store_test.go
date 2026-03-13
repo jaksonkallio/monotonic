@@ -1043,9 +1043,9 @@ func TestSequentialCounterValidation_PostgreSQL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for gap in counters, got nil")
 	}
-	// Should get a counter mismatch error
+	// Should get a counter conflict error
 	errMsg := err.Error()
-	if !strings.Contains(errMsg, "counter mismatch") || !strings.Contains(errMsg, "expected 2") || !strings.Contains(errMsg, "got 5") {
+	if !strings.Contains(errMsg, "counter conflict") || !strings.Contains(errMsg, "expected 2") || !strings.Contains(errMsg, "got 5") {
 		t.Errorf("unexpected error message: %v", err)
 	}
 
