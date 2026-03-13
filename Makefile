@@ -1,4 +1,7 @@
-.PHONY: test test-integration bench bench-integration bench-all
+.PHONY: test test-integration bench bench-integration bench-all build
+
+CGO_ENABLED ?= 0
+export CGO_ENABLED
 
 test:
 	go test ./...
@@ -13,3 +16,6 @@ bench-integration:
 	cd tests/postgres && go test -bench=. -benchmem -benchtime=1s ./...
 
 bench-all: bench bench-integration
+
+build:
+	go build ./...
