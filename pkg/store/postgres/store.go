@@ -45,12 +45,29 @@ func (s *Store) Migrate(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS idx_events_global
 			ON events (aggregate_type, global_counter);
 
-		CREATE TABLE IF NOT EXISTS sagas (
-			saga_type TEXT NOT NULL,
-			saga_id   TEXT NOT NULL,
-			completed BOOLEAN NOT NULL DEFAULT FALSE,
-			PRIMARY KEY (saga_type, saga_id)
-		);
+		CREATE INDEX IF NOT EXISTS idx_events_saga_lifecycle
+			ON events (aggregate_type, aggregate_id, event_type);
+
+		CREATE INDEX IF NOT EXISTS idx_events_saga_started
+			ON events (event_type, aggregate_type, aggregate_id)
+			WHERE event_type = 'saga-started';
+
+		CREATE INDEX IF NOT EXISTS idx_events_saga_completed
+			ON events (event_type, aggregate_type, aggregate_id)
+			WHERE event_type = 'saga-completed';
+
+		CREATE OR REPLACE VIEW sagas AS
+		SELECT
+			e.aggregate_type AS saga_type,
+			e.aggregate_id AS saga_id,
+			EXISTS(
+				SELECT 1 FROM events e2
+				WHERE e2.aggregate_type = e.aggregate_type
+				AND e2.aggregate_id = e.aggregate_id
+				AND e2.event_type = 'saga-completed'
+			) AS completed
+		FROM events e
+		WHERE e.event_type = 'saga-started';
 	`)
 	return err
 }
@@ -106,16 +123,19 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 		}
 		checked[key] = true
 
-		// Check saga completion with row-level lock
-		var completed bool
+		// Check if saga is completed by looking for a saga-completed event
+		var exists bool
 		err := tx.QueryRow(ctx,
-			`SELECT completed FROM sagas WHERE saga_type = $1 AND saga_id = $2 FOR UPDATE`,
+			`SELECT EXISTS(
+				SELECT 1 FROM events
+				WHERE aggregate_type = $1 AND aggregate_id = $2 AND event_type = 'saga-completed'
+			)`,
 			ae.AggregateType, ae.AggregateID,
-		).Scan(&completed)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		).Scan(&exists)
+		if err != nil {
 			return fmt.Errorf("check saga completion: %w", err)
 		}
-		if err == nil && completed {
+		if exists {
 			return fmt.Errorf("%w: %s/%s", monotonic.ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
 		}
 
@@ -137,8 +157,8 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
-				"event counter mismatch for %s/%s: expected %d, got %d",
-				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
+				"%w for %s/%s: expected %d, got %d",
+				monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
 
@@ -160,8 +180,8 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 				// UNIQUE constraint violation (should be rare now that we pre-validate)
 				// This can still happen due to concurrent transactions
 				return fmt.Errorf(
-					"event counter conflict for %s/%s counter %d (concurrent write detected)",
-					ae.AggregateType, ae.AggregateID, ae.Event.Counter,
+					"%w for %s/%s counter %d (concurrent write detected)",
+					monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, ae.Event.Counter,
 				)
 			}
 			return fmt.Errorf("insert event: %w", err)
@@ -245,14 +265,8 @@ func (s *Store) ListActiveSagas(ctx context.Context, sagaType string) ([]string,
 }
 
 func (s *Store) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO sagas (saga_type, saga_id, completed) VALUES ($1, $2, TRUE)
-		 ON CONFLICT (saga_type, saga_id) DO UPDATE SET completed = TRUE`,
-		sagaType, sagaID,
-	)
-	if err != nil {
-		return fmt.Errorf("mark saga completed: %w", err)
-	}
+	// No-op: saga completion is derived from the saga-completed event in the events table.
+	// The sagas view automatically reflects this.
 	return nil
 }
 
@@ -278,18 +292,18 @@ func payloadBytes(p json.RawMessage) []byte {
 var _ monotonic.Store = (*Store)(nil)
 var _ monotonic.SagaStore = (*Store)(nil)
 
-// IsSagaCompleted checks if a saga has been marked as completed.
+// IsSagaCompleted checks if a saga has been completed.
 func (s *Store) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
-	var completed bool
+	var exists bool
 	err := s.pool.QueryRow(context.Background(),
-		`SELECT completed FROM sagas WHERE saga_type = $1 AND saga_id = $2`,
+		`SELECT EXISTS(
+			SELECT 1 FROM events
+			WHERE aggregate_type = $1 AND aggregate_id = $2 AND event_type = 'saga-completed'
+		)`,
 		sagaType, sagaID,
-	).Scan(&completed)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
+	).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("check saga completed: %w", err)
 	}
-	return completed, nil
+	return exists, nil
 }

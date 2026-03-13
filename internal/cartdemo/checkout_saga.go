@@ -210,7 +210,7 @@ func checkoutPaymentFailed(ctx context.Context, saga *monotonic.Saga, store mono
 	// Retry payment after a delay
 	return monotonic.ActionResult{
 		NewState: CheckoutChargingPayment,
-		Delay:    1 * time.Minute,
+		ReadyAt:  time.Now().Add(1 * time.Minute),
 	}, nil
 }
 

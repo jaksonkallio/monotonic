@@ -3,6 +3,7 @@ package monotonic
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -31,28 +32,34 @@ func TypedAction[I any](fn TypedActionFunc[I]) ActionFunc {
 	}
 }
 
-// ActionResult represents the outcome of a saga action
+// ActionResult represents the outcome of a saga action.
+//
+// Three possible outcomes:
+//   - State transition: set NewState (and optionally Events, ReadyAt)
+//   - Completion: set Complete to true (and optionally SagaFailureReason)
+//   - No progress: leave NewState empty and Complete false. No event is persisted.
+//     Use this when waiting on external state.
 type ActionResult struct {
-	// NewState is the state to transition to
-	// Must be blank if `Complete` is true
+	// NewState is the state to transition to.
+	// Must be blank if `Complete` is true.
+	// If blank and `Complete` is false, the step is a no-op (no event persisted).
 	NewState string
 
-	// Events are events to append to other aggregates atomically
-	// Must be empty if `Complete` is true
+	// Events are events to append to other aggregates atomically with the state transition.
+	// Must be empty if `Complete` is true or if NewState is blank.
 	Events []AggregateEvent
 
-	// Complete indicates the saga should be completed
-	// Typical pattern: transition to some "completed" state, then have "completed" action return `Complete` as true
-	// When true, NewState, Events, and Delay must be empty because completing implies that no other subsequent transitions or actions can occur
+	// Complete indicates the saga should be completed.
+	// When true, NewState, Events, and ReadyAt must be empty.
 	Complete bool
 
-	// Delay before the next step can run
-	// Must be zero if `Complete` is true
-	Delay time.Duration
+	// ReadyAt is the earliest time the next step may run.
+	// Must be zero if `Complete` is true or if NewState is blank.
+	ReadyAt time.Time
 
-	// SagaFailureReason is an optional message explaining why the saga failed
-	// May be non-empty only when `Complete` is true
-	// An empty string on a completed saga indicates successful completion
+	// SagaFailureReason is an optional message explaining why the saga failed.
+	// May be non-empty only when `Complete` is true.
+	// An empty string on a completed saga indicates successful completion.
 	SagaFailureReason string
 }
 
@@ -71,9 +78,8 @@ type SagaStartedPayload struct {
 
 // SagaStateTransitionPayload is stored in state-transitioned events
 type SagaStateTransitionPayload struct {
-	ToState string        `json:"to_state"`
-	ReadyAt time.Time     `json:"ready_at,omitempty"`
-	Delay   time.Duration `json:"delay,omitempty"`
+	ToState string    `json:"to_state"`
+	ReadyAt time.Time `json:"ready_at,omitempty"`
 }
 
 // SagaCompletedPayload is stored in the saga-completed event
@@ -109,8 +115,9 @@ type Saga struct {
 	actions ActionMap
 }
 
-// ErrInvalidCloseResult is returned when ActionResult has Close=true with other fields set
-var ErrInvalidCloseResult = fmt.Errorf("ActionResult with Close=true cannot have NewState, Events, or Delay")
+// ErrInvalidCompleteResult is returned when ActionResult has Complete=true with other fields set
+var ErrInvalidCompleteResult = fmt.Errorf("ActionResult with Complete=true cannot have NewState, Events, or ReadyAt")
+var ErrSagaAlreadyExists = fmt.Errorf("saga already exists")
 
 // NewSaga creates and persists a new saga.
 func NewSaga(
@@ -154,6 +161,10 @@ func NewSaga(
 	}
 
 	if err := store.Append(ctx, event); err != nil {
+		// A counter conflict on counter=1 means a saga already exists
+		if errors.Is(err, ErrCounterConflict) {
+			return nil, fmt.Errorf("%w: %s/%s", ErrSagaAlreadyExists, sagaType, id)
+		}
 		return nil, fmt.Errorf("persist saga start: %w", err)
 	}
 	saga.counter = 1
@@ -275,8 +286,8 @@ func (s *Saga) Step(ctx context.Context) error {
 
 	// Saga should be closed as a result of this action
 	if result.Complete {
-		if result.NewState != "" || len(result.Events) > 0 || result.Delay > 0 {
-			return ErrInvalidCloseResult
+		if result.NewState != "" || len(result.Events) > 0 || !result.ReadyAt.IsZero() {
+			return ErrInvalidCompleteResult
 		}
 		return s.closeSaga(ctx, result.SagaFailureReason)
 	}
@@ -285,12 +296,16 @@ func (s *Saga) Step(ctx context.Context) error {
 		return fmt.Errorf("SagaFailureReason can only be set when Complete is true")
 	}
 
+	// No new state: action chose not to progress (e.g. waiting on external state).
+	// No event is persisted.
 	if result.NewState == "" {
-		return fmt.Errorf("action result new state is empty")
-	}
-
-	if result.Delay < 0 {
-		return fmt.Errorf("action result delay cannot be negative")
+		if len(result.Events) > 0 {
+			return fmt.Errorf("action result cannot have Events without a state transition")
+		}
+		if !result.ReadyAt.IsZero() {
+			return fmt.Errorf("action result cannot have ReadyAt without a state transition")
+		}
+		return nil
 	}
 
 	if err := s.transition(ctx, result); err != nil {
@@ -335,16 +350,9 @@ func (s *Saga) closeSaga(ctx context.Context, failureReason string) error {
 
 // transition appends a state transition event and any extra events atomically
 func (s *Saga) transition(ctx context.Context, result ActionResult) error {
-	// Calculate ready time for delayed transitions
-	readyAt := time.Now()
-	if result.Delay > 0 {
-		readyAt = readyAt.Add(result.Delay)
-	}
-
 	payload, _ := json.Marshal(SagaStateTransitionPayload{
 		ToState: result.NewState,
-		ReadyAt: readyAt,
-		Delay:   result.Delay,
+		ReadyAt: result.ReadyAt,
 	})
 
 	sagaEvent := AcceptedEvent{

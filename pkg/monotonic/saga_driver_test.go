@@ -159,7 +159,7 @@ func TestSagaDriverRespectsDelay(t *testing.T) {
 			atomic.AddInt32(&calls, 1)
 			return ActionResult{
 				NewState: "waiting",
-				Delay:    100 * time.Millisecond,
+				ReadyAt:  time.Now().Add(100 * time.Millisecond),
 			}, nil
 		},
 		"waiting": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
@@ -468,7 +468,7 @@ func TestSagaTransientError(t *testing.T) {
 	}
 }
 
-func TestDriverClosesOnRecovery(t *testing.T) {
+func TestSagaCompletedEventMarksCompleted(t *testing.T) {
 	store := NewInMemoryStore()
 	ctx := context.Background()
 
@@ -478,48 +478,32 @@ func TestDriverClosesOnRecovery(t *testing.T) {
 		},
 	}
 
-	// Create saga and manually append saga-completed event WITHOUT calling store.Close
-	// (simulating a crash after event append but before store.Close)
+	// Create saga
 	saga, _ := NewSaga(store, "test-saga", "saga-1", "completed", nil, actions)
 
-	// Manually append saga-completed event (bypassing saga.Step's store.Close call)
+	// Saga should be active
+	ids, _ := store.ListActiveSagas(ctx, "test-saga")
+	if len(ids) != 1 {
+		t.Errorf("expected 1 active saga, got %d", len(ids))
+	}
+
+	// Manually append saga-completed event
 	closeEvent := AcceptedEvent{
 		Event:   Event{Type: EventTypeCompleted},
 		Counter: saga.Counter() + 1,
 	}
 	store.Append(ctx, AggregateEvent{AggregateType: "test-saga", AggregateID: "saga-1", Event: closeEvent})
 
-	// Saga event says closed, but store doesn't know yet
+	// Saga should now be completed (derived from event, consistent with Postgres)
 	closed, _ := store.IsSagaCompleted("test-saga", "saga-1")
-	if closed {
-		t.Error("store should not know saga is closed yet (simulating crash)")
-	}
-
-	// ListAggregates still returns it
-	ids, _ := store.ListActiveSagas(ctx, "test-saga")
-	if len(ids) != 1 {
-		t.Errorf("expected 1 saga before driver recovery, got %d", len(ids))
-	}
-
-	// Driver should detect closed flag and close it in store
-	driver := NewSagaDriver(SagaDriverConfig{
-		Store:    store,
-		SagaType: "test-saga",
-		Actions:  actions,
-	})
-
-	driver.StepAll(ctx)
-
-	// Now saga should be closed in store
-	closed, _ = store.IsSagaCompleted("test-saga", "saga-1")
 	if !closed {
-		t.Error("expected driver to close saga in store")
+		t.Error("saga should be completed after saga-completed event is appended")
 	}
 
-	// ListAggregates should no longer return it
+	// ListActiveSagas should no longer return it
 	ids, _ = store.ListActiveSagas(ctx, "test-saga")
 	if len(ids) != 0 {
-		t.Errorf("expected 0 sagas after driver recovery, got %d", len(ids))
+		t.Errorf("expected 0 active sagas after completion, got %d", len(ids))
 	}
 }
 
@@ -532,7 +516,7 @@ func TestStepRespectsDelayAfterCatchUp(t *testing.T) {
 		"started": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
 			return ActionResult{
 				NewState: "waiting",
-				Delay:    1 * time.Hour, // long delay
+				ReadyAt:  time.Now().Add(1 * time.Hour), // far future
 			}, nil
 		},
 		"waiting": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {

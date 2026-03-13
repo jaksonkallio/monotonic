@@ -148,13 +148,13 @@ Multiple drivers can run simultaneously without coordination. Optimistic concurr
 
 ## Delayed Transitions (Retries)
 
-Actions can return a `Delay` to pause before the next step:
+Actions can return a `ReadyAt` to pause before the next step:
 
 ```go
 func handlePaymentFailed(ctx context.Context, saga *monotonic.Saga, store monotonic.Store) (monotonic.ActionResult, error) {
     return monotonic.ActionResult{
-        NewState: CheckoutCharging,  // Retry charging
-        Delay:    1 * time.Minute,   // Wait 1 minute before retry
+        NewState: CheckoutCharging,              // Retry charging
+        ReadyAt:  time.Now().Add(1 * time.Minute), // Wait 1 minute before retry
     }, nil
 }
 ```

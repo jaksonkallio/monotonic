@@ -39,9 +39,15 @@ type SagaStore interface {
 // ErrSagaCompleted is returned when attempting to append to a completed saga
 var ErrSagaCompleted = fmt.Errorf("saga is completed")
 
+// ErrCounterConflict is returned when an event's counter conflicts with an existing event
+var ErrCounterConflict = fmt.Errorf("event counter conflict")
+
 type inMemoryStoredAggregate struct {
-	events    []AcceptedEvent
-	completed bool // only used for sagas
+	events []AcceptedEvent
+}
+
+type inMemorySaga struct {
+	completed bool
 }
 
 // InMemoryStore is an in-memory implementation of the Store interface
@@ -49,6 +55,7 @@ type inMemoryStoredAggregate struct {
 type InMemoryStore struct {
 	mu            sync.Mutex
 	aggregates    map[AggregateID]*inMemoryStoredAggregate
+	sagas         map[AggregateID]*inMemorySaga
 	globalEvents  []AggregateEvent // all events in global order
 	globalCounter int64            // next global counter to assign
 }
@@ -56,6 +63,7 @@ type InMemoryStore struct {
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{
 		aggregates:    make(map[AggregateID]*inMemoryStoredAggregate),
+		sagas:         make(map[AggregateID]*inMemorySaga),
 		globalEvents:  []AggregateEvent{},
 		globalCounter: 1,
 	}
@@ -90,7 +98,7 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
 
-		if agg != nil && agg.completed {
+		if saga, ok := s.sagas[id]; ok && saga.completed {
 			return fmt.Errorf("%w: %s/%s", ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
 		}
 
@@ -103,8 +111,8 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
-				"event counter mismatch for %s/%s: expected %d, got %d",
-				ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
+				"%w for %s/%s: expected %d, got %d",
+				ErrCounterConflict, ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
 
@@ -120,6 +128,21 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 			s.aggregates[id] = agg
 		}
 		agg.events = append(agg.events, ae.Event)
+
+		// Register newly started sagas
+		if ae.Event.Type == EventTypeStarted {
+			if _, ok := s.sagas[id]; !ok {
+				s.sagas[id] = &inMemorySaga{}
+			}
+		}
+
+		// Mark sagas as completed when saga-completed event is appended
+		if ae.Event.Type == EventTypeCompleted {
+			if _, ok := s.sagas[id]; !ok {
+				s.sagas[id] = &inMemorySaga{}
+			}
+			s.sagas[id].completed = true
+		}
 
 		// Track in global event log for projections with assigned global counter
 		globalEvent := ae
@@ -155,9 +178,9 @@ func (s *InMemoryStore) ListActiveSagas(ctx context.Context, sagaType string) ([
 	defer s.mu.Unlock()
 
 	var ids []string
-	for aggID, agg := range s.aggregates {
-		if aggID.Type == sagaType && !agg.completed {
-			ids = append(ids, aggID.ID)
+	for id, saga := range s.sagas {
+		if id.Type == sagaType && !saga.completed {
+			ids = append(ids, id.ID)
 		}
 	}
 	return ids, nil
@@ -168,12 +191,12 @@ func (s *InMemoryStore) MarkSagaCompleted(ctx context.Context, sagaType, sagaID 
 	defer s.mu.Unlock()
 
 	id := NewAggregateID(sagaType, sagaID)
-	agg, exists := s.aggregates[id]
+	saga, exists := s.sagas[id]
 	if !exists {
 		// Nothing to complete, but that's fine (idempotent)
 		return nil
 	}
-	agg.completed = true
+	saga.completed = true
 	return nil
 }
 
@@ -182,9 +205,9 @@ func (s *InMemoryStore) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
 	defer s.mu.Unlock()
 
 	id := NewAggregateID(sagaType, sagaID)
-	agg, exists := s.aggregates[id]
+	saga, exists := s.sagas[id]
 	if !exists {
 		return false, nil
 	}
-	return agg.completed, nil
+	return saga.completed, nil
 }
