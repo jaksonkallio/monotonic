@@ -1,3 +1,5 @@
 .DS_Store
 tests/postgres/postgres.test
 .claude/*.local.*
+.direnv
+.envrc
