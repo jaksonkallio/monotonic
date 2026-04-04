@@ -5,6 +5,10 @@ import (
 	"time"
 )
 
+const (
+	AnyCounter int64 = -1
+)
+
 // Event represents pure, ephemeral event data
 type Event struct {
 	Type    string
@@ -43,4 +47,24 @@ type AggregateEvent struct {
 	Event         AcceptedEvent
 	AggregateType string
 	AggregateID   string
+}
+
+// EventFilter is used to filter events based on (optionally) aggregate type and aggregate ID
+// If both aggregate type and ID are blank, all global events are returned
+type EventFilter struct {
+	AggregateType string
+	AggregateID   string
+}
+
+type ProposedEvent struct {
+	ID              string
+	ExpiresAt       time.Time
+	ExpectedCounter int64
+	AggregateType   string
+	AggregateID     string
+	Event           Event
+}
+
+type ProposedEventBatch struct {
+	ProposedEvents []ProposedEvent
 }
