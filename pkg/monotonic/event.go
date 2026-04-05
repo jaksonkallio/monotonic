@@ -57,8 +57,6 @@ type EventFilter struct {
 }
 
 type ProposedEvent struct {
-	ID              string
-	ExpiresAt       time.Time
 	ExpectedCounter int64
 	AggregateType   string
 	AggregateID     string
@@ -66,5 +64,7 @@ type ProposedEvent struct {
 }
 
 type ProposedEventBatch struct {
+	ProposalID     string
+	ExpiresAt      time.Time
 	ProposedEvents []ProposedEvent
 }

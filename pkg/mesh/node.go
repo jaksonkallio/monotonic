@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"time"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
@@ -61,5 +62,30 @@ func (n Node) attemptStoreAppend(batch monotonic.ProposedEventBatch) error {
 
 // relay will continuously relay the proposed event batch to all configured relays, until the event is accepted or expires
 func (n Node) relay(batch monotonic.ProposedEventBatch) {
-	return
+	relays := SortPrioritizedRelays(rand.NewSource(time.Now().UnixNano()), n.Relays)
+
+	var i int64
+	for !n.accepted(batch.ProposalID) && time.Now().Before(batch.ExpiresAt) {
+		// Iteratively relay until accepted or expired
+		relay := relays[i%int64(len(relays))]
+		n.relayTo(relay, batch)
+		i += 1
+	}
+}
+
+// relayTo will relay the batch to the specified relay
+func (n Node) relayTo(relay Relay, batch monotonic.ProposedEventBatch) error {
+	ctx, cancel := context.WithTimeout(context.Background(), relay.Timeout)
+	defer cancel()
+
+	if err := relay.Transport.Propose(ctx, batch); err != nil {
+		return fmt.Errorf("relay propose: %w", err)
+	}
+
+	return nil
+}
+
+func (n Node) accepted(proposalID string) bool {
+	// TODO: check local cache and/or poll relays
+	return false
 }
