@@ -1,6 +1,7 @@
 package monotonic
 
 import (
+	"cmp"
 	"encoding/json"
 	"time"
 )
@@ -40,6 +41,10 @@ type AcceptedEvent struct {
 	AcceptedAt    time.Time
 	Counter       int64
 	GlobalCounter int64
+}
+
+func AcceptedEventLess(a AcceptedEvent, b AcceptedEvent) int {
+	return cmp.Compare(a.GlobalCounter, b.GlobalCounter)
 }
 
 // AggregateEvent pairs an event with its target aggregate

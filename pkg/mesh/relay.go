@@ -68,3 +68,9 @@ func SortPrioritizedRelays(seed rand.Source, relays []Relay) []Relay {
 
 	return sorted
 }
+
+// PollEvents polls dense stream of events matching the event filter strictly after the provided global counter
+func (r Relay) PollEvents(filter monotonic.EventFilter, after int64) ([]monotonic.AcceptedEvent, error) {
+	// TODO: implement
+	return nil, nil
+}

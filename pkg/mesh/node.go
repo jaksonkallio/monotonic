@@ -23,6 +23,9 @@ type Node struct {
 
 	// Relays
 	Relays []Relay
+
+	// Cache for events
+	cache EventCache
 }
 
 // ProposeEvent will propose a batch of events to the node, attempting to append directly to the store if available or propagate across relays
@@ -36,9 +39,36 @@ func (n Node) ProposeEvent(batch monotonic.ProposedEventBatch) error {
 		}
 	}
 
-	go n.relay(batch)
+	n.relayProposedEventsBatch(batch)
 
 	return nil
+}
+
+// AcceptedEvents returns a dense stream of events matching the provided filter, strictly after the provided global counter
+func (n Node) AcceptedEvents(filter monotonic.EventFilter, after int64) []monotonic.AcceptedEvent {
+	var polledRelay bool
+	var acceptedEvents []monotonic.AcceptedEvent
+	for _, relay := range SortPrioritizedRelays(rand.NewSource(time.Now().UnixNano()), n.Relays) {
+		polledAcceptedEvents, err := relay.PollEvents(filter, after)
+		if err != nil {
+			// Failed to poll the relay, gracefully log and continue with another relay
+			slog.Warn("relay poll events failed", "filter", filter, "after", after)
+			continue
+		}
+		acceptedEvents = polledAcceptedEvents
+		polledRelay = true
+		break
+	}
+
+	if polledRelay {
+		// Successfully polled relay, add events to local cache
+		n.cache.Add(EventCacheKey(filter), acceptedEvents)
+	} else {
+		// All relays failed, fall back to this node's local cache
+		acceptedEvents = n.cache.Get(EventCacheKey(filter), after)
+	}
+
+	return acceptedEvents
 }
 
 // attemptStoreAppend attempts to append the batch in the store, returning any invariant-violating append error
@@ -61,20 +91,20 @@ func (n Node) attemptStoreAppend(batch monotonic.ProposedEventBatch) error {
 }
 
 // relay will continuously relay the proposed event batch to all configured relays, until the event is accepted or expires
-func (n Node) relay(batch monotonic.ProposedEventBatch) {
+func (n Node) relayProposedEventsBatch(batch monotonic.ProposedEventBatch) {
 	relays := SortPrioritizedRelays(rand.NewSource(time.Now().UnixNano()), n.Relays)
 
 	var i int64
 	for !n.accepted(batch.ProposalID) && time.Now().Before(batch.ExpiresAt) {
 		// Iteratively relay until accepted or expired
 		relay := relays[i%int64(len(relays))]
-		n.relayTo(relay, batch)
+		n.relayProposedEventsBatchTo(relay, batch)
 		i += 1
 	}
 }
 
 // relayTo will relay the batch to the specified relay
-func (n Node) relayTo(relay Relay, batch monotonic.ProposedEventBatch) error {
+func (n Node) relayProposedEventsBatchTo(relay Relay, batch monotonic.ProposedEventBatch) error {
 	ctx, cancel := context.WithTimeout(context.Background(), relay.Timeout)
 	defer cancel()
 
