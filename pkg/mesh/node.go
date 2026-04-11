@@ -19,7 +19,8 @@ type Store interface {
 
 type Node struct {
 	// Store is an optional reference to a store implementation, if this node is directly able to handle store-related actions
-	Store Store
+	Store        Store
+	storeTimeout time.Duration
 
 	// Relays
 	Relays []Relay
@@ -46,13 +47,23 @@ func (n Node) ProposeEvent(batch monotonic.ProposedEventBatch) error {
 
 // AcceptedEvents returns a dense stream of events matching the provided filter, strictly after the provided global counter
 func (n Node) AcceptedEvents(filter monotonic.EventFilter, after int64) []monotonic.AcceptedEvent {
+	if n.Store != nil {
+		// Store is configured, first try to directly find events in the store
+		events, err := n.attemptStoreFindEvents(filter, after)
+		if err == nil {
+			return events
+		}
+		slog.Error("store find events failed", "error", err, "filter", filter, "after", after)
+	}
+
+	// Attempt to poll events from each relay
 	var polledRelay bool
 	var acceptedEvents []monotonic.AcceptedEvent
 	for _, relay := range SortPrioritizedRelays(rand.NewSource(time.Now().UnixNano()), n.Relays) {
 		polledAcceptedEvents, err := relay.PollEvents(filter, after)
 		if err != nil {
 			// Failed to poll the relay, gracefully log and continue with another relay
-			slog.Warn("relay poll events failed", "filter", filter, "after", after)
+			slog.Error("relay poll events failed", "error", err, "filter", filter, "after", after)
 			continue
 		}
 		acceptedEvents = polledAcceptedEvents
@@ -73,8 +84,7 @@ func (n Node) AcceptedEvents(filter monotonic.EventFilter, after int64) []monoto
 
 // attemptStoreAppend attempts to append the batch in the store, returning any invariant-violating append error
 func (n Node) attemptStoreAppend(batch monotonic.ProposedEventBatch) error {
-	// TODO: configurable timeout for appending
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), n.storeTimeout)
 	defer cancel()
 
 	if err := n.Store.Append(ctx, batch.ProposedEvents...); err != nil {
@@ -88,6 +98,12 @@ func (n Node) attemptStoreAppend(batch monotonic.ProposedEventBatch) error {
 	}
 
 	return nil
+}
+
+func (n Node) attemptStoreFindEvents(filter monotonic.EventFilter, after int64) ([]monotonic.AcceptedEvent, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), n.storeTimeout)
+	defer cancel()
+	return n.Store.FindEvents(ctx, filter, after)
 }
 
 // relay will continuously relay the proposed event batch to all configured relays, until the event is accepted or expires
