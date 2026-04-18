@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package monotonic;
+option go_package = "github.com/jaksonkallio/monotonic/pkg/mesh/protobuf";
+
+// BroadcastEnvelope wraps message types in an envelope that has additional information for broadcast concerns
+message BroadcastEnvelope {
+	fixed64 broadcast_id = 1;
+	uint64 expires_at = 2;
+	oneof {
+		PollEvents poll_events = 3;
+		EventStream event_stream = 4;
+	}
+}
+
+// PollEvents is a message requesting events matching a particular filter after the specified counter
+message PollEvents {
+  EventFilter event_filter = 1;
+  int64 after = 2;
+}
+
+// EventStream is a dense stream of events matching a particular filter
+message EventStream {
+	EventFilter event_filter = 1;
+	repeated AcceptedEvent events = 2;
+}
+
+// ProposedEventsBatch is a set of proposed events that must be atomically accepted or rejected at once.
+message ProposedEventsBatch {
+	uint64 expires_at = 1;
+	repeated ProposedEvent proposed_events = 2;
+}
+
+// ProposedEvent is a single event with an expected counter by the proposer.
+message ProposedEvent {
+	uint64 expected_counter = 1;
+	Event event = 2;
+}
+
+// EventFilter defines an event stream based on aggregate type and aggregate ID filter values
+message EventFilter {
+	string aggregate_type = 1;
+	string aggregate_id = 2;
+}
+
+// Event is a single event for a specific aggregate.
+message Event {
+	string aggregate_type = 1;
+	string aggregate_id = 2;
+	string type = 3;
+	bytes payload = 4;
+}
+
+// AcceptedEvent is an event that has been accepted, containing additional acceptance counters.
+message AcceptedEvent {
+	uint64 global_counter = 1;
+	uint64 aggregate_type_counter = 2;
+	uint64 aggregate_type_id_counter = 3;
+	uint64 accepted_at = 4;
+	Event event = 5;
+}
+
+service SynchronousRelayService {
+  rpc ProposeEvents (ProposedEventsBatch);
+  rpc PollEvents (PollEvents) returns (EventStream);
+}
