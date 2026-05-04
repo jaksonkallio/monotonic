@@ -11,34 +11,25 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// ProjectionPersistence is a Postgres-backed implementation of monotonic.ProjectionPersistence.
-//
-// Each instance manages a single table with this shape:
-//
-//	CREATE TABLE <table> (
-//	    projection_key TEXT PRIMARY KEY,
-//	    global_counter BIGINT NOT NULL,
-//	    -- one column per key returned by V.Fields()
-//	);
-//
-// The caller is responsible for creating the table — column types depend on the
-// pgtype.Value implementations the value type uses, which this package does not
-// attempt to infer.
+// ProjectionPersistence stores projection rows in a Postgres table; callers must create the table with columns: projection_key TEXT PRIMARY KEY, global_counter BIGINT NOT NULL, plus one column per V.Fields() key.
 type ProjectionPersistence[V monotonic.ProjectionValue] struct {
-	pool      *pgxpool.Pool
+	// pool is the connection pool; lifecycle is the caller's responsibility.
+	pool *pgxpool.Pool
+	// tableName is the Postgres table backing this projection.
 	tableName string
-	newValue  func() V
-	columns   []string
+	// newValue produces an empty V; called once at construction and again on each Get to scan into.
+	newValue func() V
+	// columns are the V.Fields() keys in deterministic (sorted) order for stable SQL.
+	columns []string
 }
 
 // NewProjectionPersistence creates a Postgres-backed projection persistence for values of type V.
-// newValue is invoked during Get to produce a value whose Fields() map is populated from
-// the row, and once at construction time to learn the column set.
 func NewProjectionPersistence[V monotonic.ProjectionValue](
 	pool *pgxpool.Pool,
 	tableName string,
 	newValue func() V,
 ) *ProjectionPersistence[V] {
+	// Sample once to learn the column set; sorted for stable SQL ordering.
 	sample := newValue()
 	fields := sample.Fields()
 	cols := make([]string, 0, len(fields))
@@ -55,8 +46,7 @@ func NewProjectionPersistence[V monotonic.ProjectionValue](
 	}
 }
 
-// Get returns the projection value and its global counter for the given key.
-// If no row exists, returns the zero value of V, counter 0, and nil error.
+// Get returns the projection value and counter for key, or (zero V, 0, nil) when no row exists.
 func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.ProjectionKey) (V, uint64, error) {
 	var zero V
 
@@ -80,6 +70,7 @@ func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.Projec
 		return zero, 0, nil
 	}
 
+	// rows.Values() returns pgx-decoded native Go values; we then forward each to its pgtype.Value via Set.
 	rawValues, err := rows.Values()
 	if err != nil {
 		return zero, 0, fmt.Errorf("read projection row %q: %w", key, err)
@@ -105,32 +96,17 @@ func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.Projec
 	return value, uint64(globalCounter), nil
 }
 
-// Set upserts the projection value for the given key, but only if the provided
-// globalCounter is strictly greater than the existing one. If a row exists with
-// a counter >= globalCounter, returns monotonic.ErrProjectionStale.
-func (p *ProjectionPersistence[V]) Set(ctx context.Context, key monotonic.ProjectionKey, value V, globalCounter uint64) error {
+// Set atomically upserts the batch in one transaction; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.
+func (p *ProjectionPersistence[V]) Set(ctx context.Context, projecteds []monotonic.Projected[V], globalCounter uint64) error {
+	if len(projecteds) == 0 {
+		return nil
+	}
+	// globalCounter == 0 is reserved as the not-found sentinel in ProjectionReader.Get.
 	if globalCounter == 0 {
 		return fmt.Errorf("globalCounter must be > 0")
 	}
 
-	fields := value.Fields()
-
 	insertCols := append([]string{"projection_key", "global_counter"}, p.columns...)
-	args := make([]any, 0, len(insertCols))
-	args = append(args, string(key), int64(globalCounter))
-
-	for _, col := range p.columns {
-		pgVal, ok := fields[col]
-		if !ok {
-			return fmt.Errorf("projection value missing field %q", col)
-		}
-		raw := pgVal.Get()
-		if raw == pgtype.Undefined {
-			return fmt.Errorf("projection field %q is undefined", col)
-		}
-		args = append(args, raw)
-	}
-
 	placeholders := make([]string, len(insertCols))
 	for i := range placeholders {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
@@ -143,10 +119,11 @@ func (p *ProjectionPersistence[V]) Set(ctx context.Context, key monotonic.Projec
 		setClauses = append(setClauses, fmt.Sprintf("%s = EXCLUDED.%s", qc, qc))
 	}
 
+	// `<=` keeps equal-counter writes idempotent (redundant rewrite) so retries and direct replays converge.
 	query := fmt.Sprintf(
 		`INSERT INTO %s (%s) VALUES (%s)
 		 ON CONFLICT (projection_key) DO UPDATE SET %s
-		 WHERE %s.global_counter < EXCLUDED.global_counter`,
+		 WHERE %s.global_counter <= EXCLUDED.global_counter`,
 		quoteIdent(p.tableName),
 		strings.Join(quoteIdents(insertCols), ", "),
 		strings.Join(placeholders, ", "),
@@ -154,21 +131,53 @@ func (p *ProjectionPersistence[V]) Set(ctx context.Context, key monotonic.Projec
 		quoteIdent(p.tableName),
 	)
 
-	tag, err := p.pool.Exec(ctx, query, args...)
+	tx, err := p.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("upsert projection %q: %w", key, err)
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	for _, pj := range projecteds {
+		args, err := p.argsForRow(pj.Key, pj.Value, globalCounter)
+		if err != nil {
+			return err
+		}
+
+		tag, err := tx.Exec(ctx, query, args...)
+		if err != nil {
+			return fmt.Errorf("upsert projection %q: %w", pj.Key, err)
+		}
+		// RowsAffected == 0 means the WHERE rejected the update, i.e. existing counter > globalCounter.
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: key=%q counter=%d", monotonic.ErrProjectionStale, pj.Key, globalCounter)
+		}
 	}
 
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: key=%q counter=%d", monotonic.ErrProjectionStale, key, globalCounter)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit projection batch: %w", err)
 	}
-
 	return nil
 }
 
-// LatestGlobalCounter returns the highest global_counter recorded across all rows
-// in the projection table, or 0 if the table is empty. For this to be cheap on
-// large tables, the caller should ensure an index exists on global_counter.
+func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value V, globalCounter uint64) ([]any, error) {
+	fields := value.Fields()
+	args := make([]any, 0, 2+len(p.columns))
+	args = append(args, string(key), int64(globalCounter))
+	for _, col := range p.columns {
+		pgVal, ok := fields[col]
+		if !ok {
+			return nil, fmt.Errorf("projection value for %q missing field %q", key, col)
+		}
+		raw := pgVal.Get()
+		if raw == pgtype.Undefined {
+			return nil, fmt.Errorf("projection value for %q has undefined field %q", key, col)
+		}
+		args = append(args, raw)
+	}
+	return args, nil
+}
+
+// LatestGlobalCounter returns MAX(global_counter) across the projection table, or 0 if empty; callers should index global_counter for this to be cheap at scale.
 func (p *ProjectionPersistence[V]) LatestGlobalCounter(ctx context.Context) (uint64, error) {
 	var counter int64
 	query := fmt.Sprintf(

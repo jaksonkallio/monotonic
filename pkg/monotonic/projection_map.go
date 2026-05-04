@@ -3,48 +3,38 @@ package monotonic
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/jackc/pgtype"
 )
 
-// ErrProjectionStale is returned by ProjectionWriter.Set when the provided
-// global counter is not greater than the current one for the key.
+// ErrProjectionStale is returned by ProjectionWriter.Set when a key's stored counter exceeds the provided globalCounter.
 var ErrProjectionStale = fmt.Errorf("projection write is stale")
 
-// EventFilter defines ways to filter events from the global event stream.
-// Reduces the number of events processed by a projector.
+// EventFilter selects events from the global stream by aggregate type, aggregate ID, and/or event type; non-empty fields must match.
 type EventFilter struct {
 	AggregateType string
 	AggregateID   string
 	EventType     string
 }
 
+// Projector reads events from a Store and writes per-key updates to a ProjectionPersistence.
 type Projector[V ProjectionValue] struct {
+	// store is the event source the projector reads from.
 	store Store
-
-	// eventFilters controls which events are considered for processing by the projector.
-	// Filters are OR'ed together, meaning an event is processed if it matches any of the filters.
+	// eventFilters select which events the projector processes; matched under OR semantics.
 	eventFilters []EventFilter
-
-	// logic is the business logic for processing events and updating the projection value.
+	// logic produces per-key updates for each event.
 	logic ProjectorLogic[V]
-
-	// persistence is the mechanism for reading and writing projection values.
+	// persistence reads and writes projection rows.
 	persistence ProjectionPersistence[V]
-
-	// globalCounter is the resume position; the projector processes events with
-	// global_counter > globalCounter. Initialized from persistence.LatestGlobalCounter.
+	// mu serializes Update calls and protects globalCounter.
+	mu sync.Mutex
+	// globalCounter is the resume position; events with global_counter > this are pending.
 	globalCounter uint64
 }
 
-// NewProjector creates a Projector and derives its resume position from persistence
-// by querying the highest stored global counter. Subsequent reads from the event
-// store will start strictly after that counter.
-//
-// Caveat: this assumes writes for a given event are atomic with respect to the
-// persistence (e.g. a single Set per event, or a transaction wrapping multiple Sets).
-// Otherwise a crash mid-event can leave MAX(global_counter) reflecting a partially
-// written event, and resume will skip the remainder.
+// NewProjector creates a Projector and derives its resume position from persistence.LatestGlobalCounter.
 func NewProjector[V ProjectionValue](
 	ctx context.Context,
 	store Store,
@@ -65,46 +55,43 @@ func NewProjector[V ProjectionValue](
 	}, nil
 }
 
+// ProjectorLogic produces the per-key updates a projection emits in response to each event.
 type ProjectorLogic[V ProjectionValue] interface {
-	// Apply produces zero or more projection updates for an event. The reader
-	// can be used to fetch the current value for a key when computing aggregating
-	// updates (e.g. running totals). Reads see committed state from prior events;
-	// updates emitted from this Apply are not visible until they are persisted.
+	// Apply returns zero or more projection updates for an event; reader returns committed state from prior events.
 	Apply(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]Projected[V], error)
 }
 
+// Projected is one key/value update emitted by ProjectorLogic.Apply.
 type Projected[V ProjectionValue] struct {
 	Key   ProjectionKey
 	Value V
 }
 
+// ProjectionKey identifies a single row within a projection.
 type ProjectionKey string
 
+// ProjectionValue is a projection row whose Fields map exposes its column values for storage.
 type ProjectionValue interface {
 	Fields() map[string]pgtype.Value
 }
 
+// ProjectionReader fetches projection rows by key.
 type ProjectionReader[V ProjectionValue] interface {
-	// Get retrieves the projection value and its global counter for the given key.
-	// If no row exists for the key, returns the zero value of V, counter 0, and nil error.
-	// Counter 0 unambiguously means "not found" since real events start at global counter 1.
+	// Get returns the value and global counter for key, or (zero V, 0, nil) when no row exists.
 	Get(ctx context.Context, key ProjectionKey) (V, uint64, error)
 }
 
+// ProjectionWriter atomically persists batches of projection updates produced by a single event.
 type ProjectionWriter[V ProjectionValue] interface {
-	// Set updates the projection value for the given key. globalCounter must be > 0
-	// (zero is reserved as the not-found sentinel for ProjectionReader.Get) and must
-	// be strictly greater than the currently stored counter for the key. Returns
-	// ErrProjectionStale when the existing counter is greater than or equal.
-	Set(ctx context.Context, key ProjectionKey, value V, globalCounter uint64) error
+	// Set atomically writes the batch at globalCounter; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.
+	Set(ctx context.Context, projecteds []Projected[V], globalCounter uint64) error
 }
 
+// ProjectionPersistence reads, writes, and reports progress for a projection's storage.
 type ProjectionPersistence[V ProjectionValue] interface {
 	ProjectionReader[V]
 	ProjectionWriter[V]
 
-	// LatestGlobalCounter returns the highest global counter recorded across all
-	// rows in the projection, or 0 if the projection is empty. Used by NewProjector
-	// to derive the resume position on startup.
+	// LatestGlobalCounter returns the highest global counter stored across all rows, or 0 if empty.
 	LatestGlobalCounter(ctx context.Context) (uint64, error)
 }
