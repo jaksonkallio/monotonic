@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"github.com/jackc/pgtype"
 )
 
 // ErrProjectionStale is returned by ProjectionWriter.Set when a key's stored counter exceeds the provided globalCounter.
@@ -19,7 +17,7 @@ type EventFilter struct {
 }
 
 // Projector reads events from a Store and writes per-key updates to a ProjectionPersistence.
-type Projector[V ProjectionValue] struct {
+type Projector[V any] struct {
 	// store is the event source the projector reads from.
 	store Store
 	// eventFilters select which events the projector processes; matched under OR semantics.
@@ -35,7 +33,7 @@ type Projector[V ProjectionValue] struct {
 }
 
 // NewProjector creates a Projector and derives its resume position from persistence.LatestGlobalCounter.
-func NewProjector[V ProjectionValue](
+func NewProjector[V any](
 	ctx context.Context,
 	store Store,
 	eventFilters []EventFilter,
@@ -56,13 +54,13 @@ func NewProjector[V ProjectionValue](
 }
 
 // ProjectorLogic produces the per-key updates a projection emits in response to each event.
-type ProjectorLogic[V ProjectionValue] interface {
+type ProjectorLogic[V any] interface {
 	// Apply returns zero or more projection updates for an event; reader returns committed state from prior events.
 	Apply(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]Projected[V], error)
 }
 
 // Projected is one key/value update emitted by ProjectorLogic.Apply.
-type Projected[V ProjectionValue] struct {
+type Projected[V any] struct {
 	Key   ProjectionKey
 	Value V
 }
@@ -70,25 +68,20 @@ type Projected[V ProjectionValue] struct {
 // ProjectionKey identifies a single row within a projection.
 type ProjectionKey string
 
-// ProjectionValue is a projection row whose Fields map exposes its column values for storage.
-type ProjectionValue interface {
-	Fields() map[string]pgtype.Value
-}
-
 // ProjectionReader fetches projection rows by key.
-type ProjectionReader[V ProjectionValue] interface {
+type ProjectionReader[V any] interface {
 	// Get returns the value and global counter for key, or (zero V, 0, nil) when no row exists.
 	Get(ctx context.Context, key ProjectionKey) (V, uint64, error)
 }
 
 // ProjectionWriter atomically persists batches of projection updates produced by a single event.
-type ProjectionWriter[V ProjectionValue] interface {
+type ProjectionWriter[V any] interface {
 	// Set atomically writes the batch at globalCounter; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.
 	Set(ctx context.Context, projecteds []Projected[V], globalCounter uint64) error
 }
 
 // ProjectionPersistence reads, writes, and reports progress for a projection's storage.
-type ProjectionPersistence[V ProjectionValue] interface {
+type ProjectionPersistence[V any] interface {
 	ProjectionReader[V]
 	ProjectionWriter[V]
 
