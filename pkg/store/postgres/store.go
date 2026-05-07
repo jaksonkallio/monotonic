@@ -1,4 +1,4 @@
-// Package postgres provides a Postgres-backed implementation of the monotonic.Store and monotonic.SagaStore interfaces.
+// Package postgres provides a Postgres-backed implementation of the monotonic.Store interface.
 package postgres
 
 import (
@@ -14,18 +14,17 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// Store is a Postgres-backed implementation of the monotonic.SagaStore interface.
+// Store is a Postgres-backed implementation of monotonic.Store.
 type Store struct {
 	pool *pgxpool.Pool
 }
 
-// New creates a new Postgres store using the provided connection pool.
-// The caller is responsible for pool lifecycle.
+// New creates a new Postgres store using the provided connection pool; the caller owns the pool's lifecycle.
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
-// Migrate creates the required tables and indexes if they do not already exist.
+// Migrate creates the events table and supporting indexes if they do not already exist.
 func (s *Store) Migrate(ctx context.Context) error {
 	_, err := s.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS events (
@@ -44,30 +43,6 @@ func (s *Store) Migrate(ctx context.Context) error {
 
 		CREATE INDEX IF NOT EXISTS idx_events_global
 			ON events (aggregate_type, global_counter);
-
-		CREATE INDEX IF NOT EXISTS idx_events_saga_lifecycle
-			ON events (aggregate_type, aggregate_id, event_type);
-
-		CREATE INDEX IF NOT EXISTS idx_events_saga_started
-			ON events (event_type, aggregate_type, aggregate_id)
-			WHERE event_type = 'saga-started';
-
-		CREATE INDEX IF NOT EXISTS idx_events_saga_completed
-			ON events (event_type, aggregate_type, aggregate_id)
-			WHERE event_type = 'saga-completed';
-
-		CREATE OR REPLACE VIEW sagas AS
-		SELECT
-			e.aggregate_type AS saga_type,
-			e.aggregate_id AS saga_id,
-			EXISTS(
-				SELECT 1 FROM events e2
-				WHERE e2.aggregate_type = e.aggregate_type
-				AND e2.aggregate_id = e.aggregate_id
-				AND e2.event_type = 'saga-completed'
-			) AS completed
-		FROM events e
-		WHERE e.event_type = 'saga-started';
 	`)
 	return err
 }
@@ -111,35 +86,15 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	}
 	defer tx.Rollback(ctx)
 
-	// Collect distinct aggregates to check saga completion and load current counters
 	type aggKey struct{ typ, id string }
-	checked := make(map[aggKey]bool)
 	currentCounters := make(map[aggKey]int64)
 
+	// Load each distinct aggregate's current max counter once.
 	for _, ae := range events {
 		key := aggKey{ae.AggregateType, ae.AggregateID}
-		if checked[key] {
+		if _, ok := currentCounters[key]; ok {
 			continue
 		}
-		checked[key] = true
-
-		// Check if saga is completed by looking for a saga-completed event
-		var exists bool
-		err := tx.QueryRow(ctx,
-			`SELECT EXISTS(
-				SELECT 1 FROM events
-				WHERE aggregate_type = $1 AND aggregate_id = $2 AND event_type = 'saga-completed'
-			)`,
-			ae.AggregateType, ae.AggregateID,
-		).Scan(&exists)
-		if err != nil {
-			return fmt.Errorf("check saga completion: %w", err)
-		}
-		if exists {
-			return fmt.Errorf("%w: %s/%s", monotonic.ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
-		}
-
-		// Load current max counter for validation
 		maxCounter, err := currentMaxCounter(ctx, tx, ae.AggregateType, ae.AggregateID)
 		if err != nil {
 			return fmt.Errorf("get current counter: %w", err)
@@ -147,25 +102,20 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 		currentCounters[key] = maxCounter
 	}
 
-	// Validate all event counters are sequential before inserting
+	// Validate all event counters are sequential before inserting.
 	eventsInBatch := make(map[aggKey]int64)
-
 	for _, ae := range events {
 		key := aggKey{ae.AggregateType, ae.AggregateID}
-
 		expectedCounter := currentCounters[key] + 1 + eventsInBatch[key]
-
 		if ae.Event.Counter != expectedCounter {
 			return fmt.Errorf(
 				"%w for %s/%s: expected %d, got %d",
 				monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, expectedCounter, ae.Event.Counter,
 			)
 		}
-
 		eventsInBatch[key]++
 	}
 
-	// Insert all events (counters already validated above)
 	for _, ae := range events {
 		_, err := tx.Exec(ctx,
 			`INSERT INTO events (aggregate_type, aggregate_id, counter, event_type, payload, accepted_at)
@@ -176,9 +126,8 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 		)
 		if err != nil {
 			var pgErr *pgconn.PgError
+			// 23505 is UNIQUE constraint violation; rare given pre-validation, but possible under concurrent transactions.
 			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-				// UNIQUE constraint violation (should be rare now that we pre-validate)
-				// This can still happen due to concurrent transactions
 				return fmt.Errorf(
 					"%w for %s/%s counter %d (concurrent write detected)",
 					monotonic.ErrCounterConflict, ae.AggregateType, ae.AggregateID, ae.Event.Counter,
@@ -254,33 +203,6 @@ func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventF
 	return result, rows.Err()
 }
 
-func (s *Store) ListActiveSagas(ctx context.Context, sagaType string) ([]string, error) {
-	rows, err := s.pool.Query(ctx,
-		`SELECT saga_id FROM sagas WHERE saga_type = $1 AND completed = FALSE`,
-		sagaType,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("list active sagas: %w", err)
-	}
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("scan saga id: %w", err)
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
-}
-
-func (s *Store) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
-	// No-op: saga completion is derived from the saga-completed event in the events table.
-	// The sagas view automatically reflects this.
-	return nil
-}
-
 // currentMaxCounter returns the current maximum counter for an aggregate, or 0 if none exist.
 func currentMaxCounter(ctx context.Context, tx pgx.Tx, aggregateType, aggregateID string) (int64, error) {
 	var maxCounter int64
@@ -299,22 +221,4 @@ func payloadBytes(p json.RawMessage) []byte {
 	return []byte(p)
 }
 
-// Compile-time interface checks
 var _ monotonic.Store = (*Store)(nil)
-var _ monotonic.SagaStore = (*Store)(nil)
-
-// IsSagaCompleted checks if a saga has been completed.
-func (s *Store) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
-	var exists bool
-	err := s.pool.QueryRow(context.Background(),
-		`SELECT EXISTS(
-			SELECT 1 FROM events
-			WHERE aggregate_type = $1 AND aggregate_id = $2 AND event_type = 'saga-completed'
-		)`,
-		sagaType, sagaID,
-	).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("check saga completed: %w", err)
-	}
-	return exists, nil
-}

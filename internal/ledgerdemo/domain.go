@@ -1,5 +1,5 @@
-// Package dxeval is a temporary developer-experience evaluation harness for the projection system.
-package dxeval
+// Package ledgerdemo is the example event-sourced ledger that serves as the project's primary demo of monotonic.
+package ledgerdemo
 
 import (
 	"context"

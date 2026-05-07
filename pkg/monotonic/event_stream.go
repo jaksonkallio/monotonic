@@ -5,8 +5,7 @@ import (
 	"fmt"
 )
 
-// eventStream provides low-level event storage and replay functionality.
-// Both AggregateBase and Saga embed this to share common event handling code.
+// eventStream provides low-level event storage and replay functionality embedded by AggregateBase.
 type eventStream struct {
 	ID      AggregateID
 	counter int64

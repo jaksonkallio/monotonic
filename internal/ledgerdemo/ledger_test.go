@@ -1,4 +1,4 @@
-package dxeval
+package ledgerdemo
 
 import (
 	"context"
@@ -87,7 +87,7 @@ func TestLedgerScenario(t *testing.T) {
 		t.Errorf("alice holder name: want Alice, got %q", aliceBalance.HolderName)
 	}
 
-	// Bob: +30 transfer in = 30.
+	// Bob: +30 transfer in = 30. HolderName populated by Bob's account-opened.
 	bobBalance, _, _ := balancePersist.Get(ctx, "bob")
 	if bobBalance.Balance != 30 {
 		t.Errorf("bob balance: want 30, got %d", bobBalance.Balance)

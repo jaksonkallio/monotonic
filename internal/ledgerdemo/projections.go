@@ -1,4 +1,4 @@
-package dxeval
+package ledgerdemo
 
 import (
 	"context"
@@ -7,9 +7,8 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// AccountBalance is one row in the per-account balance projection.
+// AccountBalance is one row in the per-account balance projection; the row is keyed by aggregate ID, so AccountID isn't repeated as a field.
 type AccountBalance struct {
-	AccountID  string
 	HolderName string
 	Balance    int64
 }
@@ -29,11 +28,8 @@ func balanceOnAccountOpened(ctx context.Context, reader monotonic.ProjectionRead
 		return nil, fmt.Errorf("invalid account-opened payload")
 	}
 	return []monotonic.Projected[AccountBalance]{{
-		Key: monotonic.ProjectionKey(event.AggregateID),
-		Value: AccountBalance{
-			AccountID:  event.AggregateID,
-			HolderName: payload.HolderName,
-		},
+		Key:   monotonic.ProjectionKey(event.AggregateID),
+		Value: AccountBalance{HolderName: payload.HolderName},
 	}}, nil
 }
 
@@ -43,7 +39,6 @@ func balanceOnFundsDeposited(ctx context.Context, reader monotonic.ProjectionRea
 		return nil, fmt.Errorf("invalid deposit payload")
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKey(event.AggregateID), func(v *AccountBalance) error {
-		v.AccountID = event.AggregateID
 		v.Balance += payload.Amount
 		return nil
 	})
@@ -55,7 +50,6 @@ func balanceOnFundsWithdrawn(ctx context.Context, reader monotonic.ProjectionRea
 		return nil, fmt.Errorf("invalid withdraw payload")
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKey(event.AggregateID), func(v *AccountBalance) error {
-		v.AccountID = event.AggregateID
 		v.Balance -= payload.Amount
 		return nil
 	})
@@ -79,8 +73,6 @@ func balanceOnTransferCompleted(ctx context.Context, reader monotonic.Projection
 		return nil, err
 	}
 
-	from.AccountID = payload.FromAccount
-	to.AccountID = payload.ToAccount
 	from.Balance -= payload.Amount
 	to.Balance += payload.Amount
 
