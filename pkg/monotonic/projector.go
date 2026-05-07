@@ -11,7 +11,7 @@ func (p *Projector[V]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.eventFilters, int64(p.globalCounter))
+	events, err := p.store.LoadGlobalEvents(ctx, p.logic.EventFilters(), int64(p.globalCounter))
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}

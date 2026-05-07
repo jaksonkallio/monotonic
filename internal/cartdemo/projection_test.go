@@ -15,45 +15,62 @@ type OrderStatsSummary struct {
 	ItemsSold      map[string]int
 }
 
-// orderStatsLogic is the ProjectorLogic that folds cart and stock events into an OrderStatsSummary.
-type orderStatsLogic struct{}
+// newOrderStatsLogic builds the ProjectorLogic that folds cart and stock events into an OrderStatsSummary.
+func newOrderStatsLogic() monotonic.ProjectorLogic[OrderStatsSummary] {
+	return monotonic.NewDispatch[OrderStatsSummary]().
+		On("cart", EventCheckoutStarted, statsOnCheckoutStarted).
+		On("cart", EventPaymentCharged, statsOnPaymentCharged).
+		On("stock", EventStockReserved, statsOnStockReserved).
+		On("stock", EventReservationConfirmed, statsOnReservationConfirmed)
+}
 
-func (l *orderStatsLogic) Apply(ctx context.Context, reader monotonic.ProjectionReader[OrderStatsSummary], event monotonic.AggregateEvent) ([]monotonic.Projected[OrderStatsSummary], error) {
-	summary, _, err := reader.Get(ctx, monotonic.ProjectionKeySummary)
-	if err != nil {
-		return nil, err
+// ensureStatsMaps lazily initializes the nil maps on a zero-value summary.
+func ensureStatsMaps(s *OrderStatsSummary) {
+	if s.ItemsReserved == nil {
+		s.ItemsReserved = make(map[string]int)
 	}
-	// Zero-value summary has nil maps; initialize on first write.
-	if summary.ItemsReserved == nil {
-		summary.ItemsReserved = make(map[string]int)
+	if s.ItemsSold == nil {
+		s.ItemsSold = make(map[string]int)
 	}
-	if summary.ItemsSold == nil {
-		summary.ItemsSold = make(map[string]int)
-	}
+}
 
-	switch event.AggregateType {
-	case "cart":
-		switch event.Event.Type {
-		case EventCheckoutStarted:
-			summary.TotalCheckouts++
-		case EventPaymentCharged:
-			summary.TotalPayments++
+func statsOnCheckoutStarted(ctx context.Context, reader monotonic.ProjectionReader[OrderStatsSummary], event monotonic.AggregateEvent) ([]monotonic.Projected[OrderStatsSummary], error) {
+	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *OrderStatsSummary) error {
+		ensureStatsMaps(s)
+		s.TotalCheckouts++
+		return nil
+	})
+}
+
+func statsOnPaymentCharged(ctx context.Context, reader monotonic.ProjectionReader[OrderStatsSummary], event monotonic.AggregateEvent) ([]monotonic.Projected[OrderStatsSummary], error) {
+	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *OrderStatsSummary) error {
+		ensureStatsMaps(s)
+		s.TotalPayments++
+		return nil
+	})
+}
+
+func statsOnStockReserved(ctx context.Context, reader monotonic.ProjectionReader[OrderStatsSummary], event monotonic.AggregateEvent) ([]monotonic.Projected[OrderStatsSummary], error) {
+	payload, ok := monotonic.ParsePayload[StockReservedPayload](event.Event)
+	if !ok {
+		return nil, nil
+	}
+	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *OrderStatsSummary) error {
+		ensureStatsMaps(s)
+		s.ItemsReserved[event.AggregateID] += payload.Quantity
+		return nil
+	})
+}
+
+func statsOnReservationConfirmed(ctx context.Context, reader monotonic.ProjectionReader[OrderStatsSummary], event monotonic.AggregateEvent) ([]monotonic.Projected[OrderStatsSummary], error) {
+	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *OrderStatsSummary) error {
+		ensureStatsMaps(s)
+		if reserved := s.ItemsReserved[event.AggregateID]; reserved > 0 {
+			s.ItemsReserved[event.AggregateID]--
+			s.ItemsSold[event.AggregateID]++
 		}
-	case "stock":
-		switch event.Event.Type {
-		case EventStockReserved:
-			if payload, ok := monotonic.ParsePayload[StockReservedPayload](event.Event); ok {
-				summary.ItemsReserved[event.AggregateID] += payload.Quantity
-			}
-		case EventReservationConfirmed:
-			if reserved := summary.ItemsReserved[event.AggregateID]; reserved > 0 {
-				summary.ItemsReserved[event.AggregateID]--
-				summary.ItemsSold[event.AggregateID]++
-			}
-		}
-	}
-
-	return []monotonic.Projected[OrderStatsSummary]{{Key: monotonic.ProjectionKeySummary, Value: summary}}, nil
+		return nil
+	})
 }
 
 func TestSummaryProjector(t *testing.T) {
@@ -86,9 +103,8 @@ func TestSummaryProjector(t *testing.T) {
 	gadget.AcceptThenApply(ctx, monotonic.NewEvent(EventReservationConfirmed, ReservationPayload{SagaID: "saga-1"}))
 
 	persistence := monotonic.NewInMemoryProjectionPersistence[OrderStatsSummary]()
-	filters := []monotonic.EventFilter{{AggregateType: "cart"}, {AggregateType: "stock"}}
 
-	projector, err := monotonic.NewProjector(ctx, store, filters, &orderStatsLogic{}, persistence)
+	projector, err := monotonic.NewProjector(ctx, store, newOrderStatsLogic(), persistence)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -97,9 +113,9 @@ func TestSummaryProjector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Update failed: %v", err)
 	}
-	// 2 stock-added + 2 item-added + 1 checkout-started + 2 stock-reserved + 1 payment-token-set + 1 payment-charged + 2 reservation-confirmed = 11
-	if processed != 11 {
-		t.Errorf("expected 11 events processed, got %d", processed)
+	// Dispatch subscribes to: checkout-started (1), stock-reserved (2), payment-charged (1), reservation-confirmed (2) = 6.
+	if processed != 6 {
+		t.Errorf("expected 6 events processed, got %d", processed)
 	}
 
 	summary, _, _ := persistence.Get(ctx, monotonic.ProjectionKeySummary)
@@ -116,7 +132,7 @@ func TestSummaryProjector(t *testing.T) {
 		t.Errorf("expected 1 gadget sold, got %d", summary.ItemsSold["gadget"])
 	}
 
-	// Add more events and catch up again
+	// Add more events and catch up again. Only checkout-started is subscribed; item-added is filtered out by the dispatch.
 	cart2, _ := LoadCart(ctx, store, "cart-2")
 	cart2.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"}))
 	cart2.AcceptThenApply(ctx, monotonic.Event{Type: EventCheckoutStarted})
@@ -125,8 +141,8 @@ func TestSummaryProjector(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second Update failed: %v", err)
 	}
-	if processed != 2 {
-		t.Errorf("expected 2 new events processed, got %d", processed)
+	if processed != 1 {
+		t.Errorf("expected 1 new event processed, got %d", processed)
 	}
 
 	summary, _, _ = persistence.Get(ctx, monotonic.ProjectionKeySummary)
@@ -148,9 +164,8 @@ func TestSummaryProjectorResume(t *testing.T) {
 	cart.AcceptThenApply(ctx, monotonic.Event{Type: EventPaymentCharged})
 
 	persistence := monotonic.NewInMemoryProjectionPersistence[OrderStatsSummary]()
-	filters := []monotonic.EventFilter{{AggregateType: "cart"}, {AggregateType: "stock"}}
 
-	first, err := monotonic.NewProjector(ctx, store, filters, &orderStatsLogic{}, persistence)
+	first, err := monotonic.NewProjector(ctx, store, newOrderStatsLogic(), persistence)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -158,11 +173,17 @@ func TestSummaryProjectorResume(t *testing.T) {
 		t.Fatalf("first Update: %v", err)
 	}
 
-	// Add a new event after the first projector caught up.
-	cart.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "gadget"}))
+	// Add an event the dispatch is subscribed to. Cart requires an item before checkout.
+	cart2, _ := LoadCart(ctx, store, "cart-2")
+	if err := cart2.AcceptThenApply(ctx, monotonic.NewEvent(EventItemAdded, ItemAddedPayload{ItemName: "widget"})); err != nil {
+		t.Fatalf("add item to cart-2: %v", err)
+	}
+	if err := cart2.AcceptThenApply(ctx, monotonic.Event{Type: EventCheckoutStarted}); err != nil {
+		t.Fatalf("checkout cart-2: %v", err)
+	}
 
 	// A new projector against the same persistence resumes from the stored counter.
-	resumed, err := monotonic.NewProjector(ctx, store, filters, &orderStatsLogic{}, persistence)
+	resumed, err := monotonic.NewProjector(ctx, store, newOrderStatsLogic(), persistence)
 	if err != nil {
 		t.Fatalf("NewProjector resume: %v", err)
 	}

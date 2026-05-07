@@ -226,9 +226,8 @@ func TestProjector(t *testing.T) {
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 10}))
 
 	persistence := NewInMemoryProjectionPersistence[incrementSummary]()
-	filters := []EventFilter{{AggregateType: "counter"}}
 
-	projector, err := NewProjector(ctx, store, filters, &incrementLogic{}, persistence)
+	projector, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -264,7 +263,7 @@ func TestProjector(t *testing.T) {
 	// Resuming a fresh Projector against the same persistence should pick up only events past the stored counter.
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 50}))
 
-	resumed, err := NewProjector(ctx, store, filters, &incrementLogic{}, persistence)
+	resumed, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
 	if err != nil {
 		t.Fatalf("NewProjector resume: %v", err)
 	}
@@ -357,22 +356,20 @@ type incrementSummary struct {
 	Total int
 }
 
-type incrementLogic struct{}
+func newIncrementLogic() ProjectorLogic[incrementSummary] {
+	return NewDispatch[incrementSummary]().
+		On("counter", eventIncremented, applyIncrement)
+}
 
-func (l *incrementLogic) Apply(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]Projected[incrementSummary], error) {
-	if event.Event.Type != eventIncremented {
-		return nil, nil
-	}
+func applyIncrement(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]Projected[incrementSummary], error) {
 	payload, ok := ParsePayload[incrementedPayload](event.Event)
 	if !ok {
 		return nil, nil
 	}
-	summary, _, err := reader.Get(ctx, ProjectionKeySummary)
-	if err != nil {
-		return nil, err
-	}
-	summary.Total += payload.Amount
-	return []Projected[incrementSummary]{{Key: ProjectionKeySummary, Value: summary}}, nil
+	return MutateByKey(ctx, reader, ProjectionKeySummary, func(s *incrementSummary) error {
+		s.Total += payload.Amount
+		return nil
+	})
 }
 
 // High-Concurrency Tests

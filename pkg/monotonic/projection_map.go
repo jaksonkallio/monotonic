@@ -13,9 +13,7 @@ var ErrProjectionStale = fmt.Errorf("projection write is stale")
 type Projector[V any] struct {
 	// store is the event source the projector reads from.
 	store Store
-	// eventFilters select which events the projector processes; matched under OR semantics.
-	eventFilters []EventFilter
-	// logic produces per-key updates for each event.
+	// logic produces per-key updates for each event and supplies the projector's EventFilters.
 	logic ProjectorLogic[V]
 	// persistence reads and writes projection rows.
 	persistence ProjectionPersistence[V]
@@ -29,7 +27,6 @@ type Projector[V any] struct {
 func NewProjector[V any](
 	ctx context.Context,
 	store Store,
-	eventFilters []EventFilter,
 	logic ProjectorLogic[V],
 	persistence ProjectionPersistence[V],
 ) (*Projector[V], error) {
@@ -39,15 +36,16 @@ func NewProjector[V any](
 	}
 	return &Projector[V]{
 		store:         store,
-		eventFilters:  eventFilters,
 		logic:         logic,
 		persistence:   persistence,
 		globalCounter: counter,
 	}, nil
 }
 
-// ProjectorLogic produces the per-key updates a projection emits in response to each event.
+// ProjectorLogic produces the per-key updates a projection emits in response to each event and declares the EventFilters it subscribes to.
 type ProjectorLogic[V any] interface {
+	// EventFilters returns the EventFilters the projector should subscribe to, typically derived from a Dispatch.
+	EventFilters() []EventFilter
 	// Apply returns zero or more projection updates for an event; reader returns committed state from prior events.
 	Apply(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]Projected[V], error)
 }
@@ -83,4 +81,16 @@ type ProjectionPersistence[V any] interface {
 
 	// LatestGlobalCounter returns the highest global counter stored across all rows, or 0 if empty.
 	LatestGlobalCounter(ctx context.Context) (uint64, error)
+}
+
+// MutateByKey reads the row at key, applies mutate to it, and returns a single-element Projected slice ready to return from ProjectorLogic.Apply; if no row exists, mutate sees the zero value of V.
+func MutateByKey[V any](ctx context.Context, reader ProjectionReader[V], key ProjectionKey, mutate func(v *V) error) ([]Projected[V], error) {
+	current, _, err := reader.Get(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if err := mutate(&current); err != nil {
+		return nil, err
+	}
+	return []Projected[V]{{Key: key, Value: current}}, nil
 }
