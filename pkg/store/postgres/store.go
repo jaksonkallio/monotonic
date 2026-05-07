@@ -191,19 +191,30 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	return tx.Commit(ctx)
 }
 
-func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.AggregateID, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
-	// Build dynamic WHERE clause: each filter becomes a condition OR-ed together
-	// $1 is always afterGlobalCounter
+func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventFilter, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
+	// $1 is always afterGlobalCounter; each filter becomes one OR-ed clause built from its non-empty fields AND-ed together.
 	args := []any{afterGlobalCounter}
 	var conditions []string
 	for _, f := range filters {
-		if f.ID == "" {
-			args = append(args, f.Type)
-			conditions = append(conditions, fmt.Sprintf("aggregate_type = $%d", len(args)))
-		} else {
-			args = append(args, f.Type, f.ID)
-			conditions = append(conditions, fmt.Sprintf("(aggregate_type = $%d AND aggregate_id = $%d)", len(args)-1, len(args)))
+		var parts []string
+		if f.AggregateType != "" {
+			args = append(args, f.AggregateType)
+			parts = append(parts, fmt.Sprintf("aggregate_type = $%d", len(args)))
 		}
+		if f.AggregateID != "" {
+			args = append(args, f.AggregateID)
+			parts = append(parts, fmt.Sprintf("aggregate_id = $%d", len(args)))
+		}
+		if f.EventType != "" {
+			args = append(args, f.EventType)
+			parts = append(parts, fmt.Sprintf("event_type = $%d", len(args)))
+		}
+		if len(parts) == 0 {
+			// An empty EventFilter has no constraints, so it matches every event.
+			conditions = append(conditions, "TRUE")
+			continue
+		}
+		conditions = append(conditions, "("+strings.Join(parts, " AND ")+")")
 	}
 
 	filterClause := "FALSE"

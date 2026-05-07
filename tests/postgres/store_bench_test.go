@@ -150,7 +150,7 @@ func BenchmarkPostgres_LoadGlobalEvents(b *testing.B) {
 				}
 			}
 
-			filters := []monotonic.AggregateID{{Type: "counter"}}
+			filters := []monotonic.EventFilter{{AggregateType: "counter"}}
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

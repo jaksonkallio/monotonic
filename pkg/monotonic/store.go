@@ -17,10 +17,8 @@ type Store interface {
 	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
 	Append(ctx context.Context, events ...AggregateEvent) error
 
-	// LoadGlobalEvents returns all events matching the given filters with global counter > afterGlobalCounter, ordered by global counter.
-	// Each filter is an AggregateID: if ID is empty, all aggregates of that type match; if ID is set, only that specific aggregate matches.
-	// Filters are OR-ed together.
-	LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error)
+	// LoadGlobalEvents returns events matching any of the EventFilters with global counter > afterGlobalCounter, ordered by global counter; an empty filter list returns no events.
+	LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
 // SagaStore extends Store with saga lifecycle operations
@@ -154,7 +152,7 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	return nil
 }
 
-func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -164,10 +162,17 @@ func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []Aggregat
 			continue
 		}
 		for _, f := range filters {
-			if ae.AggregateType == f.Type && (f.ID == "" || ae.AggregateID == f.ID) {
-				result = append(result, ae)
-				break
+			if f.AggregateType != "" && ae.AggregateType != f.AggregateType {
+				continue
 			}
+			if f.AggregateID != "" && ae.AggregateID != f.AggregateID {
+				continue
+			}
+			if f.EventType != "" && ae.Event.Type != f.EventType {
+				continue
+			}
+			result = append(result, ae)
+			break
 		}
 	}
 	return result, nil

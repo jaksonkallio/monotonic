@@ -260,7 +260,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load only cart events
-	events, err := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "cart"}}, 0)
 	if err != nil {
 		t.Fatalf("load global cart: %v", err)
 	}
@@ -272,7 +272,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 	}
 
 	// Load both types
-	events, err = store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}, {Type: "stock"}}, 0)
+	events, err = store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "cart"}, {AggregateType: "stock"}}, 0)
 	if err != nil {
 		t.Fatalf("load global both: %v", err)
 	}
@@ -287,7 +287,7 @@ func TestLoadGlobalEvents(t *testing.T) {
 
 	// Load with afterGlobalCounter filter
 	afterGC := events[0].Event.GlobalCounter
-	events, err = store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}, {Type: "stock"}}, afterGC)
+	events, err = store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "cart"}, {AggregateType: "stock"}}, afterGC)
 	if err != nil {
 		t.Fatalf("load global after: %v", err)
 	}
@@ -620,7 +620,7 @@ func TestGlobalCounterOrdering(t *testing.T) {
 		}
 	}
 
-	events, err := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "cart"}}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "cart"}}, 0)
 	if err != nil {
 		t.Fatalf("load global: %v", err)
 	}
@@ -871,7 +871,7 @@ func TestConcurrentAppends_PostgreSQL_DifferentAggregates(t *testing.T) {
 	}
 
 	// Verify total events in store
-	events, err := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "counter"}}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "counter"}}, 0)
 	if err != nil {
 		t.Fatalf("LoadGlobalEvents: %v", err)
 	}
@@ -966,7 +966,7 @@ func TestConcurrentAppends_PostgreSQL_GlobalCounterOrdering(t *testing.T) {
 	}
 
 	// Verify global counter sequence has no gaps
-	events, _ := store.LoadGlobalEvents(ctx, []monotonic.AggregateID{{Type: "counter"}}, 0)
+	events, _ := store.LoadGlobalEvents(ctx, []monotonic.EventFilter{{AggregateType: "counter"}}, 0)
 	expectedTotal := numWriters * eventsPerWriter
 	if len(events) != expectedTotal {
 		t.Errorf("expected %d total events, got %d", expectedTotal, len(events))

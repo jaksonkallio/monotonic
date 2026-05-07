@@ -166,7 +166,7 @@ func BenchmarkLoadGlobalEvents(b *testing.B) {
 				}
 			}
 
-			filters := []AggregateID{{Type: "counter"}}
+			filters := []EventFilter{{AggregateType: "counter"}}
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {

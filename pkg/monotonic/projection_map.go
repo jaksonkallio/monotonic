@@ -9,13 +9,6 @@ import (
 // ErrProjectionStale is returned by ProjectionWriter.Set when a key's stored counter exceeds the provided globalCounter.
 var ErrProjectionStale = fmt.Errorf("projection write is stale")
 
-// EventFilter selects events from the global stream by aggregate type, aggregate ID, and/or event type; non-empty fields must match.
-type EventFilter struct {
-	AggregateType string
-	AggregateID   string
-	EventType     string
-}
-
 // Projector reads events from a Store and writes per-key updates to a ProjectionPersistence.
 type Projector[V any] struct {
 	// store is the event source the projector reads from.
@@ -67,6 +60,9 @@ type Projected[V any] struct {
 
 // ProjectionKey identifies a single row within a projection.
 type ProjectionKey string
+
+// ProjectionKeySummary is the conventional ProjectionKey for summary/single-row projections.
+const ProjectionKeySummary ProjectionKey = "summary"
 
 // ProjectionReader fetches projection rows by key.
 type ProjectionReader[V any] interface {

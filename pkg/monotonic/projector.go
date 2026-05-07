@@ -11,21 +11,13 @@ func (p *Projector[V]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	aggregateFilters := toAggregateFilters(p.eventFilters)
-	events, err := p.store.LoadGlobalEvents(ctx, aggregateFilters, int64(p.globalCounter))
+	events, err := p.store.LoadGlobalEvents(ctx, p.eventFilters, int64(p.globalCounter))
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}
 
 	processed := 0
 	for _, event := range events {
-		// Store filtering is per-aggregate only; apply EventType client-side here.
-		if !matchesAnyFilter(event, p.eventFilters) {
-			p.globalCounter = uint64(event.Event.GlobalCounter)
-			processed++
-			continue
-		}
-
 		updates, err := p.logic.Apply(ctx, p.persistence, event)
 		if err != nil {
 			return processed, fmt.Errorf("apply event %d: %w", event.Event.GlobalCounter, err)
@@ -76,36 +68,4 @@ func (p *Projector[V]) GlobalCounter() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.globalCounter
-}
-
-// toAggregateFilters extracts and dedupes the (Type, ID) filters from EventFilters for Store.LoadGlobalEvents.
-func toAggregateFilters(filters []EventFilter) []AggregateID {
-	seen := make(map[AggregateID]struct{}, len(filters))
-	result := make([]AggregateID, 0, len(filters))
-	for _, f := range filters {
-		id := AggregateID{Type: f.AggregateType, ID: f.AggregateID}
-		if _, ok := seen[id]; ok {
-			continue
-		}
-		seen[id] = struct{}{}
-		result = append(result, id)
-	}
-	return result
-}
-
-// matchesAnyFilter reports whether the event matches at least one filter under OR semantics.
-func matchesAnyFilter(event AggregateEvent, filters []EventFilter) bool {
-	for _, f := range filters {
-		if f.AggregateType != "" && event.AggregateType != f.AggregateType {
-			continue
-		}
-		if f.AggregateID != "" && event.AggregateID != f.AggregateID {
-			continue
-		}
-		if f.EventType != "" && event.Event.Type != f.EventType {
-			continue
-		}
-		return true
-	}
-	return false
 }
