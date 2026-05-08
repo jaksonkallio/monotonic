@@ -2,7 +2,7 @@
   <img src="./docs/logo.png" alt="Monotonic" />
 </p>
 
-A lightweight event-sourcing framework for Go with aggregates and projections. It's designed for small-to-medium scale projects that want the benefits of event sourcing without the complexity of distributed infrastructure or orchestration.
+A lightweight event-sourcing framework for Go with aggregates and projections. It's designed for small-to-medium throughput projects that want the benefits of event sourcing without the complexity of dedicated orchestration components.
 
 Simple example below, see [docs/getting-started.md](./docs/getting-started.md) for a deep dive.
 
@@ -28,7 +28,7 @@ func main() {
 	})
 
 	// Accept and apply some domain events.
-	// These business operations are concurrent-safe, business logic invariants are enforced in a strict order.
+	// These business operations are globally concurrent-safe, business logic invariants are enforced in a strict order.
 	account.AcceptThenApply(ctx, m.NewEvent("account-opened", AccountOpened{HolderName: "Alice"}))
 	account.AcceptThenApply(ctx, m.NewEvent("funds-deposited", FundsMoved{Amount: 100}))
 	account.AcceptThenApply(ctx, m.NewEvent("funds-withdrawn", FundsMoved{Amount: 30}))
@@ -66,6 +66,7 @@ func main() {
 
 	// Projected rows, from our account summary projection logic.
 	// This could be persisted as a plain ol' Postgres table, Redis key value, in-memory table, etc. for easy querying/reading.
+	// One common pattern is to persist projection as a Postgres table and use something like `sqlc` to generate type-safe read queries.
 	// | key   | HolderName | Balance | Closed |
 	// |-------|------------|---------|--------|
 	// | alice | Alice      | 0       | true   |
