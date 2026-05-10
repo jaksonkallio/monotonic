@@ -84,6 +84,7 @@ type ProjectorRunner interface {
 func RunProjectors(ctx context.Context, pollInterval time.Duration, projectors ...ProjectorRunner) error {
 	g, ctx := errgroup.WithContext(ctx)
 	for _, p := range projectors {
+		p := p
 		g.Go(func() error {
 			return p.Run(ctx, pollInterval)
 		})

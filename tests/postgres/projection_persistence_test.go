@@ -46,8 +46,14 @@ func testProjPersistence[V any](t *testing.T) *pgstore.ProjectionPersistence[V] 
 	}
 
 	t.Cleanup(func() {
-		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS %q`, tableName))
-		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP INDEX IF EXISTS %q`, "idx_"+tableName+"_gc"))
+		ctx := context.Background()
+		if _, err := sharedPool.Exec(ctx, fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, tableName)); err != nil {
+			t.Errorf("cleanup: drop table %q: %v", tableName, err)
+		}
+		indexName := "idx_" + tableName + "_gc"
+		if _, err := sharedPool.Exec(ctx, fmt.Sprintf(`DROP INDEX IF EXISTS "%s"`, indexName)); err != nil {
+			t.Errorf("cleanup: drop index %q: %v", indexName, err)
+		}
 	})
 	return p
 }
