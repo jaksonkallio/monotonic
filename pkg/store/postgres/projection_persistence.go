@@ -52,6 +52,14 @@ func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string) (*Pro
 		}
 		fields = append(fields, fieldInfo{column: tag, index: i})
 	}
+	seen := make(map[string]string, len(fields)) // column → first field name
+	for _, fi := range fields {
+		first := t.Field(fi.index).Name
+		if prev, ok := seen[fi.column]; ok {
+			return nil, fmt.Errorf("ProjectionPersistence: duplicate proj tag %q on fields %q and %q", fi.column, prev, first)
+		}
+		seen[fi.column] = first
+	}
 	if len(fields) == 0 {
 		return nil, fmt.Errorf("ProjectionPersistence: %s has no proj-tagged fields", t.Name())
 	}

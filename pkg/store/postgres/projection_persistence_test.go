@@ -82,6 +82,17 @@ func TestNewProjectionPersistence_IgnoresUntaggedExportedFields(t *testing.T) {
 	}
 }
 
+func TestNewProjectionPersistence_DuplicateColumnTagRejected(t *testing.T) {
+	type withDupe struct {
+		A string `proj:"name"`
+		B string `proj:"name"`
+	}
+	_, err := postgres.NewProjectionPersistence[withDupe](nil, "table")
+	if err == nil {
+		t.Error("expected error for duplicate proj tag value")
+	}
+}
+
 func TestNewProjectionPersistence_AllSupportedFieldTypes(t *testing.T) {
 	type allTypes struct {
 		S   string  `proj:"s"`
