@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // Update processes all pending events and returns the count, or 0 if caught up.
@@ -68,4 +70,23 @@ func (p *Projector[V]) GlobalCounter() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.globalCounter
+}
+
+// ProjectorRunner is implemented by any projector that can be driven by RunProjectors.
+// *Projector[V] satisfies this interface automatically.
+type ProjectorRunner interface {
+	Run(ctx context.Context, pollInterval time.Duration) error
+}
+
+// RunProjectors runs each projector concurrently in its own goroutine and returns when all have stopped.
+// If any projector returns an error, the shared context is cancelled and RunProjectors returns that error.
+// On clean context cancellation all projectors stop and RunProjectors returns nil.
+func RunProjectors(ctx context.Context, pollInterval time.Duration, projectors ...ProjectorRunner) error {
+	g, ctx := errgroup.WithContext(ctx)
+	for _, p := range projectors {
+		g.Go(func() error {
+			return p.Run(ctx, pollInterval)
+		})
+	}
+	return g.Wait()
 }
