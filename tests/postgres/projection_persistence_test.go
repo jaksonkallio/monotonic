@@ -2,7 +2,9 @@ package postgres_integration_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"reflect"
 	"fmt"
 	"hash/fnv"
 	"regexp"
@@ -422,5 +424,80 @@ func TestProjector_MultipleProjectionsPersistCorrectlyToPostgres(t *testing.T) {
 	}
 	if summary.Total != 100 {
 		t.Errorf("expected Total=100, got %d", summary.Total)
+	}
+}
+
+// --- Field type round-trip tests ---
+
+func TestProjectionPersistence_TimeFieldRoundtrip(t *testing.T) {
+	type row struct {
+		OccurredAt time.Time `proj:"occurred_at"`
+	}
+	ctx := context.Background()
+	p := testProjPersistence[row](t)
+
+	// Truncate to microseconds: Postgres TIMESTAMPTZ stores microsecond precision,
+	// so a nanosecond-precision Go time.Time will not survive the round-trip unchanged.
+	want := time.Now().UTC().Truncate(time.Microsecond)
+	if err := p.Set(ctx, []monotonic.Projected[row]{{Key: "k", Value: row{OccurredAt: want}}}, 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	got, err := p.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !got.OccurredAt.Equal(want) {
+		t.Errorf("time mismatch: got %v, want %v", got.OccurredAt, want)
+	}
+}
+
+func TestProjectionPersistence_BytesFieldRoundtrip(t *testing.T) {
+	type row struct {
+		Data []byte `proj:"data"`
+	}
+	ctx := context.Background()
+	p := testProjPersistence[row](t)
+
+	want := []byte{0x01, 0x02, 0x03, 0xFF}
+	if err := p.Set(ctx, []monotonic.Projected[row]{{Key: "k", Value: row{Data: want}}}, 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	got, err := p.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(got.Data) != string(want) {
+		t.Errorf("bytes mismatch: got %v, want %v", got.Data, want)
+	}
+}
+
+func TestProjectionPersistence_JSONRawMessageFieldRoundtrip(t *testing.T) {
+	type row struct {
+		Meta json.RawMessage `proj:"meta"`
+	}
+	ctx := context.Background()
+	p := testProjPersistence[row](t)
+
+	want := json.RawMessage(`{"count":3,"tags":["a","b"]}`)
+	if err := p.Set(ctx, []monotonic.Projected[row]{{Key: "k", Value: row{Meta: want}}}, 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	got, err := p.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	// Postgres normalizes JSONB (key order, spacing), so compare parsed values.
+	var gotVal, wantVal any
+	if err := json.Unmarshal(got.Meta, &gotVal); err != nil {
+		t.Fatalf("unmarshal got: %v", err)
+	}
+	if err := json.Unmarshal(want, &wantVal); err != nil {
+		t.Fatalf("unmarshal want: %v", err)
+	}
+	if !reflect.DeepEqual(gotVal, wantVal) {
+		t.Errorf("JSON mismatch: got %s, want %s", got.Meta, want)
 	}
 }
