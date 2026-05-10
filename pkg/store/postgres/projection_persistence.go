@@ -26,7 +26,7 @@ type fieldInfo struct {
 	column string
 	// index is the field's position in the struct, used by reflect.Value.Field.
 	index int
-	// isJSON is true for json.RawMessage and struct fields, which are stored as JSONB.
+	// isJSON is true for json.RawMessage fields, which are stored as JSONB.
 	isJSON bool
 }
 
