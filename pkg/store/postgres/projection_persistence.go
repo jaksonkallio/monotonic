@@ -64,23 +64,20 @@ func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string) (*Pro
 	}, nil
 }
 
-// Get returns the projection value and counter for key, or (zero V, 0, nil) when no row exists.
-func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.ProjectionKey) (V, uint64, error) {
+// Get returns the projection value for key, or (zero V, nil) when no row exists.
+func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.ProjectionKey) (V, error) {
 	var value V
 
-	selectCols := append([]string{"global_counter"}, p.columnNames()...)
 	query := fmt.Sprintf(
 		`SELECT %s FROM %s WHERE projection_key = $1`,
-		strings.Join(quoteIdents(selectCols), ", "),
+		strings.Join(quoteIdents(p.columnNames()), ", "),
 		quoteIdent(p.tableName),
 	)
 
 	// Address &value so reflect.Value.Field returns addressable Values that pgx can scan into.
 	valueElem := reflect.ValueOf(&value).Elem()
 
-	var globalCounter int64
-	dests := make([]any, 0, 1+len(p.fields))
-	dests = append(dests, &globalCounter)
+	dests := make([]any, 0, len(p.fields))
 	for _, fi := range p.fields {
 		dests = append(dests, valueElem.Field(fi.index).Addr().Interface())
 	}
@@ -88,12 +85,12 @@ func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.Projec
 	err := p.pool.QueryRow(ctx, query, string(key)).Scan(dests...)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return value, 0, nil
+			return value, nil
 		}
-		return value, 0, fmt.Errorf("query projection %q: %w", key, err)
+		return value, fmt.Errorf("query projection %q: %w", key, err)
 	}
 
-	return value, uint64(globalCounter), nil
+	return value, nil
 }
 
 // Set atomically upserts the batch in one transaction; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.

@@ -64,8 +64,8 @@ const ProjectionKeySummary ProjectionKey = "summary"
 
 // ProjectionReader fetches projection rows by key.
 type ProjectionReader[V any] interface {
-	// Get returns the value and global counter for key, or (zero V, 0, nil) when no row exists.
-	Get(ctx context.Context, key ProjectionKey) (V, uint64, error)
+	// Get returns the value for key, or (zero V, nil) when no row exists.
+	Get(ctx context.Context, key ProjectionKey) (V, error)
 }
 
 // ProjectionWriter atomically persists batches of projection updates produced by a single event.
@@ -85,7 +85,7 @@ type ProjectionPersistence[V any] interface {
 
 // MutateByKey reads the row at key, applies mutate to it, and returns a single-element Projected slice ready to return from ProjectorLogic.Apply; if no row exists, mutate sees the zero value of V.
 func MutateByKey[V any](ctx context.Context, reader ProjectionReader[V], key ProjectionKey, mutate func(v *V) error) ([]Projected[V], error) {
-	current, _, err := reader.Get(ctx, key)
+	current, err := reader.Get(ctx, key)
 	if err != nil {
 		return nil, err
 	}

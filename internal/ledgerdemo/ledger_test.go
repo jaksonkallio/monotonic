@@ -79,7 +79,7 @@ func TestLedgerScenario(t *testing.T) {
 
 	// Verify per-account balances.
 	// Alice: +100 deposit, -30 transfer out, -20 withdrawal = 50.
-	aliceBalance, _, _ := balancePersist.Get(ctx, "alice")
+	aliceBalance, _ := balancePersist.Get(ctx, "alice")
 	if aliceBalance.Balance != 50 {
 		t.Errorf("alice balance: want 50, got %d", aliceBalance.Balance)
 	}
@@ -88,7 +88,7 @@ func TestLedgerScenario(t *testing.T) {
 	}
 
 	// Bob: +30 transfer in = 30. HolderName populated by Bob's account-opened.
-	bobBalance, _, _ := balancePersist.Get(ctx, "bob")
+	bobBalance, _ := balancePersist.Get(ctx, "bob")
 	if bobBalance.Balance != 30 {
 		t.Errorf("bob balance: want 30, got %d", bobBalance.Balance)
 	}
@@ -97,7 +97,7 @@ func TestLedgerScenario(t *testing.T) {
 	}
 
 	// Verify summary stats.
-	stats, _, _ := statsPersist.Get(ctx, monotonic.ProjectionKeySummary)
+	stats, _ := statsPersist.Get(ctx, monotonic.ProjectionKeySummary)
 	if stats.AccountsOpened != 2 {
 		t.Errorf("accounts opened: want 2, got %d", stats.AccountsOpened)
 	}
@@ -129,7 +129,7 @@ func TestLedgerScenario(t *testing.T) {
 		t.Errorf("resumed balance processed: want 1, got %d", processed)
 	}
 
-	aliceBalance, _, _ = balancePersist.Get(ctx, "alice")
+	aliceBalance, _ = balancePersist.Get(ctx, "alice")
 	if aliceBalance.Balance != 55 {
 		t.Errorf("alice balance after resume: want 55, got %d", aliceBalance.Balance)
 	}

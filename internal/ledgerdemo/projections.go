@@ -64,11 +64,11 @@ func balanceOnTransferCompleted(ctx context.Context, reader monotonic.Projection
 	fromKey := monotonic.ProjectionKey(payload.FromAccount)
 	toKey := monotonic.ProjectionKey(payload.ToAccount)
 
-	from, _, err := reader.Get(ctx, fromKey)
+	from, err := reader.Get(ctx, fromKey)
 	if err != nil {
 		return nil, err
 	}
-	to, _, err := reader.Get(ctx, toKey)
+	to, err := reader.Get(ctx, toKey)
 	if err != nil {
 		return nil, err
 	}

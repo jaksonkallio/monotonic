@@ -29,15 +29,15 @@ func NewInMemoryProjectionPersistence[V any]() *InMemoryProjectionPersistence[V]
 	}
 }
 
-// Get returns the projection value and counter for key, or (zero V, 0, nil) when no row exists.
-func (p *InMemoryProjectionPersistence[V]) Get(ctx context.Context, key ProjectionKey) (V, uint64, error) {
+// Get returns the projection value for key, or (zero V, nil) when no row exists.
+func (p *InMemoryProjectionPersistence[V]) Get(ctx context.Context, key ProjectionKey) (V, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if r, ok := p.rows[key]; ok {
-		return r.value, r.globalCounter, nil
+		return r.value, nil
 	}
 	var zero V
-	return zero, 0, nil
+	return zero, nil
 }
 
 // Set atomically writes the batch at globalCounter; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.

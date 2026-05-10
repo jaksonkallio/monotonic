@@ -239,7 +239,7 @@ func TestProjector(t *testing.T) {
 	if processed != 3 {
 		t.Errorf("expected 3 events processed, got %d", processed)
 	}
-	summary, _, _ := persistence.Get(ctx, ProjectionKeySummary)
+	summary, _ := persistence.Get(ctx, ProjectionKeySummary)
 	if summary.Total != 13 {
 		t.Errorf("expected total 13, got %d", summary.Total)
 	}
@@ -255,7 +255,7 @@ func TestProjector(t *testing.T) {
 	if processed != 1 {
 		t.Errorf("expected 1 new event, got %d", processed)
 	}
-	summary, _, _ = persistence.Get(ctx, ProjectionKeySummary)
+	summary, _ = persistence.Get(ctx, ProjectionKeySummary)
 	if summary.Total != 113 {
 		t.Errorf("expected total 113, got %d", summary.Total)
 	}
@@ -274,7 +274,7 @@ func TestProjector(t *testing.T) {
 	if processed != 1 {
 		t.Errorf("expected 1 event from saved counter, got %d", processed)
 	}
-	summary, _, _ = persistence.Get(ctx, ProjectionKeySummary)
+	summary, _ = persistence.Get(ctx, ProjectionKeySummary)
 	if summary.Total != 163 {
 		t.Errorf("expected total 163, got %d", summary.Total)
 	}
