@@ -19,3 +19,12 @@ bench-all: bench bench-integration
 
 build:
 	go build ./...
+
+proto:
+	protoc \
+		--go_out=./pkg/mesh/protobuf \
+		--go_opt=paths=source_relative \
+		--go-grpc_out=./pkg/mesh/protobuf \
+		--go-grpc_opt=paths=source_relative \
+		-I ./pkg/mesh/protobuf \
+		./pkg/mesh/protobuf/mesh.proto

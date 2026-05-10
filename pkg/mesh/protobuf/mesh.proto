@@ -1,20 +1,21 @@
 syntax = "proto3";
 
 package monotonic;
+import "google/protobuf/empty.proto";
 option go_package = "github.com/jaksonkallio/monotonic/pkg/mesh/protobuf";
 
 // BroadcastEnvelope wraps message types in an envelope that has additional information for broadcast concerns
 message BroadcastEnvelope {
 	fixed64 broadcast_id = 1;
 	uint64 expires_at = 2;
-	oneof {
-		PollEvents poll_events = 3;
+	oneof payload {
+		PollEventsRequest poll_events = 3;
 		EventStream event_stream = 4;
 	}
 }
 
 // PollEvents is a message requesting events matching a particular filter after the specified counter
-message PollEvents {
+message PollEventsRequest {
   EventFilter event_filter = 1;
   int64 after = 2;
 }
@@ -25,16 +26,20 @@ message EventStream {
 	repeated AcceptedEvent events = 2;
 }
 
-// ProposedEventsBatch is a set of proposed events that must be atomically accepted or rejected at once.
+// ProposedEventsBatch is a set of proposed events that must be atomically accepted or rejected at once
 message ProposedEventsBatch {
 	uint64 expires_at = 1;
 	repeated ProposedEvent proposed_events = 2;
 }
 
-// ProposedEvent is a single event with an expected counter by the proposer.
+// ProposedEvent is a single event
 message ProposedEvent {
+	// expected_counter is the counter value that the proposer expects for this event and will be rejected if not exactly matching the actual next counter
 	uint64 expected_counter = 1;
-	Event event = 2;
+	// any_counter indicates whether the event can be accepted with any counter value, effectively ignoring the `expected_counter` value
+	bool any_counter = 2;
+	// event data that is being proposed
+	Event event = 3;
 }
 
 // EventFilter defines an event stream based on aggregate type and aggregate ID filter values
@@ -43,7 +48,7 @@ message EventFilter {
 	string aggregate_id = 2;
 }
 
-// Event is a single event for a specific aggregate.
+// Event is a single event for a specific aggregate
 message Event {
 	string aggregate_type = 1;
 	string aggregate_id = 2;
@@ -51,7 +56,7 @@ message Event {
 	bytes payload = 4;
 }
 
-// AcceptedEvent is an event that has been accepted, containing additional acceptance counters.
+// AcceptedEvent is an event that has been accepted, containing additional acceptance counters
 message AcceptedEvent {
 	uint64 global_counter = 1;
 	uint64 aggregate_type_counter = 2;
@@ -60,7 +65,10 @@ message AcceptedEvent {
 	Event event = 5;
 }
 
+// SynchronousRelayService is a service representing a synchronous relay connection between nodes
 service SynchronousRelayService {
-  rpc ProposeEvents (ProposedEventsBatch);
-  rpc PollEvents (PollEvents) returns (EventStream);
+	// ProposeEvents is for proposing an event batch
+	rpc ProposeEvents (ProposedEventsBatch) returns (google.protobuf.Empty);
+	// PollEvents polls event stream from the node based on provided event filter
+	rpc PollEvents (PollEventsRequest) returns (EventStream);
 }
