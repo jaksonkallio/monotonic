@@ -38,12 +38,12 @@ func NewEvent[P Payload](eventType string, payload P) Event {
 }
 
 // ParsePayload unmarshals an event's payload into the specified type
-func ParsePayload[P Payload](event AcceptedEvent) (P, bool) {
+func ParsePayload[P Payload](event AcceptedEvent) (P, error) {
 	var payload P
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
-		return payload, false
+		return payload, err
 	}
-	return payload, true
+	return payload, nil
 }
 
 // AcceptedEvent represents an event that has been accepted in an event stream with an assigned counter

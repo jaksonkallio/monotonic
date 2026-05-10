@@ -87,16 +87,16 @@ type Account struct {
 func (a *Account) Apply(event m.AcceptedEvent) {
 	switch event.Type {
 	case "account-opened":
-		if p, ok := m.ParsePayload[AccountOpened](event); ok {
+		if p, err := m.ParsePayload[AccountOpened](event); err == nil {
 			a.HolderName = p.HolderName
 			a.Opened = true
 		}
 	case "funds-deposited":
-		if p, ok := m.ParsePayload[FundsMoved](event); ok {
+		if p, err := m.ParsePayload[FundsMoved](event); err == nil {
 			a.Balance += p.Amount
 		}
 	case "funds-withdrawn":
-		if p, ok := m.ParsePayload[FundsMoved](event); ok {
+		if p, err := m.ParsePayload[FundsMoved](event); err == nil {
 			a.Balance -= p.Amount
 		}
 	case "account-closed":
@@ -173,23 +173,29 @@ func (l *AccountSummaryLogic) Apply(ctx context.Context, reader m.ProjectionRead
 	key := m.ProjectionKey(event.AggregateID)
 	switch event.Event.Type {
 	case "account-opened":
-		if p, ok := m.ParsePayload[AccountOpened](event.Event); ok {
-			return []m.Projected[AccountSummary]{{Key: key, Value: AccountSummary{HolderName: p.HolderName}}}, nil
+		p, err := m.ParsePayload[AccountOpened](event.Event)
+		if err != nil {
+			return nil, err
 		}
+		return []m.Projected[AccountSummary]{{Key: key, Value: AccountSummary{HolderName: p.HolderName}}}, nil
 	case "funds-deposited":
-		if p, ok := m.ParsePayload[FundsMoved](event.Event); ok {
-			return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-				s.Balance += p.Amount
-				return nil
-			})
+		p, err := m.ParsePayload[FundsMoved](event.Event)
+		if err != nil {
+			return nil, err
 		}
+		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
+			s.Balance += p.Amount
+			return nil
+		})
 	case "funds-withdrawn":
-		if p, ok := m.ParsePayload[FundsMoved](event.Event); ok {
-			return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-				s.Balance -= p.Amount
-				return nil
-			})
+		p, err := m.ParsePayload[FundsMoved](event.Event)
+		if err != nil {
+			return nil, err
 		}
+		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
+			s.Balance -= p.Amount
+			return nil
+		})
 	case "account-closed":
 		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
 			s.Balance = 0

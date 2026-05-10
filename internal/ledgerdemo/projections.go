@@ -23,9 +23,9 @@ func NewBalanceLogic() monotonic.ProjectorLogic[AccountBalance] {
 }
 
 func balanceOnAccountOpened(ctx context.Context, reader monotonic.ProjectionReader[AccountBalance], event monotonic.AggregateEvent) ([]monotonic.Projected[AccountBalance], error) {
-	payload, ok := monotonic.ParsePayload[AccountOpenedPayload](event.Event)
-	if !ok {
-		return nil, fmt.Errorf("invalid account-opened payload")
+	payload, err := monotonic.ParsePayload[AccountOpenedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing account-opened payload: %w", err)
 	}
 	return []monotonic.Projected[AccountBalance]{{
 		Key:   monotonic.ProjectionKey(event.AggregateID),
@@ -34,9 +34,9 @@ func balanceOnAccountOpened(ctx context.Context, reader monotonic.ProjectionRead
 }
 
 func balanceOnFundsDeposited(ctx context.Context, reader monotonic.ProjectionReader[AccountBalance], event monotonic.AggregateEvent) ([]monotonic.Projected[AccountBalance], error) {
-	payload, ok := monotonic.ParsePayload[FundsMovedPayload](event.Event)
-	if !ok {
-		return nil, fmt.Errorf("invalid deposit payload")
+	payload, err := monotonic.ParsePayload[FundsMovedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing deposit payload: %w", err)
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKey(event.AggregateID), func(v *AccountBalance) error {
 		v.Balance += payload.Amount
@@ -45,9 +45,9 @@ func balanceOnFundsDeposited(ctx context.Context, reader monotonic.ProjectionRea
 }
 
 func balanceOnFundsWithdrawn(ctx context.Context, reader monotonic.ProjectionReader[AccountBalance], event monotonic.AggregateEvent) ([]monotonic.Projected[AccountBalance], error) {
-	payload, ok := monotonic.ParsePayload[FundsMovedPayload](event.Event)
-	if !ok {
-		return nil, fmt.Errorf("invalid withdraw payload")
+	payload, err := monotonic.ParsePayload[FundsMovedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing withdraw payload: %w", err)
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKey(event.AggregateID), func(v *AccountBalance) error {
 		v.Balance -= payload.Amount
@@ -56,9 +56,9 @@ func balanceOnFundsWithdrawn(ctx context.Context, reader monotonic.ProjectionRea
 }
 
 func balanceOnTransferCompleted(ctx context.Context, reader monotonic.ProjectionReader[AccountBalance], event monotonic.AggregateEvent) ([]monotonic.Projected[AccountBalance], error) {
-	payload, ok := monotonic.ParsePayload[TransferCompletedPayload](event.Event)
-	if !ok {
-		return nil, fmt.Errorf("invalid transfer payload")
+	payload, err := monotonic.ParsePayload[TransferCompletedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing transfer-completed payload: %w", err)
 	}
 
 	fromKey := monotonic.ProjectionKey(payload.FromAccount)
@@ -108,9 +108,9 @@ func statsOnAccountOpened(ctx context.Context, reader monotonic.ProjectionReader
 }
 
 func statsOnFundsDeposited(ctx context.Context, reader monotonic.ProjectionReader[LedgerStats], event monotonic.AggregateEvent) ([]monotonic.Projected[LedgerStats], error) {
-	payload, ok := monotonic.ParsePayload[FundsMovedPayload](event.Event)
-	if !ok {
-		return nil, nil
+	payload, err := monotonic.ParsePayload[FundsMovedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing funds-deposited payload: %w", err)
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *LedgerStats) error {
 		s.TotalDeposited += payload.Amount
@@ -119,9 +119,9 @@ func statsOnFundsDeposited(ctx context.Context, reader monotonic.ProjectionReade
 }
 
 func statsOnFundsWithdrawn(ctx context.Context, reader monotonic.ProjectionReader[LedgerStats], event monotonic.AggregateEvent) ([]monotonic.Projected[LedgerStats], error) {
-	payload, ok := monotonic.ParsePayload[FundsMovedPayload](event.Event)
-	if !ok {
-		return nil, nil
+	payload, err := monotonic.ParsePayload[FundsMovedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing funds-withdrawn payload: %w", err)
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *LedgerStats) error {
 		s.TotalWithdrawn += payload.Amount
@@ -130,9 +130,9 @@ func statsOnFundsWithdrawn(ctx context.Context, reader monotonic.ProjectionReade
 }
 
 func statsOnTransferCompleted(ctx context.Context, reader monotonic.ProjectionReader[LedgerStats], event monotonic.AggregateEvent) ([]monotonic.Projected[LedgerStats], error) {
-	payload, ok := monotonic.ParsePayload[TransferCompletedPayload](event.Event)
-	if !ok {
-		return nil, nil
+	payload, err := monotonic.ParsePayload[TransferCompletedPayload](event.Event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing transfer-completed payload: %w", err)
 	}
 	return monotonic.MutateByKey(ctx, reader, monotonic.ProjectionKeySummary, func(s *LedgerStats) error {
 		s.TransfersCompleted++

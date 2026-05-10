@@ -25,11 +25,11 @@ type counter struct {
 func (c *counter) Apply(event AcceptedEvent) {
 	switch event.Type {
 	case eventIncremented:
-		if p, ok := ParsePayload[incrementedPayload](event); ok {
+		if p, err := ParsePayload[incrementedPayload](event); err == nil {
 			c.Value += p.Amount
 		}
 	case eventDecremented:
-		if p, ok := ParsePayload[incrementedPayload](event); ok {
+		if p, err := ParsePayload[incrementedPayload](event); err == nil {
 			c.Value -= p.Amount
 		}
 	}
@@ -290,9 +290,9 @@ func newIncrementLogic() ProjectorLogic[incrementSummary] {
 }
 
 func applyIncrement(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]Projected[incrementSummary], error) {
-	payload, ok := ParsePayload[incrementedPayload](event.Event)
-	if !ok {
-		return nil, nil
+	payload, err := ParsePayload[incrementedPayload](event.Event)
+	if err != nil {
+		return nil, err
 	}
 	return MutateByKey(ctx, reader, ProjectionKeySummary, func(s *incrementSummary) error {
 		s.Total += payload.Amount

@@ -3,7 +3,7 @@ package ledgerdemo
 
 import (
 	"context"
-	"errors"
+	"fmt"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
@@ -48,11 +48,11 @@ type account struct {
 func (a *account) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
 	case EventFundsDeposited:
-		if p, ok := monotonic.ParsePayload[FundsMovedPayload](event); ok {
+		if p, err := monotonic.ParsePayload[FundsMovedPayload](event); err == nil {
 			a.Balance += p.Amount
 		}
 	case EventFundsWithdrawn:
-		if p, ok := monotonic.ParsePayload[FundsMovedPayload](event); ok {
+		if p, err := monotonic.ParsePayload[FundsMovedPayload](event); err == nil {
 			a.Balance -= p.Amount
 		}
 	}
@@ -60,12 +60,12 @@ func (a *account) Apply(event monotonic.AcceptedEvent) {
 
 func (a *account) ShouldAccept(event monotonic.Event) error {
 	if event.Type == EventFundsWithdrawn {
-		p, ok := monotonic.ParsePayload[FundsMovedPayload](monotonic.AcceptedEvent{Event: event})
-		if !ok {
-			return errors.New("invalid withdraw payload")
+		p, err := monotonic.ParsePayload[FundsMovedPayload](monotonic.AcceptedEvent{Event: event})
+		if err != nil {
+			return fmt.Errorf("parsing withdraw payload: %w", err)
 		}
 		if a.Balance < p.Amount {
-			return errors.New("insufficient funds")
+			return fmt.Errorf("insufficient funds")
 		}
 	}
 	return nil

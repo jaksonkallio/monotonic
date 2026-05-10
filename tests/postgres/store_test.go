@@ -512,11 +512,11 @@ type counter struct {
 func (c *counter) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
 	case eventIncremented:
-		if p, ok := monotonic.ParsePayload[incrementedPayload](event); ok {
+		if p, err := monotonic.ParsePayload[incrementedPayload](event); err == nil {
 			c.Value += p.Amount
 		}
 	case eventDecremented:
-		if p, ok := monotonic.ParsePayload[incrementedPayload](event); ok {
+		if p, err := monotonic.ParsePayload[incrementedPayload](event); err == nil {
 			c.Value -= p.Amount
 		}
 	}
