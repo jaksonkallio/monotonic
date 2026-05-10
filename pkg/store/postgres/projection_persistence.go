@@ -198,7 +198,13 @@ func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value
 		fv := valueRef.Field(fi.index)
 		if fi.isJSON {
 			// Pass as string so the ::jsonb placeholder cast is applied correctly.
-			args = append(args, string(fv.Interface().(json.RawMessage)))
+			// Default nil/empty to "{}" so the NOT NULL JSONB column always receives valid JSON.
+			rm := fv.Interface().(json.RawMessage)
+			s := string(rm)
+			if s == "" {
+				s = "{}"
+			}
+			args = append(args, s)
 		} else {
 			args = append(args, fv.Interface())
 		}

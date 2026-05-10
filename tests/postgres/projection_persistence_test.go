@@ -501,3 +501,28 @@ func TestProjectionPersistence_JSONRawMessageFieldRoundtrip(t *testing.T) {
 		t.Errorf("JSON mismatch: got %s, want %s", got.Meta, want)
 	}
 }
+
+func TestProjectionPersistence_NilJSONRawMessageDefaultsToEmptyObject(t *testing.T) {
+	type row struct {
+		Meta json.RawMessage `proj:"meta"`
+	}
+	ctx := context.Background()
+	p := testProjPersistence[row](t)
+
+	// Store a row with a nil json.RawMessage (zero value).
+	if err := p.Set(ctx, []monotonic.Projected[row]{{Key: "k", Value: row{}}}, 1); err != nil {
+		t.Fatalf("Set with nil json.RawMessage: %v", err)
+	}
+
+	got, err := p.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	var v any
+	if err := json.Unmarshal(got.Meta, &v); err != nil {
+		t.Fatalf("stored value is not valid JSON: %v", err)
+	}
+	if m, ok := v.(map[string]any); !ok || len(m) != 0 {
+		t.Errorf("expected empty JSON object, got %s", got.Meta)
+	}
+}
