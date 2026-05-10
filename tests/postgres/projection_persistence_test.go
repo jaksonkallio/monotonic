@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 	"testing"
@@ -19,13 +20,23 @@ type projRow struct {
 	Score int64  `proj:"score"`
 }
 
-// safeTableName converts a test name into a valid Postgres identifier.
+// safeTableName converts a test name into a valid Postgres identifier (≤ 63 bytes).
+// The table name is "proj_" + safe (≤ 56 bytes total), which keeps the derived
+// index name "idx_" + tableName + "_gc" within the 63-byte limit.
+// When the safe portion exceeds 51 bytes it is truncated to 42 bytes and a
+// "_xxxxxxxx" fnv32 hash suffix is appended, preventing collisions between
+// test names that share a long common prefix.
 var nonAlphaNum = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
 func safeTableName(testName string) string {
 	safe := strings.ToLower(nonAlphaNum.ReplaceAllString(testName, "_"))
-	if len(safe) > 60 {
-		safe = safe[:60]
+	// "proj_" prefix (5) + safe must fit in 63 bytes; index adds "idx_"+"_gc" (7 more),
+	// so safe is capped at 51. Hash suffix uses 9 of those 51 bytes (1 + 8 hex digits).
+	const maxSafe = 51
+	if len(safe) > maxSafe {
+		h := fnv.New32a()
+		h.Write([]byte(safe))
+		safe = fmt.Sprintf("%s_%08x", safe[:maxSafe-9], h.Sum32())
 	}
 	return "proj_" + safe
 }
