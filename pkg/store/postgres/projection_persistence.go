@@ -175,6 +175,60 @@ func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value
 	return args
 }
 
+// Migrate creates the projection table and a global_counter index if they do not already exist.
+// Call once during application startup before using Get, Set, or LatestGlobalCounter.
+func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
+	var zero V
+	t := reflect.TypeOf(zero)
+
+	colDefs := make([]string, 0, 2+len(p.fields))
+	colDefs = append(colDefs,
+		`"projection_key" TEXT NOT NULL PRIMARY KEY`,
+		`"global_counter" BIGINT NOT NULL`,
+	)
+	for _, fi := range p.fields {
+		f := t.Field(fi.index)
+		pgType, err := goTypeToPostgres(f.Type)
+		if err != nil {
+			return fmt.Errorf("migrate: field %q: %w", f.Name, err)
+		}
+		colDefs = append(colDefs, fmt.Sprintf("%s %s NOT NULL", quoteIdent(fi.column), pgType))
+	}
+
+	ddl := fmt.Sprintf(
+		"CREATE TABLE IF NOT EXISTS %s (%s);\n"+
+			"CREATE INDEX IF NOT EXISTS %s ON %s (global_counter)",
+		quoteIdent(p.tableName),
+		strings.Join(colDefs, ", "),
+		quoteIdent("idx_"+p.tableName+"_gc"),
+		quoteIdent(p.tableName),
+	)
+	if _, err := p.pool.Exec(ctx, ddl); err != nil {
+		return fmt.Errorf("migrate projection table %q: %w", p.tableName, err)
+	}
+	return nil
+}
+
+// goTypeToPostgres maps a Go reflect.Type to the matching Postgres column type.
+// Only the primitive types that pgx natively encodes are supported; everything else is an error.
+func goTypeToPostgres(t reflect.Type) (string, error) {
+	switch t.Kind() {
+	case reflect.String:
+		return "TEXT", nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "BIGINT", nil
+	case reflect.Float32:
+		return "REAL", nil
+	case reflect.Float64:
+		return "DOUBLE PRECISION", nil
+	case reflect.Bool:
+		return "BOOLEAN", nil
+	default:
+		return "", fmt.Errorf("unsupported Go type %s; use string, integer, float, or bool fields", t.Kind())
+	}
+}
+
 func (p *ProjectionPersistence[V]) columnNames() []string {
 	out := make([]string, len(p.fields))
 	for i, f := range p.fields {
