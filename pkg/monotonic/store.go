@@ -6,64 +6,42 @@ import (
 	"sync"
 )
 
-// Store is the interface for event persistence
+// Store is the interface for event persistence.
 type Store interface {
-	// LoadAggregateEvents returns events for an aggregate in order.
-	// Only events with counter > afterCounter are returned. Pass 0 to load all events.
+	// LoadAggregateEvents returns events for an aggregate in counter order; only events with counter > afterCounter are returned (pass 0 for all).
 	LoadAggregateEvents(ctx context.Context, aggregateType, aggregateID string, afterCounter int64) ([]AcceptedEvent, error)
 
-	// Append adds new event(s) to the aggregate's event history atomically
-	// Either all events are appended at once or none are
-	// Returns an error if any event could not be appended (e.g. counter mismatch, saga closed)
+	// Append atomically adds events to one or more aggregates' histories; either all are appended or none.
 	Append(ctx context.Context, events ...AggregateEvent) error
 
-	// LoadGlobalEvents returns all events matching the given filters with global counter > afterGlobalCounter, ordered by global counter.
-	// Each filter is an AggregateID: if ID is empty, all aggregates of that type match; if ID is set, only that specific aggregate matches.
-	// Filters are OR-ed together.
-	LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error)
+	// LoadGlobalEvents returns events matching any of the EventFilters with global counter > afterGlobalCounter, ordered by global counter; an empty filter list returns no events.
+	LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error)
 }
 
-// SagaStore extends Store with saga lifecycle operations
-type SagaStore interface {
-	Store
-
-	// ListActiveSagas returns all saga IDs of a given type that have not been marked completed
-	ListActiveSagas(ctx context.Context, sagaType string) ([]string, error)
-
-	// MarkSagaCompleted marks a saga as completed
-	// Completed sagas cannot have more events appended and are not returned by `ListActiveSagas`
-	// Idempotent, marking an already completed saga is a no-op
-	MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error
-}
-
-// ErrSagaCompleted is returned when attempting to append to a completed saga
-var ErrSagaCompleted = fmt.Errorf("saga is completed")
-
-// ErrCounterConflict is returned when an event's counter conflicts with an existing event
+// ErrCounterConflict is returned when an event's counter conflicts with an existing event.
 var ErrCounterConflict = fmt.Errorf("event counter conflict")
 
+// inMemoryStoredAggregate is the in-memory backing for one aggregate's event log.
 type inMemoryStoredAggregate struct {
 	events []AcceptedEvent
 }
 
-type inMemorySaga struct {
-	completed bool
-}
-
-// InMemoryStore is an in-memory implementation of the Store interface
-// Useful for testing and development
+// InMemoryStore is an in-memory implementation of Store, useful for tests and development.
 type InMemoryStore struct {
-	mu            sync.Mutex
-	aggregates    map[AggregateID]*inMemoryStoredAggregate
-	sagas         map[AggregateID]*inMemorySaga
-	globalEvents  []AggregateEvent // all events in global order
-	globalCounter int64            // next global counter to assign
+	// mu protects all maps and slices below.
+	mu sync.Mutex
+	// aggregates holds the per-aggregate event logs.
+	aggregates map[AggregateID]*inMemoryStoredAggregate
+	// globalEvents records every appended event in global order for projection reads.
+	globalEvents []AggregateEvent
+	// globalCounter is the next global counter to assign on append.
+	globalCounter int64
 }
 
+// NewInMemoryStore creates an empty InMemoryStore.
 func NewInMemoryStore() *InMemoryStore {
 	return &InMemoryStore{
 		aggregates:    make(map[AggregateID]*inMemoryStoredAggregate),
-		sagas:         make(map[AggregateID]*inMemorySaga),
 		globalEvents:  []AggregateEvent{},
 		globalCounter: 1,
 	}
@@ -79,8 +57,7 @@ func (s *InMemoryStore) LoadAggregateEvents(ctx context.Context, aggregateType, 
 		return nil, nil
 	}
 
-	// Events are stored in order, so we can slice from afterCounter
-	// (counter is 1-indexed, slice is 0-indexed)
+	// Counter is 1-indexed, slice is 0-indexed.
 	if afterCounter >= int64(len(agg.events)) {
 		return nil, nil
 	}
@@ -91,22 +68,17 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Track how many events seen for each aggregate in this batch, necessary for expected counts
+	// Track per-aggregate counters within this batch so multiple events for the same aggregate validate sequentially.
 	eventsInBatch := make(map[AggregateID]int64)
 
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg := s.aggregates[id]
 
-		if saga, ok := s.sagas[id]; ok && saga.completed {
-			return fmt.Errorf("%w: %s/%s", ErrSagaCompleted, ae.AggregateType, ae.AggregateID)
-		}
-
 		var expectedCounter int64 = 1
 		if agg != nil {
 			expectedCounter = int64(len(agg.events)) + 1
 		}
-
 		expectedCounter += eventsInBatch[id]
 
 		if ae.Event.Counter != expectedCounter {
@@ -119,7 +91,6 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 		eventsInBatch[id]++
 	}
 
-	// Commit
 	for _, ae := range events {
 		id := NewAggregateID(ae.AggregateType, ae.AggregateID)
 		agg, exists := s.aggregates[id]
@@ -129,22 +100,7 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 		}
 		agg.events = append(agg.events, ae.Event)
 
-		// Register newly started sagas
-		if ae.Event.Type == EventTypeStarted {
-			if _, ok := s.sagas[id]; !ok {
-				s.sagas[id] = &inMemorySaga{}
-			}
-		}
-
-		// Mark sagas as completed when saga-completed event is appended
-		if ae.Event.Type == EventTypeCompleted {
-			if _, ok := s.sagas[id]; !ok {
-				s.sagas[id] = &inMemorySaga{}
-			}
-			s.sagas[id].completed = true
-		}
-
-		// Track in global event log for projections with assigned global counter
+		// Mirror into the global log with an assigned global counter for projection reads.
 		globalEvent := ae
 		globalEvent.Event.GlobalCounter = s.globalCounter
 		s.globalEvents = append(s.globalEvents, globalEvent)
@@ -154,7 +110,7 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	return nil
 }
 
-func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []AggregateID, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -164,50 +120,18 @@ func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []Aggregat
 			continue
 		}
 		for _, f := range filters {
-			if ae.AggregateType == f.Type && (f.ID == "" || ae.AggregateID == f.ID) {
-				result = append(result, ae)
-				break
+			if f.AggregateType != "" && ae.AggregateType != f.AggregateType {
+				continue
 			}
+			if f.AggregateID != "" && ae.AggregateID != f.AggregateID {
+				continue
+			}
+			if f.EventType != "" && ae.Event.Type != f.EventType {
+				continue
+			}
+			result = append(result, ae)
+			break
 		}
 	}
 	return result, nil
-}
-
-func (s *InMemoryStore) ListActiveSagas(ctx context.Context, sagaType string) ([]string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var ids []string
-	for id, saga := range s.sagas {
-		if id.Type == sagaType && !saga.completed {
-			ids = append(ids, id.ID)
-		}
-	}
-	return ids, nil
-}
-
-func (s *InMemoryStore) MarkSagaCompleted(ctx context.Context, sagaType, sagaID string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	id := NewAggregateID(sagaType, sagaID)
-	saga, exists := s.sagas[id]
-	if !exists {
-		// Nothing to complete, but that's fine (idempotent)
-		return nil
-	}
-	saga.completed = true
-	return nil
-}
-
-func (s *InMemoryStore) IsSagaCompleted(sagaType, sagaID string) (bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	id := NewAggregateID(sagaType, sagaID)
-	saga, exists := s.sagas[id]
-	if !exists {
-		return false, nil
-	}
-	return saga.completed, nil
 }

@@ -1,4 +1,4 @@
-.PHONY: test test-integration bench bench-integration bench-all build
+.PHONY: test test-integration bench bench-integration bench-all build fmt
 
 CGO_ENABLED ?= 0
 export CGO_ENABLED
@@ -19,3 +19,6 @@ bench-all: bench bench-integration
 
 build:
 	go build ./...
+
+fmt:
+	gofmt -w .

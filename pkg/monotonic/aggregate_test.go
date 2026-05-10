@@ -25,11 +25,11 @@ type counter struct {
 func (c *counter) Apply(event AcceptedEvent) {
 	switch event.Type {
 	case eventIncremented:
-		if p, ok := ParsePayload[incrementedPayload](event); ok {
+		if p, err := ParsePayload[incrementedPayload](event); err == nil {
 			c.Value += p.Amount
 		}
 	case eventDecremented:
-		if p, ok := ParsePayload[incrementedPayload](event); ok {
+		if p, err := ParsePayload[incrementedPayload](event); err == nil {
 			c.Value -= p.Amount
 		}
 	}
@@ -214,11 +214,10 @@ func TestAcceptThenApplyRetryable(t *testing.T) {
 	}
 }
 
-func TestProjection(t *testing.T) {
+func TestProjector(t *testing.T) {
 	store := NewInMemoryStore()
 	ctx := context.Background()
 
-	// Set up some counter events
 	c1, _ := loadCounter(ctx, store, "c1")
 	c1.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 1}))
 	c1.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 2}))
@@ -226,141 +225,79 @@ func TestProjection(t *testing.T) {
 	c2, _ := loadCounter(ctx, store, "c2")
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 10}))
 
-	// Simple projection that counts total increments
-	proj := &incrementProjection{}
-	p := NewProjection(store, proj)
+	persistence := NewInMemoryProjectionPersistence[incrementSummary]()
 
-	processed, err := p.Update(ctx)
+	projector, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+
+	processed, err := projector.Update(ctx)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
 	if processed != 3 {
 		t.Errorf("expected 3 events processed, got %d", processed)
 	}
-	if proj.total != 13 {
-		t.Errorf("expected total 13, got %d", proj.total)
+	summary, _ := persistence.Get(ctx, ProjectionKeySummary)
+	if summary.Total != 13 {
+		t.Errorf("expected total 13, got %d", summary.Total)
 	}
-	if p.GlobalCounter() == 0 {
+	if projector.GlobalCounter() == 0 {
 		t.Error("global counter should be > 0")
 	}
 
-	// Add more events, update again
 	c1.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 100}))
-	processed, err = p.Update(ctx)
+	processed, err = projector.Update(ctx)
 	if err != nil {
 		t.Fatalf("second Update: %v", err)
 	}
 	if processed != 1 {
 		t.Errorf("expected 1 new event, got %d", processed)
 	}
-	if proj.total != 113 {
-		t.Errorf("expected total 113, got %d", proj.total)
+	summary, _ = persistence.Get(ctx, ProjectionKeySummary)
+	if summary.Total != 113 {
+		t.Errorf("expected total 113, got %d", summary.Total)
 	}
 
-	// NewProjectionFrom — resume from a saved counter
-	savedCounter := p.GlobalCounter()
+	// Resuming a fresh Projector against the same persistence should pick up only events past the stored counter.
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 50}))
 
-	proj2 := &incrementProjection{}
-	p2 := NewProjectionFrom(store, proj2, savedCounter)
-	processed, err = p2.Update(ctx)
+	resumed, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
 	if err != nil {
-		t.Fatalf("Update from counter: %v", err)
+		t.Fatalf("NewProjector resume: %v", err)
+	}
+	processed, err = resumed.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update from saved counter: %v", err)
 	}
 	if processed != 1 {
 		t.Errorf("expected 1 event from saved counter, got %d", processed)
 	}
-	if proj2.total != 50 {
-		t.Errorf("expected total 50, got %d", proj2.total)
+	summary, _ = persistence.Get(ctx, ProjectionKeySummary)
+	if summary.Total != 163 {
+		t.Errorf("expected total 163, got %d", summary.Total)
 	}
 }
 
-func TestSagaRunToCompletion(t *testing.T) {
-	store := NewInMemoryStore()
-	ctx := context.Background()
+type incrementSummary struct {
+	Total int
+}
 
-	actions := ActionMap{
-		"start": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{NewState: "done"}, nil
-		},
-		"done": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Complete: true}, nil
-		},
-	}
+func newIncrementLogic() ProjectorLogic[incrementSummary] {
+	return NewDispatch[incrementSummary]().
+		On("counter", eventIncremented, applyIncrement)
+}
 
-	saga, err := NewSaga(store, "test-saga", "s1", "start", nil, actions)
+func applyIncrement(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]Projected[incrementSummary], error) {
+	payload, err := ParsePayload[incrementedPayload](event.Event)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
-
-	if err := saga.Run(ctx); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if !saga.Completed() {
-		t.Error("expected saga to be completed")
-	}
-	if saga.State() != "done" {
-		t.Errorf("expected state 'done', got %q", saga.State())
-	}
-}
-
-func TestSagaInput(t *testing.T) {
-	store := NewInMemoryStore()
-
-	type testInput struct {
-		Name string `json:"name"`
-	}
-	inputData, _ := json.Marshal(testInput{Name: "hello"})
-
-	actions := ActionMap{
-		"start": func(ctx context.Context, saga *Saga, store Store) (ActionResult, error) {
-			return ActionResult{Complete: true}, nil
-		},
-	}
-
-	saga, err := NewSaga(store, "test-saga", "s2", "start", inputData, actions)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Input() returns a copy
-	raw := saga.Input()
-	if raw == nil {
-		t.Fatal("Input() returned nil")
-	}
-
-	// InputAs() unmarshals correctly
-	var got testInput
-	if err := saga.InputAs(&got); err != nil {
-		t.Fatalf("InputAs: %v", err)
-	}
-	if got.Name != "hello" {
-		t.Errorf("expected name 'hello', got %q", got.Name)
-	}
-
-	// Verify Input() returns a copy (modifying it shouldn't affect saga)
-	raw[0] = 0
-	var got2 testInput
-	saga.InputAs(&got2)
-	if got2.Name != "hello" {
-		t.Error("Input() did not return a defensive copy")
-	}
-}
-
-type incrementProjection struct {
-	total int
-}
-
-func (p *incrementProjection) AggregateFilters() []AggregateID {
-	return []AggregateID{{Type: "counter"}}
-}
-
-func (p *incrementProjection) Apply(event AggregateEvent) {
-	if event.Event.Type == eventIncremented {
-		if payload, ok := ParsePayload[incrementedPayload](event.Event); ok {
-			p.total += payload.Amount
-		}
-	}
+	return MutateByKey(ctx, reader, ProjectionKeySummary, func(s *incrementSummary) error {
+		s.Total += payload.Amount
+		return nil
+	})
 }
 
 // High-Concurrency Tests
@@ -481,7 +418,7 @@ func TestConcurrentAppends_DifferentAggregates(t *testing.T) {
 	}
 
 	// Verify total events in store
-	events, err := store.LoadGlobalEvents(ctx, []AggregateID{{Type: "counter"}}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
 	if err != nil {
 		t.Fatalf("LoadGlobalEvents: %v", err)
 	}
@@ -530,7 +467,7 @@ func TestConcurrentAppends_MixedReadWrite(t *testing.T) {
 					readerErrors <- nil
 					return
 				default:
-					events, err := store.LoadGlobalEvents(ctx, []AggregateID{{Type: "counter"}}, 0)
+					events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
 					if err != nil {
 						readerErrors <- err
 						return
@@ -564,7 +501,7 @@ func TestConcurrentAppends_MixedReadWrite(t *testing.T) {
 	}
 
 	// Verify final event count
-	events, _ := store.LoadGlobalEvents(ctx, []AggregateID{{Type: "counter"}}, 0)
+	events, _ := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
 	expectedTotal := numWriters * eventsPerWriter
 	if len(events) != expectedTotal {
 		t.Errorf("expected %d total events, got %d", expectedTotal, len(events))

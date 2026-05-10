@@ -90,8 +90,7 @@ func (b *AggregateBase) AcceptThenApplyRetryable(ctx context.Context, retry Retr
 	}
 }
 
-// Accept accepts events without applying yet
-// Use when you need to prepare events for multiple aggregates to be committed atomically, such as in a saga
+// Accept accepts events without applying yet; use when preparing events for multiple aggregates to be committed atomically.
 func (b *AggregateBase) Accept(ctx context.Context, events ...Event) ([]AcceptedEvent, error) {
 	if len(events) == 0 {
 		// No-op
