@@ -131,10 +131,17 @@ func TestProjectionPersistence_SetUpdatesExistingRow(t *testing.T) {
 	ctx := context.Background()
 	p := testProjPersistence[projRow](t)
 
-	p.Set(ctx, []monotonic.Projected[projRow]{{Key: "k", Value: projRow{Score: 1}}}, 1)
-	p.Set(ctx, []monotonic.Projected[projRow]{{Key: "k", Value: projRow{Score: 2}}}, 2)
+	if err := p.Set(ctx, []monotonic.Projected[projRow]{{Key: "k", Value: projRow{Score: 1}}}, 1); err != nil {
+		t.Fatalf("first Set: %v", err)
+	}
+	if err := p.Set(ctx, []monotonic.Projected[projRow]{{Key: "k", Value: projRow{Score: 2}}}, 2); err != nil {
+		t.Fatalf("second Set: %v", err)
+	}
 
-	got, _ := p.Get(ctx, "k")
+	got, err := p.Get(ctx, "k")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
 	if got.Score != 2 {
 		t.Errorf("expected Score=2 after update, got %d", got.Score)
 	}
