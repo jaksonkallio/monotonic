@@ -1,6 +1,7 @@
 package postgres_integration_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -468,7 +469,7 @@ func TestProjectionPersistence_BytesFieldRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if string(got.Data) != string(want) {
+	if !bytes.Equal(got.Data, want) {
 		t.Errorf("bytes mismatch: got %v, want %v", got.Data, want)
 	}
 }
