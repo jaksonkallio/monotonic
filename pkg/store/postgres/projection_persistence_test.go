@@ -125,7 +125,7 @@ func TestNewProjectionPersistence_UnsupportedTypeRejected(t *testing.T) {
 
 func TestNewProjectionPersistence_StructFieldRejected(t *testing.T) {
 	type withStruct struct {
-		Name  string     `proj:"name"`
+		Name  string          `proj:"name"`
 		Inner struct{ X int } `proj:"inner"`
 	}
 	_, err := postgres.NewProjectionPersistence[withStruct](nil, "table")
