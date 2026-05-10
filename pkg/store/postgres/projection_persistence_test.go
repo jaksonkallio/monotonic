@@ -1,7 +1,9 @@
 package postgres_test
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/jaksonkallio/monotonic/pkg/store/postgres"
 )
@@ -95,14 +97,39 @@ func TestNewProjectionPersistence_DuplicateColumnTagRejected(t *testing.T) {
 
 func TestNewProjectionPersistence_AllSupportedFieldTypes(t *testing.T) {
 	type allTypes struct {
-		S   string  `proj:"s"`
-		I   int64   `proj:"i"`
-		F64 float64 `proj:"f64"`
-		F32 float32 `proj:"f32"`
-		B   bool    `proj:"b"`
+		S    string          `proj:"s"`
+		I    int64           `proj:"i"`
+		F64  float64         `proj:"f64"`
+		F32  float32         `proj:"f32"`
+		B    bool            `proj:"b"`
+		T    time.Time       `proj:"t"`
+		Raw  []byte          `proj:"raw"`
+		JSON json.RawMessage `proj:"json"`
 	}
 	_, err := postgres.NewProjectionPersistence[allTypes](nil, "table")
 	if err != nil {
 		t.Fatalf("unexpected error for all-supported-types struct: %v", err)
+	}
+}
+
+func TestNewProjectionPersistence_UnsupportedTypeRejected(t *testing.T) {
+	type withSlice struct {
+		Name string   `proj:"name"`
+		Tags []string `proj:"tags"`
+	}
+	_, err := postgres.NewProjectionPersistence[withSlice](nil, "table")
+	if err == nil {
+		t.Error("expected error for unsupported []string field type")
+	}
+}
+
+func TestNewProjectionPersistence_StructFieldRejected(t *testing.T) {
+	type withStruct struct {
+		Name  string     `proj:"name"`
+		Inner struct{ X int } `proj:"inner"`
+	}
+	_, err := postgres.NewProjectionPersistence[withStruct](nil, "table")
+	if err == nil {
+		t.Error("expected error for unsupported struct field type")
 	}
 }
