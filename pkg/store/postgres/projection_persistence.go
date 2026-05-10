@@ -2,15 +2,22 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
+)
+
+var (
+	timeType           = reflect.TypeFor[time.Time]()
+	jsonRawMessageType = reflect.TypeFor[json.RawMessage]()
 )
 
 // fieldInfo describes one tagged struct field used as a projection column.
@@ -19,6 +26,8 @@ type fieldInfo struct {
 	column string
 	// index is the field's position in the struct, used by reflect.Value.Field.
 	index int
+	// isJSON is true for json.RawMessage fields, which are stored as JSONB.
+	isJSON bool
 }
 
 // ProjectionPersistence stores projection rows in a Postgres table; V must be a struct whose exported fields are tagged `proj:"column_name"` to describe the projected columns.
@@ -50,7 +59,10 @@ func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string) (*Pro
 		if !f.IsExported() {
 			return nil, fmt.Errorf("ProjectionPersistence: field %q has proj tag but is unexported", f.Name)
 		}
-		fields = append(fields, fieldInfo{column: tag, index: i})
+		if _, err := goTypeToPostgres(f.Type); err != nil {
+			return nil, fmt.Errorf("ProjectionPersistence: field %q: %w", f.Name, err)
+		}
+		fields = append(fields, fieldInfo{column: tag, index: i, isJSON: f.Type == jsonRawMessageType})
 	}
 	seen := make(map[string]string, len(fields)) // column → first field name
 	for _, fi := range fields {
@@ -112,9 +124,14 @@ func (p *ProjectionPersistence[V]) Set(ctx context.Context, projecteds []monoton
 	}
 
 	insertCols := append([]string{"projection_key", "global_counter"}, p.columnNames()...)
-	placeholders := make([]string, len(insertCols))
-	for i := range placeholders {
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+	// First two placeholders (projection_key, global_counter) are always untyped.
+	placeholders := []string{"$1", "$2"}
+	for i, fi := range p.fields {
+		ph := fmt.Sprintf("$%d", i+3)
+		if fi.isJSON {
+			ph += "::jsonb"
+		}
+		placeholders = append(placeholders, ph)
 	}
 
 	setClauses := make([]string, 0, len(p.fields)+1)
@@ -178,7 +195,19 @@ func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value
 	args := make([]any, 0, 2+len(p.fields))
 	args = append(args, string(key), int64(globalCounter))
 	for _, fi := range p.fields {
-		args = append(args, valueRef.Field(fi.index).Interface())
+		fv := valueRef.Field(fi.index)
+		if fi.isJSON {
+			// Pass as string so the ::jsonb placeholder cast is applied correctly.
+			// Default nil/empty to "{}" so the NOT NULL JSONB column always receives valid JSON.
+			rm := fv.Interface().(json.RawMessage)
+			s := string(rm)
+			if s == "" {
+				s = "{}"
+			}
+			args = append(args, s)
+		} else {
+			args = append(args, fv.Interface())
+		}
 	}
 	return args
 }
@@ -218,8 +247,18 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 }
 
 // goTypeToPostgres maps a Go reflect.Type to the matching Postgres column type.
-// Only the primitive types that pgx natively encodes are supported; everything else is an error.
+// Supported types: string, int*, uint*, float32, float64, bool, time.Time, []byte, json.RawMessage.
 func goTypeToPostgres(t reflect.Type) (string, error) {
+	if t == timeType {
+		return "TIMESTAMPTZ", nil
+	}
+	if t == jsonRawMessageType {
+		return "JSONB", nil
+	}
+	// []byte after json.RawMessage so the named type is caught above.
+	if t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8 {
+		return "BYTEA", nil
+	}
 	switch t.Kind() {
 	case reflect.String:
 		return "TEXT", nil
@@ -233,7 +272,7 @@ func goTypeToPostgres(t reflect.Type) (string, error) {
 	case reflect.Bool:
 		return "BOOLEAN", nil
 	default:
-		return "", fmt.Errorf("unsupported Go type %s; use string, integer, float, or bool fields", t.Kind())
+		return "", fmt.Errorf("unsupported Go type %s (%s); supported types: string, int*, uint*, float32, float64, bool, time.Time, []byte, json.RawMessage", t, t.Kind())
 	}
 }
 
