@@ -1,0 +1,36 @@
+name: PR Checks
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+    branches: [main]
+
+jobs:
+  test:
+    name: Run Tests and Checks
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: 'go.mod'
+
+    - name: Check Go formatting
+      run: |
+        if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+          echo "The following files are not properly formatted:"
+          gofmt -l .
+          echo "Please run 'gofmt -w .' to fix formatting issues."
+          exit 1
+        fi
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Run tests
+      run: go test -v ./...
