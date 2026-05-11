@@ -94,6 +94,16 @@ func main() {
 	carol.AcceptThenApply(ctx, m.NewEvent("account-opened", AccountOpened{HolderName: "Carol"}))
 	carol.AcceptThenApply(ctx, m.NewEvent("funds-deposited", FundsMoved{Amount: 50}))
 
+	// `AcceptThenApply` is just a convenience method, you can also manually do `Accept` and `Apply` steps separately.
+	// This allows you to accept+apply events atomically in a batch across multiple different aggregates.
+	// Either both events in the batch succeed, or both events are rejected.
+	transferWithdraw, _ := bob.Accept(ctx, m.NewEvent("funds-withdrawn", FundsMoved{Amount: 25, Memo: "transferred to carol" }))
+	transferDeposit, _ := carol.Accept(ctx, m.NewEvent("funds-deposited", FundsMoved{Amount: 25, Memo: "transferred from bob" }))
+	store.Append(ctx,
+		m.AggregateEvent{AggregateType: bob.ID.Type, AggregateID: bob.ID.ID, Event: transferWithdraw[0]},
+		m.AggregateEvent{AggregateType: carol.ID.Type, AggregateID: carol.ID.ID, Event: transferDeposit[0]},
+	)
+
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
 	summaries := m.NewInMemoryProjectionPersistence[AccountSummary]()
 	projector, _ := m.NewProjector(ctx, store, NewAccountSummaryLogic(), summaries)
@@ -105,8 +115,8 @@ func main() {
 	// | key   | HolderName | Balance | Closed |
 	// |-------|------------|---------|--------|
 	// | alice | Alice      | 0       | true   |
-	// | bob   | Bob        | 200     | false  |
-	// | carol | Carol      | 50      | false  |
+	// | bob   | Bob        | 175     | false  |
+	// | carol | Carol      | 75      | false  |
 }
 
 // Account aggregate representing a bank account.
@@ -187,7 +197,8 @@ type AccountOpened struct {
 }
 
 type FundsMoved struct {
-	Amount int64 `json:"amount"`
+	Amount int64  `json:"amount"`
+	Memo   string `json:"memo"`
 }
 
 // AccountSummary is a per-account projection row exposing holder, balance, and closed state.
