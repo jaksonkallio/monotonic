@@ -4,7 +4,38 @@
 
 A lightweight event-sourcing framework for Go with aggregates and projections. It's designed for small-to-medium throughput projects that want the benefits of event sourcing without the complexity of dedicated orchestration components.
 
-Simple example below, see [docs/getting-started.md](./docs/getting-started.md) for a deep dive.
+## Example
+_Note: this entire README file is human-written! No AI._
+
+First off, what is **event sourcing**? The quick answer is "a system that derives state from past events". In most traditional applications, you are storing the current state of the system, probably in some sort of database. If you were running a bank software, this might look like storing a table of current balances somewhere, with a column for the account number and another column for the current balance. As transactions occur, you might be incrementing or decrementing this value. The event sourcing approach flips this on its head, by instead just tracking the **historic immutable events** of what has already happened, and deriving the current state from that. An event sourced bank software would just store records of transactions, then at any time we can **project** the current balance from all of the deposits and withdrawals that occurred for an account. The "current balance" of an account becomes just a passive result of all of the events that have happened previously, rather than an explicit value our software increments or decrements.
+
+An **aggregate** is a single compartmentalized entity within an event sourcing system that has the ability to enforce invariants within it. Monotonic uses an "aggregate type" + "aggregate ID" namespacing approach to make it easy to give specific aggregates a string key. Here's what an appended event for Alice's `account` aggregate might look like:
+
+```json
+{
+	"AggregateType": "account",
+	"AggregateID": "alice",
+	"Event": {
+		"Type": "funds-withdrawn",
+		"Payload": {
+			"Amount": 100
+		},
+		"AcceptedAt": "2026-05-11T08:39:00Z",
+		"Counter": 12,
+		"GlobalCounter": 1083
+	}
+}
+```
+
+Importantly, you'll notice that there is a `Counter` value on the event. Counters are critical to event sourcing systems, so important in fact that they're the reason this project is called "Monotonic"! All events are assigned a dense, strictly-increasing counter integer at append-time. This allows us to enforce business invariants using optimistic concurrency, we can assert that a new event may be appended based on its counter value within the aggregate. If two instances try to append an event with the same counter at the exact same time, exactly one will succeed and the other will fail. The solution is often just to immediately retry the business logic operation. As a user of the framework, you wouldn't have to worry about counters beyond what they provide to you: concurrent-safe business logic enforcement. Whether you have 1x or 200x running instances with Monotonic appending events, you don't have to worry about any distributed coordination because the framework handles it for you.
+
+Aggregate implementations for your business logic are usually just plain Go structs with an embedded `AggregateBase`. Monotonic uses the approach of separating new-event invariant enforcement and applying historic immutable events as two different methods: `ShouldAccept` and `Apply`. You'll see more about this in the example.
+
+Event sourcing is generally coupled to the idea of CQRS, which stands for **command query read separation**. This principle is that we should be modeling the "command" (write) side of our domain logic differently than our "read" side of the domain logic, where the read side is often inextricably tied to the presentation layer of the application. If you've ever built medium/high complexity software, you'll recognize this frustration of trying to make your domain logic layer also work as a good read layer (e.g. ORMs). CQRS is freeing because we can just admit that modifying domain objects and reading information about domain objects are totally different concerns right from the get-go.
+
+A common pattern for event-sourced applications is to have a domain layer that exclusively handles the implementation of business logic **invariants** (invariants are business logic rules that would prevent new events from being appended), basically, the "command" side of CQRS. Then, completely separately, you can build out **projections** which are (often tabular) data structures that simply react to these events that have happened, building up the projected state that will be shown in the application's presentation-layer.
+
+Now that we have some of the basics down, let's look at a practical code example! There are tons of event sourcing frameworks out there with varying degrees of complexity tradeoffs, but of course since this is the Monotonic framework repo, we'll be using that for our example.
 
 ```go
 package main
@@ -19,10 +50,14 @@ import (
 )
 
 func main() {
+	// Store is where the actual events are stored, there's an in-memory store for testing/experimenting, and a Postgres one for production.
+	// It's easy to implement your own store! You just need some sort of database that can read + insert counter values atomically.
 	store := m.NewInMemoryStore()
 	ctx := context.TODO()
 
-	// Hydrate/create an account aggregate.
+	// "Hydrate" function replays all events for an aggregate from the store into an in-memory representation needed to enforce invariants.
+	// The implementer usually wraps `Hydrate` functions into simpler function of their own like `HydrateAccount`.
+	// Your aggregate structs are just normal Go structs with an embedded `AggregateBase` provided by Monotonic.
 	account, _ := m.Hydrate(ctx, store, "account", "alice", func(base *m.AggregateBase) *Account {
 		return &Account{AggregateBase: base}
 	})
@@ -35,14 +70,14 @@ func main() {
 	fmt.Println(account.HolderName) // Alice
 	fmt.Println(account.Balance)    // 70
 
-	// Rehydrate account from the store, state is consistent after being rebuilt from all stored events.
+	// Rehydrate account from the store, state is consistent after being replayed from all appended events.
 	fresh, _ := m.Hydrate(ctx, store, "account", "alice", func(base *m.AggregateBase) *Account {
 		return &Account{AggregateBase: base}
 	})
 	fmt.Println(fresh.HolderName) // Alice
 	fmt.Println(fresh.Balance)    // 70
 
-	// Close the account, which is an event that inherently drains any remaining balance and marks as closed.
+	// Close the account, this sets the closed flag and drains the balance to zero.
 	fresh.AcceptThenApply(ctx, m.NewEvent("account-closed", nil))
 	fmt.Println(fresh.Balance) // 0
 	fmt.Println(fresh.Closed)  // true
@@ -59,9 +94,19 @@ func main() {
 	carol.AcceptThenApply(ctx, m.NewEvent("account-opened", AccountOpened{HolderName: "Carol"}))
 	carol.AcceptThenApply(ctx, m.NewEvent("funds-deposited", FundsMoved{Amount: 50}))
 
+	// `AcceptThenApply` is just a convenience method, you can also manually do `Accept` and `Apply` steps separately.
+	// This allows you to accept+apply events atomically in a batch across multiple different aggregates.
+	// Either both events in the batch succeed, or both events are rejected.
+	transferWithdraw, _ := bob.Accept(ctx, m.NewEvent("funds-withdrawn", FundsMoved{Amount: 25, Memo: "transferred to carol" }))
+	transferDeposit, _ := carol.Accept(ctx, m.NewEvent("funds-deposited", FundsMoved{Amount: 25, Memo: "transferred from bob" }))
+	store.Append(ctx,
+		m.AggregateEvent{AggregateType: bob.ID.Type, AggregateID: bob.ID.ID, Event: transferWithdraw[0]},
+		m.AggregateEvent{AggregateType: carol.ID.Type, AggregateID: carol.ID.ID, Event: transferDeposit[0]},
+	)
+
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
 	summaries := m.NewInMemoryProjectionPersistence[AccountSummary]()
-	projector, _ := m.NewProjector(ctx, store, &AccountSummaryLogic{}, summaries)
+	projector, _ := m.NewProjector(ctx, store, NewAccountSummaryLogic(), summaries)
 	projector.Update(ctx)
 
 	// Projected rows, from our account summary projection logic.
@@ -70,8 +115,8 @@ func main() {
 	// | key   | HolderName | Balance | Closed |
 	// |-------|------------|---------|--------|
 	// | alice | Alice      | 0       | true   |
-	// | bob   | Bob        | 200     | false  |
-	// | carol | Carol      | 50      | false  |
+	// | bob   | Bob        | 175     | false  |
+	// | carol | Carol      | 75      | false  |
 }
 
 // Account aggregate representing a bank account.
@@ -152,7 +197,8 @@ type AccountOpened struct {
 }
 
 type FundsMoved struct {
-	Amount int64 `json:"amount"`
+	Amount int64  `json:"amount"`
+	Memo   string `json:"memo"`
 }
 
 // AccountSummary is a per-account projection row exposing holder, balance, and closed state.
@@ -162,47 +208,57 @@ type AccountSummary struct {
 	Closed     bool
 }
 
-// AccountSummaryLogic projects every account event into the AccountSummary table, keyed by aggregate ID.
-type AccountSummaryLogic struct{}
-
-func (l *AccountSummaryLogic) EventFilters() []m.EventFilter {
-	return []m.EventFilter{{AggregateType: "account"}}
+// NewAccountSummaryLogic builds a dispatch that routes each account event type to its projection handler.
+func NewAccountSummaryLogic() m.ProjectorLogic[AccountSummary] {
+	return m.NewDispatch[AccountSummary]().
+		On("account", "account-opened", applyAccountOpened).
+		On("account", "funds-deposited", applyFundsDeposited).
+		On("account", "funds-withdrawn", applyFundsWithdrawn).
+		On("account", "account-closed", applyAccountClosed)
 }
 
-func (l *AccountSummaryLogic) Apply(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
-	key := m.ProjectionKey(event.AggregateID)
-	switch event.Event.Type {
-	case "account-opened":
-		p, err := m.ParsePayload[AccountOpened](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return []m.Projected[AccountSummary]{{Key: key, Value: AccountSummary{HolderName: p.HolderName}}}, nil
-	case "funds-deposited":
-		p, err := m.ParsePayload[FundsMoved](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance += p.Amount
-			return nil
-		})
-	case "funds-withdrawn":
-		p, err := m.ParsePayload[FundsMoved](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance -= p.Amount
-			return nil
-		})
-	case "account-closed":
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance = 0
-			s.Closed = true
-			return nil
-		})
+func applyAccountOpened(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[AccountOpened](event.Event)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return []m.Projected[AccountSummary]{
+		{
+			Key: m.ProjectionKey(event.AggregateID),
+			Value: AccountSummary{
+				HolderName: p.HolderName
+			}
+		}
+	}, nil
+}
+
+func applyFundsDeposited(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[FundsMoved](event.Event)
+	if err != nil {
+		return nil, err
+	}
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance += p.Amount
+		return nil
+	})
+}
+
+func applyFundsWithdrawn(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[FundsMoved](event.Event)
+	if err != nil {
+		return nil, err
+	}
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance -= p.Amount
+		return nil
+	})
+}
+
+func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance = 0
+		s.Closed = true
+		return nil
+	})
 }
 ```
