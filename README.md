@@ -31,7 +31,7 @@ Importantly, you'll notice that there is a `Counter` value on the event. Counter
 
 Aggregate implementations for your business logic are usually just plain Go structs with an embedded `AggregateBase`. Monotonic uses the approach of separating new-event invariant enforcement and applying historic immutable events as two different methods: `ShouldAccept` and `Apply`. You'll see more about this in the example.
 
-Event sourcing is generally coupled to the idea of CQRS, which stands for **command query read separation**. This principle is that we should be modeling the "command" (write) side of our domain logic differently than our "read" side of the domain logic, where the read side is often inextricably tied to the presentation layer of the application. If you've ever built medium/high complexity software, you'll recognize this frustration of trying to make your domain layer also work as a good read layer (e.g. ORMs). CQRS is freeing because we can just admit that writing and reading domain objects are totally different concerns right from the get-go.
+Event sourcing is generally coupled to the idea of CQRS, which stands for **command query read separation**. This principle is that we should be modeling the "command" (write) side of our domain logic differently than our "read" side of the domain logic, where the read side is often inextricably tied to the presentation layer of the application. If you've ever built medium/high complexity software, you'll recognize this frustration of trying to make your domain logic layer also work as a good read layer (e.g. ORMs). CQRS is freeing because we can just admit that modifying domain objects and reading information about domain objects are totally different concerns right from the get-go.
 
 A common pattern for event-sourced applications is to have a domain layer that exclusively handles the implementation of business logic **invariants** (invariants are business logic rules that would prevent new events from being appended), basically, the "command" side of CQRS. Then, completely separately, you can build out **projections** which are (often tabular) data structures that simply react to these events that have happened, building up the projected state that will be shown in the application's presentation-layer.
 
@@ -96,7 +96,7 @@ func main() {
 
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
 	summaries := m.NewInMemoryProjectionPersistence[AccountSummary]()
-	projector, _ := m.NewProjector(ctx, store, &AccountSummaryLogic{}, summaries)
+	projector, _ := m.NewProjector(ctx, store, NewAccountSummaryLogic(), summaries)
 	projector.Update(ctx)
 
 	// Projected rows, from our account summary projection logic.
@@ -197,47 +197,57 @@ type AccountSummary struct {
 	Closed     bool
 }
 
-// AccountSummaryLogic projects every account event into the AccountSummary table, keyed by aggregate ID.
-type AccountSummaryLogic struct{}
-
-func (l *AccountSummaryLogic) EventFilters() []m.EventFilter {
-	return []m.EventFilter{{AggregateType: "account"}}
+// NewAccountSummaryLogic builds a dispatch that routes each account event type to its projection handler.
+func NewAccountSummaryLogic() m.ProjectorLogic[AccountSummary] {
+	return m.NewDispatch[AccountSummary]().
+		On("account", "account-opened", applyAccountOpened).
+		On("account", "funds-deposited", applyFundsDeposited).
+		On("account", "funds-withdrawn", applyFundsWithdrawn).
+		On("account", "account-closed", applyAccountClosed)
 }
 
-func (l *AccountSummaryLogic) Apply(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
-	key := m.ProjectionKey(event.AggregateID)
-	switch event.Event.Type {
-	case "account-opened":
-		p, err := m.ParsePayload[AccountOpened](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return []m.Projected[AccountSummary]{{Key: key, Value: AccountSummary{HolderName: p.HolderName}}}, nil
-	case "funds-deposited":
-		p, err := m.ParsePayload[FundsMoved](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance += p.Amount
-			return nil
-		})
-	case "funds-withdrawn":
-		p, err := m.ParsePayload[FundsMoved](event.Event)
-		if err != nil {
-			return nil, err
-		}
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance -= p.Amount
-			return nil
-		})
-	case "account-closed":
-		return m.MutateByKey(ctx, reader, key, func(s *AccountSummary) error {
-			s.Balance = 0
-			s.Closed = true
-			return nil
-		})
+func applyAccountOpened(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[AccountOpened](event.Event)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	return []m.Projected[AccountSummary]{
+		{
+			Key: m.ProjectionKey(event.AggregateID),
+			Value: AccountSummary{
+				HolderName: p.HolderName
+			}
+		}
+	}, nil
+}
+
+func applyFundsDeposited(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[FundsMoved](event.Event)
+	if err != nil {
+		return nil, err
+	}
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance += p.Amount
+		return nil
+	})
+}
+
+func applyFundsWithdrawn(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	p, err := m.ParsePayload[FundsMoved](event.Event)
+	if err != nil {
+		return nil, err
+	}
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance -= p.Amount
+		return nil
+	})
+}
+
+func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
+		s.Balance = 0
+		s.Closed = true
+		return nil
+	})
 }
 ```
