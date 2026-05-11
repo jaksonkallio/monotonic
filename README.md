@@ -4,7 +4,38 @@
 
 A lightweight event-sourcing framework for Go with aggregates and projections. It's designed for small-to-medium throughput projects that want the benefits of event sourcing without the complexity of dedicated orchestration components.
 
-Simple example below, see [docs/getting-started.md](./docs/getting-started.md) for a deep dive.
+## Example
+_Note: this entire README file is human-written! No AI._
+
+First off, what is **event sourcing**? The quick answer is "a system that derives state from past events". In most traditional applications, you are storing the current state of the system, probably in some sort of database. If you were running a bank software, this might look like storing a table of current balances somewhere, with a column for the account number and another column for the current balance. As transactions occur, you might be incrementing or decrementing this value. The event sourcing approach flips this on its head, by instead just tracking the **historic immutable events** of what has already happened, and deriving the current state from that. An event sourced bank software would just store records of transactions, then at any time we can **project** the current balance from all of the deposits and withdrawals that occurred for an account. The "current balance" of an account becomes just a passive result of all of the events that have happened previously, rather than an explicit value our software increments or decrements.
+
+An **aggregate** is a single compartmentalized entity within an event sourcing system that has the ability to enforce invariants within it. Monotonic uses an "aggregate type" + "aggregate ID" namespacing approach to make it easy to give specific aggregates a string key. Here's what an appended event for Alice's `account` aggregate might look like:
+
+```json
+{
+	"AggregateType": "account",
+	"AggregateID": "alice",
+	"Event": {
+		"Type": "funds-withdrawn",
+		"Payload": {
+			"Amount": 100
+		},
+		"AcceptedAt": "2026-05-11T08:39:00Z",
+		"Counter": 12,
+		"GlobalCounter": 1083
+	}
+}
+```
+
+Importantly, you'll notice that there is a `Counter` value on the event. Counters are critical to event sourcing systems, so important in fact that they're the reason this project is called "Monotonic"! All events are assigned a dense, strictly-increasing counter integer at append-time. This allows us to enforce business invariants using optimistic concurrency, we can assert that a new event may be appended based on its counter value within the aggregate. If two instances try to append an event with the same counter at the exact same time, exactly one will succeed and the other will fail. The solution is often just to immediately retry the business logic operation. As a user of the framework, you wouldn't have to worry about counters beyond what they provide to you: concurrent-safe business logic enforcement. Whether you have 1x or 200x running instances with Monotonic appending events, you don't have to worry about any distributed coordination because the framework handles it for you.
+
+Aggregate implementations for your business logic are usually just plain Go structs with an embedded `AggregateBase`. Monotonic uses the approach of separating new-event invariant enforcement and applying historic immutable events as two different methods: `ShouldAccept` and `Apply`. You'll see more about this in the example.
+
+Event sourcing is generally coupled to the idea of CQRS, which stands for **command query read separation**. This principle is that we should be modeling the "command" (write) side of our domain logic differently than our "read" side of the domain logic, where the read side is often inextricably tied to the presentation layer of the application. If you've ever built medium/high complexity software, you'll recognize this frustration of trying to make your domain layer also work as a good read layer (e.g. ORMs). CQRS is freeing because we can just admit that writing and reading domain objects are totally different concerns right from the get-go.
+
+A common pattern for event-sourced applications is to have a domain layer that exclusively handles the implementation of business logic **invariants** (invariants are business logic rules that would prevent new events from being appended), basically, the "command" side of CQRS. Then, completely separately, you can build out **projections** which are (often tabular) data structures that simply react to these events that have happened, building up the projected state that will be shown in the application's presentation-layer.
+
+Now that we have some of the basics down, let's look at a practical code example! There are tons of event sourcing frameworks out there with varying degrees of complexity tradeoffs, but of course since this is the Monotonic framework repo, we'll be using that for our example.
 
 ```go
 package main
@@ -19,10 +50,14 @@ import (
 )
 
 func main() {
+	// Store is where the actual events are stored, there's an in-memory store for testing/experimenting, and a Postgres one for production.
+	// It's easy to implement your own store! You just need some sort of database that can read + insert counter values atomically.
 	store := m.NewInMemoryStore()
 	ctx := context.TODO()
 
-	// Hydrate/create an account aggregate.
+	// "Hydrate" function replays all events for an aggregate from the store into an in-memory representation needed to enforce invariants.
+	// The implementer usually wraps `Hydrate` functions into simpler function of their own like `HydrateAccount`.
+	// Your aggregate structs are just normal Go structs with an embedded `AggregateBase` provided by Monotonic.
 	account, _ := m.Hydrate(ctx, store, "account", "alice", func(base *m.AggregateBase) *Account {
 		return &Account{AggregateBase: base}
 	})
@@ -35,14 +70,14 @@ func main() {
 	fmt.Println(account.HolderName) // Alice
 	fmt.Println(account.Balance)    // 70
 
-	// Rehydrate account from the store, state is consistent after being rebuilt from all stored events.
+	// Rehydrate account from the store, state is consistent after being replayed from all appended events.
 	fresh, _ := m.Hydrate(ctx, store, "account", "alice", func(base *m.AggregateBase) *Account {
 		return &Account{AggregateBase: base}
 	})
 	fmt.Println(fresh.HolderName) // Alice
 	fmt.Println(fresh.Balance)    // 70
 
-	// Close the account, which is an event that inherently drains any remaining balance and marks as closed.
+	// Close the account, this sets the closed flag and drains the balance to zero.
 	fresh.AcceptThenApply(ctx, m.NewEvent("account-closed", nil))
 	fmt.Println(fresh.Balance) // 0
 	fmt.Println(fresh.Closed)  // true
