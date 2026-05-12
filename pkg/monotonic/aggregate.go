@@ -84,6 +84,9 @@ func (b *AggregateBase) AcceptThenApplyRetryable(ctx context.Context, retry Retr
 		}
 
 		lastAttemptErr = b.AcceptThenApply(ctx, events...)
+		if retry.OnAttempt != nil {
+			retry.OnAttempt(attemptCounter, lastAttemptErr)
+		}
 		if lastAttemptErr == nil {
 			return nil
 		}

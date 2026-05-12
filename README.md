@@ -262,3 +262,35 @@ func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSu
 	})
 }
 ```
+
+## Benchmarks
+
+Two common concerns with scalability of event sourced systems is whether the optimistic concurrency will kill throughput under contentino, and also the staleness of projections reacting to a high-volume event stream. Here are some benchmarks to test these scenarios and provide some real numbers. These were collected on a MacBook Pro M1 against an in-memory store to isolate just the frameworks itself, Postgres store figures would be higher (there are also Postgres benchmarks in `tests/postgres`). This is just the benchmark of one single machine, try running them yourself with `make bench`!
+
+### Projection Lag Under Sustained Writes
+
+In this benchmark, a rate-limited writer runs alongside a projector to measure two kinds of lag:
+- **Wall**: is how long an individual event waited between being accepted in the store and being applied to the projection. This is the experience an end user would see in the application between "doing something" and the presentation layer updating with that new information.
+- **Events Behind**: is the backlog size, essentially how many events have been accepted but not yet applied by the projector.
+
+| Write rate   | Poll interval | p99 wall lag | p99 backlog |
+|--------------|---------------|--------------|-------------|
+| 1000 e/s     | 10ms          | 10ms         | 10 events   |
+| 5000 e/s     | 10ms          | 10ms         | 49 events   |
+| 5000 e/s     | 1ms           | 1ms          | 5 events    |
+| 10000 e/s    | 1ms           | 1ms          | 9 events    |
+
+### Optimistic Concurrency Under Realistic Contention
+
+This benchmark distributes writes across a realistic distribution of aggregates (using Zipfian skew parameter). This distribution is realistic because it simulates contention for a handful of "hot" aggregates, and a long-tail of cold ones.
+
+| Aggregates | Skew              | Concurrency | retries/op | p99 latency |
+|------------|-------------------|-------------|------------|-------------|
+| 100        | 1.05 (mild)       | 8           | 12%        | 172μs       |
+| 100        | 1.20 (Pareto-ish) | 8           | 15%        | 181μs       |
+| 100        | 1.50 (skewed)     | 8           | 24%        | 199μs       |
+| 1000       | 1.20              | 8           | 13%        | 166μs       |
+| 100        | 1.20              | 16          | 20%        | 650μs       |
+| 100        | 1.20              | 32          | 22%        | 2.5ms       |
+
+In a realistic-load row (100 aggregates, Pareto-ish skew, 8 concurrent writers), about 15% of writes hit a counter conflict and retry once with p99 latency under 200μs.
