@@ -327,3 +327,13 @@ Hydration time is the time required to load all events of an aggregate for repla
 | 10                  | 255μs          |
 | 100                 | 552μs          |
 | 1000                | 3.2ms          |
+
+## Avoid Monotonic If...
+
+**If you need more than 30,000 events per second of sustained write throughput**, because at this point you've outgrown a single Postgres instance. Monotonic funnels every event write through one global event log, which is what makes the optimistic concurrency model possible.
+
+**If your aggregates individually accumulate 10,000+ events over their lifetime**, because Monotonic hydrates the full aggregate state by replaying all of its events. This time scales linearly (see above benchmark) but at a certain point it becomes user-perceptible. You can always roll-forward aggregates to prune history where performance is important, but this isn't a built-in feature of Monotonic (yet).
+
+**If you need sub-millisecond projection freshness**, because if you do, you probably should use a framework that offers strict consistency. Monotonic operates on a CQRS-y, projections-catch-up model that _can_ be consistent very quickly (milliseconds), but does not offer perfectly strict consistency. This is a design decision to maintain a separation between reads and writes.
+
+**If you don't need event sourcing in the first place**. Event sourcing solves complex domain logic elegantly, and provides unmatched auditability and testability. If your use case doesn't involve complex domain logic, then just skip event sourcing (and Monotonic) altogether.
