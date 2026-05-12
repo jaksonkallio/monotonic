@@ -265,7 +265,9 @@ func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSu
 
 ## Benchmarks
 
-Two common concerns with scalability of event sourced systems is whether the optimistic concurrency will kill throughput under contentino, and also the staleness of projections reacting to a high-volume event stream. Here are some benchmarks to test these scenarios and provide some real numbers. These were collected on a MacBook Pro M1 against an in-memory store to isolate just the frameworks itself, Postgres store figures would be higher (there are also Postgres benchmarks in `tests/postgres`). This is just the benchmark of one single machine, try running them yourself with `make bench`!
+TL;DR about scalability of Monotonic: Under realistic load, projection lag stays in the single-digit-millisecond range, optimistic concurrency retries are cheap and bounded, and a single Postgres instance handles tens of thousands of events per second.
+
+Two common concerns with scalability of event sourced systems is whether the optimistic concurrency will kill throughput under contention, and also the staleness of projections reacting to a high-volume event stream. Here are some benchmarks to test these scenarios and provide some real numbers. These were collected on a MacBook Pro M1 against an in-memory store to isolate just the frameworks itself, Postgres store figures would be higher (there are also Postgres benchmarks in `tests/postgres`). This is just the benchmark of one single machine, try running them yourself with `make bench`!
 
 ### Projection Lag Under Sustained Writes
 
@@ -294,3 +296,34 @@ This benchmark distributes writes across a realistic distribution of aggregates 
 | 100        | 1.20              | 32          | 22%        | 2.5ms       |
 
 In a realistic-load row (100 aggregates, Pareto-ish skew, 8 concurrent writers), about 15% of writes hit a counter conflict and retry once with p99 latency under 200μs.
+
+### Postgres-backed Event Store
+
+The previous benchmarks were against an in-memory store to isolate performance of just the framework itself. In real applications, you'll likely be using a store backed by Postgres or some other mature database implementation. Here are some similar benchmarks running against a real Postgres 16 instance in a test container. You can run these yourself with `make bench-integration`, assuming you've got Docker running.
+
+A single writer doing one event at a time lands at around 1.1ms per event, which is mostly the cost of the Postgres transaction itself (begin, counter validation select, insert, commit). Throughput scales as you add concurrent writers hitting different aggregates:
+
+| Concurrency | Latency per op | Aggregate throughput |
+|-------------|----------------|----------------------|
+| 1           | 1.08ms         | 930 e/s              |
+| 2           | 650μs          | 3,080 e/s            |
+| 4           | 422μs          | 9,490 e/s            |
+| 8           | 302μs          | 26,500 e/s           |
+
+With 8 writers connected to a single Postgres instance, you're looking at handling mid-tens-of-thousands of events per second.
+
+Under worst-case optimistic concurrency with all writers contending for a single aggregate (significantly worse case than the Zipfian benchmark above), latency degrades gracefully:
+
+| Concurrency on same aggregate | Latency per op |
+|-------------------------------|----------------|
+| 2                             | 1.29ms         |
+| 4                             | 1.47ms         |
+| 8                             | 1.86ms         |
+
+Hydration time is the time required to load all events of an aggregate for replay. Monotonic does not offer a native snapshotting solution, but implementers can roll-forward their aggregates to improve hydration time where performance deems it necessary. Hydration time scales roughly linearly with number of events (~3μs per event of replay):
+
+| Events on aggregate | Hydration time |
+|---------------------|----------------|
+| 10                  | 255μs          |
+| 100                 | 552μs          |
+| 1000                | 3.2ms          |
