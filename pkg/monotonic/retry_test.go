@@ -196,6 +196,85 @@ func TestNewSensibleDefaultRetry(t *testing.T) {
 	}
 }
 
+func TestRetry_OnAttemptFiresOncePerAttempt(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+
+	// Pre-seed counter=1 so a fresh aggregate's first append (counter=1) conflicts and forces a retry.
+	if err := store.Append(ctx, AggregateEvent{
+		AggregateType: "counter",
+		AggregateID:   "retry-hook",
+		Event:         AcceptedEvent{Event: NewEvent(eventIncremented, incrementedPayload{Amount: 1}), Counter: 1, AcceptedAt: time.Now()},
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	c, err := loadCounter(ctx, store, "retry-hook")
+	if err != nil {
+		t.Fatalf("loadCounter: %v", err)
+	}
+
+	// Stale local view of the aggregate: c thinks counter=1, but store also has counter=1.
+	// Force a stale state on a fresh aggregate by constructing a base bypassing Hydrate.
+	staleBase := &AggregateBase{eventStream: eventStream{ID: c.ID, store: store}}
+	stale := &counter{AggregateBase: staleBase}
+	staleBase.self = stale
+
+	var attempts []int
+	var errsObserved []error
+	retry := Retry{
+		MaxAttempts: 5,
+		Backoff:     ConstantBackoff(0),
+		OnAttempt: func(attempt int, err error) {
+			attempts = append(attempts, attempt)
+			errsObserved = append(errsObserved, err)
+		},
+	}
+
+	if err := stale.AcceptThenApplyRetryable(ctx, retry, NewEvent(eventIncremented, incrementedPayload{Amount: 1})); err != nil {
+		t.Fatalf("AcceptThenApplyRetryable: %v", err)
+	}
+
+	if len(attempts) == 0 {
+		t.Fatal("OnAttempt should fire at least once")
+	}
+	// Attempt indexes must be 0,1,2,... contiguously.
+	for i, a := range attempts {
+		if a != i {
+			t.Errorf("attempts[%d] = %d, want %d (must be contiguous from 0)", i, a, i)
+		}
+	}
+	// Last attempt observed must be a success (nil error); all preceding must be non-nil.
+	if errsObserved[len(errsObserved)-1] != nil {
+		t.Errorf("last OnAttempt err must be nil on success, got %v", errsObserved[len(errsObserved)-1])
+	}
+	for i := 0; i < len(errsObserved)-1; i++ {
+		if errsObserved[i] == nil {
+			t.Errorf("intermediate attempt %d should have a non-nil error, got nil", i)
+		}
+	}
+}
+
+func TestRetry_OnAttemptFiresOnceWhenNoRetryNeeded(t *testing.T) {
+	ctx := context.Background()
+	store := NewInMemoryStore()
+	c, _ := loadCounter(ctx, store, "first-try")
+
+	var calls int
+	retry := Retry{
+		MaxAttempts: 5,
+		Backoff:     ConstantBackoff(0),
+		OnAttempt:   func(attempt int, err error) { calls++ },
+	}
+
+	if err := c.AcceptThenApplyRetryable(ctx, retry, NewEvent(eventIncremented, incrementedPayload{Amount: 1})); err != nil {
+		t.Fatalf("AcceptThenApplyRetryable: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("OnAttempt should fire exactly once on first-try success, got %d", calls)
+	}
+}
+
 func TestErrMaxAttemptsExceeded(t *testing.T) {
 	err := ErrMaxAttemptsExceeded
 

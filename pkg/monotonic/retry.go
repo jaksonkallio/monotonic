@@ -17,6 +17,9 @@ var ErrMaxAttemptsExceeded = fmt.Errorf("maximum retry attempts exceeded")
 type Retry struct {
 	MaxAttempts int
 	Backoff     BackoffFn
+	// OnAttempt, if non-nil, is called after each retried operation with the 0-indexed attempt counter and the attempt's error (nil on success).
+	// Intended for observability (metrics, benchmarks counting retries-per-success); must be safe for concurrent use if the Retry is shared across goroutines.
+	OnAttempt func(attempt int, err error)
 }
 
 func NewRetry(maxAttempts int, backoff BackoffFn) *Retry {
