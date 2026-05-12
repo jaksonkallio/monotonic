@@ -336,7 +336,7 @@ func TestProjector_ResumeWithPostgresPersistence(t *testing.T) {
 			})
 		})
 
-	proj1, err := monotonic.NewProjector(ctx, store, logic, p)
+	proj1, err := monotonic.NewProjector(ctx, store, logic, p, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -360,7 +360,7 @@ func TestProjector_ResumeWithPostgresPersistence(t *testing.T) {
 		},
 	})
 
-	proj2, err := monotonic.NewProjector(ctx, store, logic, p)
+	proj2, err := monotonic.NewProjector(ctx, store, logic, p, 0)
 	if err != nil {
 		t.Fatalf("resume NewProjector: %v", err)
 	}
@@ -408,7 +408,7 @@ func TestProjector_MultipleProjectionsPersistCorrectlyToPostgres(t *testing.T) {
 			})
 		})
 
-	proj, err := monotonic.NewProjector(ctx, store, logic, statsPersist)
+	proj, err := monotonic.NewProjector(ctx, store, logic, statsPersist, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}

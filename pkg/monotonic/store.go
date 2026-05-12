@@ -14,8 +14,8 @@ type Store interface {
 	// Append atomically adds events to one or more aggregates' histories; either all are appended or none.
 	Append(ctx context.Context, events ...AggregateEvent) error
 
-	// LoadGlobalEvents returns events matching any of the EventFilters with global counter > afterGlobalCounter, ordered by global counter; an empty filter list returns no events.
-	LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error)
+	// LoadGlobalEvents returns events matching any of the EventFilters with global counter > afterGlobalCounter, ordered by global counter; an empty filter list returns no events. Limit caps the number of returned events; 0 means no limit.
+	LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64, limit int) ([]AggregateEvent, error)
 }
 
 // ErrCounterConflict is returned when an event's counter conflicts with an existing event.
@@ -110,7 +110,7 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	return nil
 }
 
-func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64) ([]AggregateEvent, error) {
+func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64, limit int) ([]AggregateEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -130,6 +130,9 @@ func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFil
 				continue
 			}
 			result = append(result, ae)
+			break
+		}
+		if limit > 0 && len(result) >= limit {
 			break
 		}
 	}

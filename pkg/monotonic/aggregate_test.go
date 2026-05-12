@@ -227,7 +227,7 @@ func TestProjector(t *testing.T) {
 
 	persistence := NewInMemoryProjectionPersistence[incrementSummary]()
 
-	projector, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
+	projector, err := NewProjector(ctx, store, newIncrementLogic(), persistence, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestProjector(t *testing.T) {
 	// Resuming a fresh Projector against the same persistence should pick up only events past the stored counter.
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 50}))
 
-	resumed, err := NewProjector(ctx, store, newIncrementLogic(), persistence)
+	resumed, err := NewProjector(ctx, store, newIncrementLogic(), persistence, 0)
 	if err != nil {
 		t.Fatalf("NewProjector resume: %v", err)
 	}
@@ -418,7 +418,7 @@ func TestConcurrentAppends_DifferentAggregates(t *testing.T) {
 	}
 
 	// Verify total events in store
-	events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
+	events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0, 0)
 	if err != nil {
 		t.Fatalf("LoadGlobalEvents: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestConcurrentAppends_MixedReadWrite(t *testing.T) {
 					readerErrors <- nil
 					return
 				default:
-					events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
+					events, err := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0, 0)
 					if err != nil {
 						readerErrors <- err
 						return
@@ -501,7 +501,7 @@ func TestConcurrentAppends_MixedReadWrite(t *testing.T) {
 	}
 
 	// Verify final event count
-	events, _ := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0)
+	events, _ := store.LoadGlobalEvents(ctx, []EventFilter{{AggregateType: "counter"}}, 0, 0)
 	expectedTotal := numWriters * eventsPerWriter
 	if len(events) != expectedTotal {
 		t.Errorf("expected %d total events, got %d", expectedTotal, len(events))

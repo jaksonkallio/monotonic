@@ -9,6 +9,9 @@ import (
 // ErrProjectionStale is returned by ProjectionWriter.Set when a key's stored counter exceeds the provided globalCounter.
 var ErrProjectionStale = fmt.Errorf("projection write is stale")
 
+// DefaultUpdateBatchSize is a sensible default maximum number of events loaded per Update call.
+const DefaultUpdateBatchSize = 100
+
 // Projector reads events from a Store and writes per-key updates to a ProjectionPersistence.
 type Projector[V any] struct {
 	// store is the event source the projector reads from.
@@ -21,6 +24,8 @@ type Projector[V any] struct {
 	mu sync.Mutex
 	// globalCounter is the resume position; events with global_counter > this are pending.
 	globalCounter uint64
+	// updateBatchSize caps the number of events loaded per Update call.
+	updateBatchSize int
 }
 
 // NewProjector creates a Projector and derives its resume position from persistence.LatestGlobalCounter.
@@ -29,16 +34,18 @@ func NewProjector[V any](
 	store Store,
 	logic ProjectorLogic[V],
 	persistence ProjectionPersistence[V],
+	updateBatchSize int,
 ) (*Projector[V], error) {
 	counter, err := persistence.LatestGlobalCounter(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("init projector: %w", err)
 	}
 	return &Projector[V]{
-		store:         store,
-		logic:         logic,
-		persistence:   persistence,
-		globalCounter: counter,
+		store:           store,
+		logic:           logic,
+		persistence:     persistence,
+		globalCounter:   counter,
+		updateBatchSize: updateBatchSize,
 	}, nil
 }
 
@@ -81,6 +88,9 @@ type ProjectionPersistence[V any] interface {
 
 	// LatestGlobalCounter returns the highest global counter stored across all rows, or 0 if empty.
 	LatestGlobalCounter(ctx context.Context) (uint64, error)
+
+	// Truncate removes all rows from the projection, resetting it to an empty state.
+	Truncate(ctx context.Context) error
 }
 
 // MutateByKey reads the row at key, applies mutate to it, and returns a single-element Projected slice ready to return from ProjectorLogic.Apply; if no row exists, mutate sees the zero value of V.

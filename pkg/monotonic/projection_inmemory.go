@@ -75,3 +75,12 @@ func (p *InMemoryProjectionPersistence[V]) LatestGlobalCounter(ctx context.Conte
 	defer p.mu.Unlock()
 	return p.maxCounter, nil
 }
+
+// Truncate removes all rows and resets the counter to zero.
+func (p *InMemoryProjectionPersistence[V]) Truncate(ctx context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.rows = make(map[ProjectionKey]inMemoryProjectionRow[V])
+	p.maxCounter = 0
+	return nil
+}

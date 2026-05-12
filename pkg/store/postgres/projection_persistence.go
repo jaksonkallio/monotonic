@@ -190,6 +190,15 @@ func (p *ProjectionPersistence[V]) LatestGlobalCounter(ctx context.Context) (uin
 	return uint64(counter), nil
 }
 
+// Truncate removes all rows from the projection table.
+func (p *ProjectionPersistence[V]) Truncate(ctx context.Context) error {
+	query := fmt.Sprintf(`TRUNCATE %s`, quoteIdent(p.tableName))
+	if _, err := p.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("truncate projection table %q: %w", p.tableName, err)
+	}
+	return nil
+}
+
 func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value V, globalCounter uint64) []any {
 	valueRef := reflect.ValueOf(value)
 	args := make([]any, 0, 2+len(p.fields))
