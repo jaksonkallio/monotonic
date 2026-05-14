@@ -4,6 +4,8 @@
 
 A lightweight event-sourcing framework for Go with aggregates and projections. It's designed for small-to-medium throughput projects that want the benefits of event sourcing without the complexity of dedicated orchestration components.
 
+⚠️ Warning! This project is a deep work-in-progress currently. The interface is liable to change unexpectedly at any time and there are almost certainly bugs to fix!
+
 ## Example
 _Note: this entire README file is human-written! No AI._
 
