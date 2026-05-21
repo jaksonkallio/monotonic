@@ -51,7 +51,7 @@ func testProjPersistence[V any](t *testing.T) *pgstore.ProjectionPersistence[V] 
 	ctx := context.Background()
 	tableName := safeTableName(t.Name())
 
-	p, err := pgstore.NewProjectionPersistence[V](sharedPool, tableName)
+	p, err := pgstore.NewProjectionPersistence[V](sharedPool, tableName, false)
 	if err != nil {
 		t.Fatalf("NewProjectionPersistence: %v", err)
 	}

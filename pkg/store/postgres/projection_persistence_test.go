@@ -13,14 +13,14 @@ import (
 // struct introspection performed by NewProjectionPersistence.
 
 func TestNewProjectionPersistence_NonStructTypeRejected(t *testing.T) {
-	_, err := postgres.NewProjectionPersistence[string](nil, "table")
+	_, err := postgres.NewProjectionPersistence[string](nil, "table", false)
 	if err == nil {
 		t.Error("expected error when V is not a struct")
 	}
 }
 
 func TestNewProjectionPersistence_IntTypeRejected(t *testing.T) {
-	_, err := postgres.NewProjectionPersistence[int](nil, "table")
+	_, err := postgres.NewProjectionPersistence[int](nil, "table", false)
 	if err == nil {
 		t.Error("expected error when V is int")
 	}
@@ -31,7 +31,7 @@ func TestNewProjectionPersistence_StructWithNoTaggedFieldsRejected(t *testing.T)
 		Foo string
 		Bar int
 	}
-	_, err := postgres.NewProjectionPersistence[noTags](nil, "table")
+	_, err := postgres.NewProjectionPersistence[noTags](nil, "table", false)
 	if err == nil {
 		t.Error("expected error for struct with no proj-tagged fields")
 	}
@@ -41,7 +41,7 @@ func TestNewProjectionPersistence_UnexportedTaggedFieldRejected(t *testing.T) {
 	type withUnexported struct {
 		name string `proj:"name"` //nolint:unused
 	}
-	_, err := postgres.NewProjectionPersistence[withUnexported](nil, "table")
+	_, err := postgres.NewProjectionPersistence[withUnexported](nil, "table", false)
 	if err == nil {
 		t.Error("expected error when proj-tagged field is unexported")
 	}
@@ -52,7 +52,7 @@ func TestNewProjectionPersistence_ValidStructSucceeds(t *testing.T) {
 		Name    string `proj:"name"`
 		Balance int64  `proj:"balance"`
 	}
-	p, err := postgres.NewProjectionPersistence[myRow](nil, "test_table")
+	p, err := postgres.NewProjectionPersistence[myRow](nil, "test_table", false)
 	if err != nil {
 		t.Fatalf("unexpected error for valid struct: %v", err)
 	}
@@ -67,7 +67,7 @@ func TestNewProjectionPersistence_IgnoresDashTag(t *testing.T) {
 		Ignore string `proj:"-"`
 	}
 	// Should succeed; the "-" field is ignored.
-	_, err := postgres.NewProjectionPersistence[withDash](nil, "table")
+	_, err := postgres.NewProjectionPersistence[withDash](nil, "table", false)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestNewProjectionPersistence_IgnoresUntaggedExportedFields(t *testing.T) {
 		Name    string `proj:"name"`
 		Ignored int    // no tag
 	}
-	_, err := postgres.NewProjectionPersistence[mixed](nil, "table")
+	_, err := postgres.NewProjectionPersistence[mixed](nil, "table", false)
 	if err != nil {
 		t.Fatalf("unexpected error for struct with untagged fields: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestNewProjectionPersistence_DuplicateColumnTagRejected(t *testing.T) {
 		A string `proj:"name"`
 		B string `proj:"name"`
 	}
-	_, err := postgres.NewProjectionPersistence[withDupe](nil, "table")
+	_, err := postgres.NewProjectionPersistence[withDupe](nil, "table", false)
 	if err == nil {
 		t.Error("expected error for duplicate proj tag value")
 	}
@@ -106,7 +106,7 @@ func TestNewProjectionPersistence_AllSupportedFieldTypes(t *testing.T) {
 		Raw  []byte          `proj:"raw"`
 		JSON json.RawMessage `proj:"json"`
 	}
-	_, err := postgres.NewProjectionPersistence[allTypes](nil, "table")
+	_, err := postgres.NewProjectionPersistence[allTypes](nil, "table", false)
 	if err != nil {
 		t.Fatalf("unexpected error for all-supported-types struct: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestNewProjectionPersistence_UnsupportedTypeRejected(t *testing.T) {
 		Name string   `proj:"name"`
 		Tags []string `proj:"tags"`
 	}
-	_, err := postgres.NewProjectionPersistence[withSlice](nil, "table")
+	_, err := postgres.NewProjectionPersistence[withSlice](nil, "table", false)
 	if err == nil {
 		t.Error("expected error for unsupported []string field type")
 	}
@@ -128,7 +128,7 @@ func TestNewProjectionPersistence_StructFieldRejected(t *testing.T) {
 		Name  string          `proj:"name"`
 		Inner struct{ X int } `proj:"inner"`
 	}
-	_, err := postgres.NewProjectionPersistence[withStruct](nil, "table")
+	_, err := postgres.NewProjectionPersistence[withStruct](nil, "table", false)
 	if err == nil {
 		t.Error("expected error for unsupported struct field type")
 	}
