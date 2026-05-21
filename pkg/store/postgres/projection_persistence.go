@@ -256,7 +256,7 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 		if !p.allowMigrationRebuild {
 			return fmt.Errorf("projection table %q schema does not match expected columns/types; set allowMigrationRebuild to automatically drop and recreate", p.tableName)
 		}
-		slog.Info("schema has changed, dropping table for migration rebuild")
+		slog.Info("projection schema has changed, dropping table for migration rebuild", "table", p.tableName)
 		if err := p.dropTable(ctx); err != nil {
 			return err
 		}
