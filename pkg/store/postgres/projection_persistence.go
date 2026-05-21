@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
@@ -38,10 +39,13 @@ type ProjectionPersistence[V any] struct {
 	tableName string
 	// fields are the tagged columns of V, sorted by column name for stable SQL.
 	fields []fieldInfo
+	// allowMigrationRebuild, when true, causes Migrate to drop and recreate the table if the existing schema does not match the expected columns and types.
+	allowMigrationRebuild bool
 }
 
 // NewProjectionPersistence creates a Postgres-backed projection persistence for V; returns an error if V is not a struct or has no `proj`-tagged exported fields.
-func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string) (*ProjectionPersistence[V], error) {
+// When allowMigrationRebuild is true, Migrate will drop and recreate the table if the existing schema does not match the expected columns and types.
+func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string, allowMigrationRebuild bool) (*ProjectionPersistence[V], error) {
 	var zero V
 	t := reflect.TypeOf(zero)
 	// nil reflect.Type means V was an interface or untyped nil; either way, not a struct.
@@ -78,9 +82,10 @@ func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string) (*Pro
 	sort.Slice(fields, func(i, j int) bool { return fields[i].column < fields[j].column })
 
 	return &ProjectionPersistence[V]{
-		pool:      pool,
-		tableName: tableName,
-		fields:    fields,
+		pool:                  pool,
+		tableName:             tableName,
+		fields:                fields,
+		allowMigrationRebuild: allowMigrationRebuild,
 	}, nil
 }
 
@@ -190,6 +195,15 @@ func (p *ProjectionPersistence[V]) LatestGlobalCounter(ctx context.Context) (uin
 	return uint64(counter), nil
 }
 
+// Truncate removes all rows from the projection table.
+func (p *ProjectionPersistence[V]) Truncate(ctx context.Context) error {
+	query := fmt.Sprintf(`TRUNCATE %s`, quoteIdent(p.tableName))
+	if _, err := p.pool.Exec(ctx, query); err != nil {
+		return fmt.Errorf("truncate projection table %q: %w", p.tableName, err)
+	}
+	return nil
+}
+
 func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value V, globalCounter uint64) []any {
 	valueRef := reflect.ValueOf(value)
 	args := make([]any, 0, 2+len(p.fields))
@@ -213,10 +227,40 @@ func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value
 }
 
 // Migrate creates the projection table and a global_counter index if they do not already exist.
+// When allowMigrationRebuild is true, the existing table is dropped and recreated if its columns
+// or types do not match the expected schema derived from V.
 // Call once during application startup before using Get, Set, or LatestGlobalCounter.
 func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 	var zero V
 	t := reflect.TypeOf(zero)
+
+	// Build the expected column type map (includes the two fixed columns).
+	expectedCols := map[string]string{
+		"projection_key": "TEXT",
+		"global_counter": "BIGINT",
+	}
+	for _, fi := range p.fields {
+		f := t.Field(fi.index)
+		pgType, err := goTypeToPostgres(f.Type)
+		if err != nil {
+			return fmt.Errorf("migrate: field %q: %w", f.Name, err)
+		}
+		expectedCols[fi.column] = pgType
+	}
+
+	schemaChanged, err := p.schemaChanged(ctx, expectedCols)
+	if err != nil {
+		return err
+	}
+	if schemaChanged {
+		if !p.allowMigrationRebuild {
+			return fmt.Errorf("projection table %q schema does not match expected columns/types; set allowMigrationRebuild to automatically drop and recreate", p.tableName)
+		}
+		slog.Info("projection schema has changed, dropping table for migration rebuild", "table", p.tableName)
+		if err := p.dropTable(ctx); err != nil {
+			return err
+		}
+	}
 
 	colDefs := make([]string, 0, 2+len(p.fields))
 	colDefs = append(colDefs,
@@ -224,12 +268,7 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 		`"global_counter" BIGINT NOT NULL`,
 	)
 	for _, fi := range p.fields {
-		f := t.Field(fi.index)
-		pgType, err := goTypeToPostgres(f.Type)
-		if err != nil {
-			return fmt.Errorf("migrate: field %q: %w", f.Name, err)
-		}
-		colDefs = append(colDefs, fmt.Sprintf("%s %s NOT NULL", quoteIdent(fi.column), pgType))
+		colDefs = append(colDefs, fmt.Sprintf("%s %s NOT NULL", quoteIdent(fi.column), expectedCols[fi.column]))
 	}
 
 	ddl := fmt.Sprintf(
@@ -244,6 +283,87 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 		return fmt.Errorf("migrate projection table %q: %w", p.tableName, err)
 	}
 	return nil
+}
+
+// schemaChanged returns true when the existing table's columns or types do not match expectedCols.
+// Returns false if the table does not exist yet (no columns found).
+func (p *ProjectionPersistence[V]) schemaChanged(ctx context.Context, expectedCols map[string]string) (bool, error) {
+	rows, err := p.pool.Query(ctx,
+		`SELECT column_name, UPPER(data_type) FROM information_schema.columns
+		 WHERE table_name = $1 AND table_schema = 'public'`,
+		p.tableName,
+	)
+	if err != nil {
+		return false, fmt.Errorf("query schema for rebuild check on %q: %w", p.tableName, err)
+	}
+	defer rows.Close()
+
+	actualCols := make(map[string]string)
+	for rows.Next() {
+		var colName, dataType string
+		if err := rows.Scan(&colName, &dataType); err != nil {
+			return false, fmt.Errorf("scan schema column for %q: %w", p.tableName, err)
+		}
+		actualCols[colName] = normalizeDataType(dataType)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate schema columns for %q: %w", p.tableName, err)
+	}
+
+	// Table does not exist yet.
+	if len(actualCols) == 0 {
+		return false, nil
+	}
+
+	if len(actualCols) != len(expectedCols) {
+		return true, nil
+	}
+	for col, expectedType := range expectedCols {
+		if actualType, ok := actualCols[col]; !ok || actualType != normalizeDataType(expectedType) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// dropTable drops the projection table and its global_counter index.
+func (p *ProjectionPersistence[V]) dropTable(ctx context.Context) error {
+	drop := fmt.Sprintf(
+		"DROP TABLE IF EXISTS %s; DROP INDEX IF EXISTS %s",
+		quoteIdent(p.tableName),
+		quoteIdent("idx_"+p.tableName+"_gc"),
+	)
+	if _, err := p.pool.Exec(ctx, drop); err != nil {
+		return fmt.Errorf("drop projection table %q for rebuild: %w", p.tableName, err)
+	}
+	return nil
+}
+
+// normalizeDataType maps information_schema data_type strings to the type names used in our DDL
+// so comparisons are consistent.
+func normalizeDataType(dt string) string {
+	switch dt {
+	case "CHARACTER VARYING":
+		return "TEXT"
+	case "DOUBLE PRECISION":
+		return "DOUBLE PRECISION"
+	case "REAL":
+		return "REAL"
+	case "BIGINT", "INTEGER", "SMALLINT":
+		return "BIGINT"
+	case "BOOLEAN":
+		return "BOOLEAN"
+	case "TEXT":
+		return "TEXT"
+	case "BYTEA":
+		return "BYTEA"
+	case "JSONB":
+		return "JSONB"
+	case "TIMESTAMP WITH TIME ZONE":
+		return "TIMESTAMPTZ"
+	default:
+		return dt
+	}
 }
 
 // goTypeToPostgres maps a Go reflect.Type to the matching Postgres column type.

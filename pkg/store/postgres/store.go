@@ -140,7 +140,7 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	return tx.Commit(ctx)
 }
 
-func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventFilter, afterGlobalCounter int64) ([]monotonic.AggregateEvent, error) {
+func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventFilter, afterGlobalCounter int64, limit int) ([]monotonic.AggregateEvent, error) {
 	// $1 is always afterGlobalCounter; each filter becomes one OR-ed clause built from its non-empty fields AND-ed together.
 	args := []any{afterGlobalCounter}
 	var conditions []string
@@ -171,11 +171,16 @@ func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventF
 		filterClause = strings.Join(conditions, " OR ")
 	}
 
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf(" LIMIT %d", limit)
+	}
+
 	query := fmt.Sprintf(
 		`SELECT aggregate_type, aggregate_id, counter, global_counter, event_type, payload, accepted_at
 		 FROM events
 		 WHERE (%s) AND global_counter > $1
-		 ORDER BY global_counter`, filterClause,
+		 ORDER BY global_counter%s`, filterClause, limitClause,
 	)
 
 	rows, err := s.pool.Query(ctx, query, args...)

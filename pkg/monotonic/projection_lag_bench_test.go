@@ -55,7 +55,7 @@ func BenchmarkProjection_LagSteadyState(b *testing.B) {
 			// Each event-lag sample is stored in a Latencies as time.Duration(N) — N is the count of events behind. Reusing Latencies' percentile machinery; units are interpreted as "events" when reading back.
 			eventsLag := mtest.NewLatencies()
 
-			projector, err := monotonic.NewProjector(ctx, store, &lagLogic{walltime: walltimeLag}, persist)
+			projector, err := monotonic.NewProjector(ctx, store, &lagLogic{walltime: walltimeLag}, persist, 0)
 			if err != nil {
 				b.Fatalf("NewProjector: %v", err)
 			}

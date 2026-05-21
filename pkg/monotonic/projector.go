@@ -8,12 +8,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Update processes all pending events and returns the count, or 0 if caught up.
+// Update processes a batch of pending events and returns the count, or 0 if caught up.
 func (p *Projector[V]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.logic.EventFilters(), int64(p.globalCounter))
+	events, err := p.store.LoadGlobalEvents(ctx, p.logic.EventFilters(), int64(p.globalCounter), p.updateBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}
@@ -35,6 +35,27 @@ func (p *Projector[V]) Update(ctx context.Context) (int, error) {
 	}
 
 	return processed, nil
+}
+
+// Rebuild truncates the projection and replays all events from the beginning.
+func (p *Projector[V]) Rebuild(ctx context.Context) error {
+	p.mu.Lock()
+	if err := p.persistence.Truncate(ctx); err != nil {
+		p.mu.Unlock()
+		return fmt.Errorf("truncate projection: %w", err)
+	}
+	p.globalCounter = 0
+	p.mu.Unlock()
+
+	for {
+		n, err := p.Update(ctx)
+		if err != nil {
+			return fmt.Errorf("rebuild replay: %w", err)
+		}
+		if n == 0 {
+			return nil
+		}
+	}
 }
 
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.

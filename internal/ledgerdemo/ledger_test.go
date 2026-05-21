@@ -54,13 +54,13 @@ func TestLedgerScenario(t *testing.T) {
 
 	// Spin up both projectors against the same store.
 	balancePersist := monotonic.NewInMemoryProjectionPersistence[AccountBalance]()
-	balanceProjector, err := monotonic.NewProjector(ctx, store, NewBalanceLogic(), balancePersist)
+	balanceProjector, err := monotonic.NewProjector(ctx, store, NewBalanceLogic(), balancePersist, 0)
 	if err != nil {
 		t.Fatalf("NewProjector balance: %v", err)
 	}
 
 	statsPersist := monotonic.NewInMemoryProjectionPersistence[LedgerStats]()
-	statsProjector, err := monotonic.NewProjector(ctx, store, NewStatsLogic(), statsPersist)
+	statsProjector, err := monotonic.NewProjector(ctx, store, NewStatsLogic(), statsPersist, 0)
 	if err != nil {
 		t.Fatalf("NewProjector stats: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestLedgerScenario(t *testing.T) {
 		t.Fatalf("second deposit: %v", err)
 	}
 
-	resumedBalance, err := monotonic.NewProjector(ctx, store, NewBalanceLogic(), balancePersist)
+	resumedBalance, err := monotonic.NewProjector(ctx, store, NewBalanceLogic(), balancePersist, 0)
 	if err != nil {
 		t.Fatalf("resume balance: %v", err)
 	}

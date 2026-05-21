@@ -154,7 +154,7 @@ func BenchmarkPostgres_LoadGlobalEvents(b *testing.B) {
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				store.LoadGlobalEvents(ctx, filters, 0)
+				store.LoadGlobalEvents(ctx, filters, 0, 0)
 			}
 		})
 	}
