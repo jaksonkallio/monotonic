@@ -380,7 +380,9 @@ func TestProjector_RebuildClearsPersistence(t *testing.T) {
 
 	// After rebuild, the projection should have been truncated and re-populated.
 	logic.applied = 0
-	p.Rebuild(ctx)
+	if err := p.Rebuild(ctx); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
 
 	val, _ = persist.Get(ctx, monotonic.ProjectionKeySummary)
 	if val != 1 {
