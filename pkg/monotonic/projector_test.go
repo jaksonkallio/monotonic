@@ -342,7 +342,9 @@ func TestProjector_RebuildReplaysAllEvents(t *testing.T) {
 	}
 
 	// Catch up first.
-	p.Update(ctx)
+	if err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
 	if logic.applied != 3 {
 		t.Fatalf("expected 3 applies before rebuild, got %d", logic.applied)
 	}
