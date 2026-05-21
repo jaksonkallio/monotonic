@@ -527,3 +527,112 @@ func TestProjectionPersistence_NilJSONRawMessageDefaultsToEmptyObject(t *testing
 		t.Errorf("expected empty JSON object, got %s", got.Meta)
 	}
 }
+
+// --- Migration rebuild tests ---
+
+func TestProjectionPersistence_MigrateErrorsOnSchemaMismatchWithoutRebuild(t *testing.T) {
+	ctx := context.Background()
+	tableName := safeTableName(t.Name())
+
+	// Create a table with a different schema (extra column, missing "score").
+	ddl := fmt.Sprintf(
+		`CREATE TABLE %s ("projection_key" TEXT NOT NULL PRIMARY KEY, "global_counter" BIGINT NOT NULL, "name" TEXT NOT NULL, "extra" TEXT NOT NULL)`,
+		fmt.Sprintf(`"%s"`, tableName),
+	)
+	if _, err := sharedPool.Exec(ctx, ddl); err != nil {
+		t.Fatalf("create mismatched table: %v", err)
+	}
+	t.Cleanup(func() {
+		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, tableName))
+	})
+
+	p, err := pgstore.NewProjectionPersistence[projRow](sharedPool, tableName, false)
+	if err != nil {
+		t.Fatalf("NewProjectionPersistence: %v", err)
+	}
+
+	err = p.Migrate(ctx)
+	if err == nil {
+		t.Fatal("expected Migrate to return an error on schema mismatch with allowMigrationRebuild=false")
+	}
+	if !strings.Contains(err.Error(), "schema does not match") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestProjectionPersistence_MigrateRebuildOnSchemaMismatch(t *testing.T) {
+	ctx := context.Background()
+	tableName := safeTableName(t.Name())
+
+	// Create a table with a different schema.
+	ddl := fmt.Sprintf(
+		`CREATE TABLE %s ("projection_key" TEXT NOT NULL PRIMARY KEY, "global_counter" BIGINT NOT NULL, "name" TEXT NOT NULL, "extra" TEXT NOT NULL)`,
+		fmt.Sprintf(`"%s"`, tableName),
+	)
+	if _, err := sharedPool.Exec(ctx, ddl); err != nil {
+		t.Fatalf("create mismatched table: %v", err)
+	}
+	t.Cleanup(func() {
+		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, tableName))
+		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP INDEX IF EXISTS "%s"`, "idx_"+tableName+"_gc"))
+	})
+
+	p, err := pgstore.NewProjectionPersistence[projRow](sharedPool, tableName, true)
+	if err != nil {
+		t.Fatalf("NewProjectionPersistence: %v", err)
+	}
+
+	// Migrate should drop the old table and recreate with the correct schema.
+	if err := p.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate with rebuild: %v", err)
+	}
+
+	// Verify the new table works with the expected schema.
+	want := projRow{Name: "alice", Score: 42}
+	if err := p.Set(ctx, []monotonic.Projected[projRow]{{Key: "alice", Value: want}}, 1); err != nil {
+		t.Fatalf("Set after rebuild: %v", err)
+	}
+	got, err := p.Get(ctx, "alice")
+	if err != nil {
+		t.Fatalf("Get after rebuild: %v", err)
+	}
+	if got != want {
+		t.Errorf("roundtrip after rebuild: got %+v, want %+v", got, want)
+	}
+}
+
+func TestProjectionPersistence_MigrateRebuildPreservesDataWhenSchemaMatches(t *testing.T) {
+	ctx := context.Background()
+	tableName := safeTableName(t.Name())
+
+	p, err := pgstore.NewProjectionPersistence[projRow](sharedPool, tableName, true)
+	if err != nil {
+		t.Fatalf("NewProjectionPersistence: %v", err)
+	}
+	t.Cleanup(func() {
+		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP TABLE IF EXISTS "%s"`, tableName))
+		sharedPool.Exec(context.Background(), fmt.Sprintf(`DROP INDEX IF EXISTS "%s"`, "idx_"+tableName+"_gc"))
+	})
+
+	if err := p.Migrate(ctx); err != nil {
+		t.Fatalf("first Migrate: %v", err)
+	}
+
+	want := projRow{Name: "bob", Score: 99}
+	if err := p.Set(ctx, []monotonic.Projected[projRow]{{Key: "bob", Value: want}}, 1); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+
+	// Migrate again with the same schema — data should survive.
+	if err := p.Migrate(ctx); err != nil {
+		t.Fatalf("second Migrate: %v", err)
+	}
+
+	got, err := p.Get(ctx, "bob")
+	if err != nil {
+		t.Fatalf("Get after second Migrate: %v", err)
+	}
+	if got != want {
+		t.Errorf("data not preserved: got %+v, want %+v", got, want)
+	}
+}
