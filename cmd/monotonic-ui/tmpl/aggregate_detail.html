@@ -1,0 +1,53 @@
+{{define "aggregate_detail.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.AggregateID}} — monotonic</title>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@starfederation/datastar@1.0.0-beta.11/dist/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page" data-signals='{ {{range .Events}}"expand_{{.GlobalCounter}}":false,{{end}}"_":0 }'>
+
+  <div class="crumb">
+    <a href="/aggregates">aggregates</a>
+    <span class="sep">/</span>
+    <a href="/aggregates/{{.AggregateType}}">{{.AggregateType}}</a>
+    <span class="sep">/</span>
+    {{.AggregateID}}
+  </div>
+
+  <div style="display:flex;gap:32px;margin-bottom:18px;align-items:baseline">
+    <span class="c-atype" style="font-size:14px;font-weight:600">{{.AggregateType}}</span>
+    <span style="font-size:13px">{{.AggregateID}}</span>
+    <span class="stat">{{len .Events}} events</span>
+  </div>
+
+  {{if .Events}}
+  <div class="tl">
+    {{range .Events}}
+    <div class="tl-item">
+      <div class="tl-dot"></div>
+      <div class="tl-row">
+        <span class="tl-n">{{.Counter}}</span>
+        <span class="tl-e">{{.EventType}}</span>
+        <span class="tl-ts">{{fmtTime .AcceptedAt}}</span>
+        <span class="tl-gc">gc:{{.GlobalCounter}}</span>
+        <button class="expand" data-on-click="$expand_{{.GlobalCounter}} = !$expand_{{.GlobalCounter}}">▸</button>
+      </div>
+      <div class="tl-pl" data-show="$expand_{{.GlobalCounter}}">
+        <pre class="payload">{{fmtPretty .Payload}}</pre>
+      </div>
+    </div>
+    {{end}}
+  </div>
+  {{else}}
+  <div class="empty">no events</div>
+  {{end}}
+
+</div>
+</body>
+</html>
+{{end}}

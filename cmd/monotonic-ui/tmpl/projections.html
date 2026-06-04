@@ -1,0 +1,52 @@
+{{define "projections.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>projections — monotonic</title>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page">
+
+  <div class="sec">projections</div>
+  <p class="stat" style="margin-bottom:14px">
+    tables with <code>projection_key</code> + <code>global_counter</code> columns
+  </p>
+
+  {{if .Projections}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>table</th>
+          <th class="c-num">rows</th>
+          <th class="c-num">max gc</th>
+          <th>lag</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Projections}}
+        <tr>
+          <td><a class="row-link" href="/projections/{{.TableName}}">{{.TableName}}</a></td>
+          <td class="c-num">{{fmtNum .RowCount}}</td>
+          <td class="c-num">{{.MaxGC}}</td>
+          <td>
+            <span class="lag {{lagClass .Lag}}">
+              {{if eq .Lag 0}}current{{else}}+{{fmtNum .Lag}} events{{end}}
+            </span>
+          </td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">no projection tables discovered</div>
+  {{end}}
+
+</div>
+</body>
+</html>
+{{end}}

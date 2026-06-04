@@ -1,0 +1,43 @@
+{{define "aggregates.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>aggregates — monotonic</title>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page">
+
+  <div class="sec">aggregate types</div>
+
+  {{if .Types}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>type</th>
+          <th class="c-num">aggregates</th>
+          <th class="c-num">events</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Types}}
+        <tr>
+          <td><a class="row-link" href="/aggregates/{{.AggregateType}}">{{.AggregateType}}</a></td>
+          <td class="c-num">{{fmtNum .AggregateCount}}</td>
+          <td class="c-num">{{fmtNum .EventCount}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">no events in store</div>
+  {{end}}
+
+</div>
+</body>
+</html>
+{{end}}

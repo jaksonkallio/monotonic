@@ -1,0 +1,49 @@
+{{define "aggregate_type.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.AggregateType}} — monotonic</title>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page">
+
+  <div class="crumb">
+    <a href="/aggregates">aggregates</a>
+    <span class="sep">/</span>
+    {{.AggregateType}}
+  </div>
+
+  {{if .IDs}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>aggregate id</th>
+          <th class="c-num">events</th>
+          <th class="c-num">latest counter</th>
+          <th class="c-ts">last event at (utc)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{range .IDs}}
+        <tr>
+          <td><a class="row-link" href="/aggregates/{{$.AggregateType}}/{{.AggregateID}}">{{.AggregateID}}</a></td>
+          <td class="c-num">{{fmtNum .EventCount}}</td>
+          <td class="c-num">{{.MaxCounter}}</td>
+          <td class="c-ts">{{fmtTime .LastEventAt}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">no aggregates found</div>
+  {{end}}
+
+</div>
+</body>
+</html>
+{{end}}

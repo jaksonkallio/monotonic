@@ -1,0 +1,64 @@
+{{define "events.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>events — monotonic</title>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@starfederation/datastar@1.0.0-beta.11/dist/datastar.min.js"></script>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page"
+  data-signals='{"aggType":"{{.AggType}}","aggID":"{{.AggID}}","eventType":"{{.EventType}}","tailGC":{{.MaxGC}}{{range .Events}},"expand_{{.GlobalCounter}}":false{{end}}}'
+>
+
+  <div class="filter-bar">
+    <span class="flbl">filter</span>
+    <input type="text" data-bind-aggType   placeholder="aggregate type" style="width:150px">
+    <input type="text" data-bind-aggID     placeholder="aggregate id"   style="width:220px">
+    <input type="text" data-bind-eventType placeholder="event type"     style="width:150px">
+    <button data-on-click="@get('/events/rows')">apply</button>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+      {{if .Tail}}
+        <a class="btn live" href="/">
+          <span class="dot"></span>live
+        </a>
+        {{/* SSE connection for tail — starts immediately on page load */}}
+        <div data-on-load="@get('/events/tail')" style="display:none"></div>
+      {{else}}
+        <a class="btn" href="/?tail=1&agg_type={{.AggType}}&agg_id={{.AggID}}&event_type={{.EventType}}">tail</a>
+      {{end}}
+    </div>
+  </div>
+
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th class="c-gc">#</th>
+          <th class="c-ts">accepted at (utc)</th>
+          <th>aggregate type</th>
+          <th>aggregate id</th>
+          <th class="c-cnt">n</th>
+          <th>event type</th>
+          <th style="width:28px"></th>
+        </tr>
+      </thead>
+      {{template "events_tbody.html" .}}
+    </table>
+  </div>
+
+  <div class="pagination">
+    {{if .OlderGC}}
+      <a class="btn" href="/?before={{.OlderGC}}&agg_type={{.AggType}}&agg_id={{.AggID}}&event_type={{.EventType}}">← older</a>
+    {{end}}
+    {{if .BeforeGC}}
+      <a class="btn" href="/?agg_type={{.AggType}}&agg_id={{.AggID}}&event_type={{.EventType}}">newest ↑</a>
+    {{end}}
+  </div>
+
+</div>
+</body>
+</html>
+{{end}}

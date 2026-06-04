@@ -1,0 +1,52 @@
+{{define "projection_detail.html"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.TableName}} — monotonic</title>
+  <style>{{template "styles" .}}</style>
+</head>
+<body>
+{{template "nav" .}}
+<div class="page">
+
+  <div class="crumb">
+    <a href="/projections">projections</a>
+    <span class="sep">/</span>
+    {{.TableName}}
+  </div>
+
+  <div style="display:flex;gap:20px;align-items:baseline;margin-bottom:18px">
+    <span style="font-size:14px;font-weight:600">{{.TableName}}</span>
+    <span class="stat">{{fmtNum .Info.RowCount}} rows</span>
+    <span class="lag {{lagClass .Info.Lag}}">
+      {{if eq .Info.Lag 0}}current{{else}}+{{fmtNum .Info.Lag}} events behind{{end}}
+    </span>
+  </div>
+
+  {{if .Rows}}
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          {{range .Columns}}<th>{{.Name}}</th>{{end}}
+        </tr>
+      </thead>
+      <tbody>
+        {{range .Rows}}
+        {{$row := .}}
+        <tr>
+          {{range $.Columns}}<td>{{rowVal $row .Name}}</td>{{end}}
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+  {{else}}
+  <div class="empty">no rows</div>
+  {{end}}
+
+</div>
+</body>
+</html>
+{{end}}

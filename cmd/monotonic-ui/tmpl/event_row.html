@@ -1,0 +1,16 @@
+{{define "event_row.html"}}
+<tr>
+  <td class="c-gc">{{.GlobalCounter}}</td>
+  <td class="c-ts">{{fmtTime .AcceptedAt}}</td>
+  <td class="c-atype">{{.AggregateType}}</td>
+  <td><a class="row-link" href="/aggregates/{{.AggregateType}}/{{.AggregateID}}">{{.AggregateID}}</a></td>
+  <td class="c-cnt">{{.Counter}}</td>
+  <td class="c-etype">{{.EventType}}</td>
+  <td><button class="expand" data-on-click="$expand_{{.GlobalCounter}} = !$expand_{{.GlobalCounter}}">▸</button></td>
+</tr>
+<tr class="payload-row" data-show="$expand_{{.GlobalCounter}}">
+  <td colspan="7">
+    <div class="payload-inner"><pre class="payload">{{fmtPretty .Payload}}</pre></div>
+  </td>
+</tr>
+{{end}}

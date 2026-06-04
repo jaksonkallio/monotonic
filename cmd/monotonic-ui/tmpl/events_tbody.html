@@ -1,0 +1,7 @@
+{{define "events_tbody.html"}}
+<tbody id="events-tbody">
+  {{range .Events}}{{template "event_row.html" .}}{{else}}
+  <tr><td colspan="7" class="empty">no events found</td></tr>
+  {{end}}
+</tbody>
+{{end}}
