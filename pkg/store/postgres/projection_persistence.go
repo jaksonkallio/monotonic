@@ -37,15 +37,17 @@ type ProjectionPersistence[V any] struct {
 	pool *pgxpool.Pool
 	// tableName is the Postgres table backing this projection.
 	tableName string
+	// mode is the reconciliation mode this persistence accepts. Schema and Set semantics differ per mode.
+	mode monotonic.ReconciliationMode
 	// fields are the tagged columns of V, sorted by column name for stable SQL.
 	fields []fieldInfo
 	// allowMigrationRebuild, when true, causes Migrate to drop and recreate the table if the existing schema does not match the expected columns and types.
 	allowMigrationRebuild bool
 }
 
-// NewProjectionPersistence creates a Postgres-backed projection persistence for V; returns an error if V is not a struct or has no `proj`-tagged exported fields.
+// NewProjectionPersistence creates a Postgres-backed projection persistence for V in the given reconciliation mode; returns an error if V is not a struct or has no `proj`-tagged exported fields.
 // When allowMigrationRebuild is true, Migrate will drop and recreate the table if the existing schema does not match the expected columns and types.
-func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string, allowMigrationRebuild bool) (*ProjectionPersistence[V], error) {
+func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string, mode monotonic.ReconciliationMode, allowMigrationRebuild bool) (*ProjectionPersistence[V], error) {
 	var zero V
 	t := reflect.TypeOf(zero)
 	// nil reflect.Type means V was an interface or untyped nil; either way, not a struct.
@@ -84,14 +86,18 @@ func NewProjectionPersistence[V any](pool *pgxpool.Pool, tableName string, allow
 	return &ProjectionPersistence[V]{
 		pool:                  pool,
 		tableName:             tableName,
+		mode:                  mode,
 		fields:                fields,
 		allowMigrationRebuild: allowMigrationRebuild,
 	}, nil
 }
 
-// Get returns the projection value for key, or (zero V, nil) when no row exists.
+// Get returns the projection value for key, or (zero V, nil) when no row exists. Returns ErrProjectionModeMismatch when the persistence is in replace mode.
 func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.ProjectionKey) (V, error) {
 	var value V
+	if p.mode != monotonic.ReconcileUpsert {
+		return value, fmt.Errorf("%w: Get requires upsert mode, table %q is %s", monotonic.ErrProjectionModeMismatch, p.tableName, p.mode)
+	}
 
 	query := fmt.Sprintf(
 		`SELECT %s FROM %s WHERE projection_key = $1`,
@@ -99,7 +105,6 @@ func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.Projec
 		quoteIdent(p.tableName),
 	)
 
-	// Address &value so reflect.Value.Field returns addressable Values that pgx can scan into.
 	valueElem := reflect.ValueOf(&value).Elem()
 
 	dests := make([]any, 0, len(p.fields))
@@ -118,9 +123,41 @@ func (p *ProjectionPersistence[V]) Get(ctx context.Context, key monotonic.Projec
 	return value, nil
 }
 
-// Set atomically upserts the batch in one transaction; returns ErrProjectionStale if any key's stored counter exceeds globalCounter.
-func (p *ProjectionPersistence[V]) Set(ctx context.Context, projecteds []monotonic.Projected[V], globalCounter uint64) error {
-	if len(projecteds) == 0 {
+// GetSet returns all values at key, or an empty slice when no rows exist. For upsert mode it returns 0 or 1 element.
+func (p *ProjectionPersistence[V]) GetSet(ctx context.Context, key monotonic.ProjectionKey) ([]V, error) {
+	query := fmt.Sprintf(
+		`SELECT %s FROM %s WHERE projection_key = $1`,
+		strings.Join(quoteIdents(p.columnNames()), ", "),
+		quoteIdent(p.tableName),
+	)
+	rows, err := p.pool.Query(ctx, query, string(key))
+	if err != nil {
+		return nil, fmt.Errorf("query projection set %q: %w", key, err)
+	}
+	defer rows.Close()
+
+	var out []V
+	for rows.Next() {
+		var value V
+		valueElem := reflect.ValueOf(&value).Elem()
+		dests := make([]any, 0, len(p.fields))
+		for _, fi := range p.fields {
+			dests = append(dests, valueElem.Field(fi.index).Addr().Interface())
+		}
+		if err := rows.Scan(dests...); err != nil {
+			return nil, fmt.Errorf("scan projection set row for %q: %w", key, err)
+		}
+		out = append(out, value)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate projection set rows for %q: %w", key, err)
+	}
+	return out, nil
+}
+
+// Set atomically writes the batch in one transaction; returns ErrProjectionStale if any key's stored counter exceeds globalCounter, or ErrProjectionModeMismatch if a set's Mode does not match the persistence's mode.
+func (p *ProjectionPersistence[V]) Set(ctx context.Context, sets []monotonic.ProjectedSet[V], globalCounter uint64) error {
+	if len(sets) == 0 {
 		return nil
 	}
 	// globalCounter == 0 is reserved as the not-found sentinel in ProjectionReader.Get.
@@ -128,8 +165,28 @@ func (p *ProjectionPersistence[V]) Set(ctx context.Context, projecteds []monoton
 		return fmt.Errorf("globalCounter must be > 0")
 	}
 
+	for _, ps := range sets {
+		if ps.Mode != p.mode {
+			return fmt.Errorf("%w: set key=%q mode=%s, table %q mode=%s", monotonic.ErrProjectionModeMismatch, ps.Key, ps.Mode, p.tableName, p.mode)
+		}
+		if ps.Mode == monotonic.ReconcileUpsert && len(ps.Values) != 1 {
+			return fmt.Errorf("upsert set for key %q must have exactly one value, got %d", ps.Key, len(ps.Values))
+		}
+	}
+
+	switch p.mode {
+	case monotonic.ReconcileUpsert:
+		return p.setUpsert(ctx, sets, globalCounter)
+	case monotonic.ReconcileReplace:
+		return p.setReplace(ctx, sets, globalCounter)
+	default:
+		return fmt.Errorf("unknown reconciliation mode %s", p.mode)
+	}
+}
+
+// setUpsert performs ON CONFLICT (projection_key) DO UPDATE upserts for each set in a single transaction.
+func (p *ProjectionPersistence[V]) setUpsert(ctx context.Context, sets []monotonic.ProjectedSet[V], globalCounter uint64) error {
 	insertCols := append([]string{"projection_key", "global_counter"}, p.columnNames()...)
-	// First two placeholders (projection_key, global_counter) are always untyped.
 	placeholders := []string{"$1", "$2"}
 	for i, fi := range p.fields {
 		ph := fmt.Sprintf("$%d", i+3)
@@ -164,15 +221,87 @@ func (p *ProjectionPersistence[V]) Set(ctx context.Context, projecteds []monoton
 	}
 	defer tx.Rollback(ctx)
 
-	for _, pj := range projecteds {
-		args := p.argsForRow(pj.Key, pj.Value, globalCounter)
+	for _, ps := range sets {
+		args := p.argsForRow(ps.Key, ps.Values[0], globalCounter)
 		tag, err := tx.Exec(ctx, query, args...)
 		if err != nil {
-			return fmt.Errorf("upsert projection %q: %w", pj.Key, err)
+			return fmt.Errorf("upsert projection %q: %w", ps.Key, err)
 		}
-		// RowsAffected == 0 means the WHERE rejected the update, i.e. existing counter > globalCounter.
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: key=%q counter=%d", monotonic.ErrProjectionStale, pj.Key, globalCounter)
+			return fmt.Errorf("%w: key=%q counter=%d", monotonic.ErrProjectionStale, ps.Key, globalCounter)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit projection batch: %w", err)
+	}
+	return nil
+}
+
+// setReplace performs per-key delete-then-insert reconciliation in a single transaction; rejects writes whose stored max(global_counter) for any key exceeds globalCounter.
+func (p *ProjectionPersistence[V]) setReplace(ctx context.Context, sets []monotonic.ProjectedSet[V], globalCounter uint64) error {
+	tx, err := p.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Stale-write check per distinct key: any stored row with counter > ours blocks the write.
+	seenKeys := make(map[monotonic.ProjectionKey]struct{}, len(sets))
+	for _, ps := range sets {
+		if _, dup := seenKeys[ps.Key]; dup {
+			return fmt.Errorf("duplicate key %q in replace batch", ps.Key)
+		}
+		seenKeys[ps.Key] = struct{}{}
+
+		var maxCounter int64
+		err := tx.QueryRow(ctx,
+			fmt.Sprintf(`SELECT COALESCE(MAX(global_counter), 0) FROM %s WHERE projection_key = $1`, quoteIdent(p.tableName)),
+			string(ps.Key),
+		).Scan(&maxCounter)
+		if err != nil {
+			return fmt.Errorf("read max counter for %q: %w", ps.Key, err)
+		}
+		if uint64(maxCounter) > globalCounter {
+			return fmt.Errorf("%w: key=%q counter=%d", monotonic.ErrProjectionStale, ps.Key, globalCounter)
+		}
+	}
+
+	// Delete all rows for the touched keys.
+	keys := make([]string, 0, len(sets))
+	for _, ps := range sets {
+		keys = append(keys, string(ps.Key))
+	}
+	if _, err := tx.Exec(ctx,
+		fmt.Sprintf(`DELETE FROM %s WHERE projection_key = ANY($1)`, quoteIdent(p.tableName)),
+		keys,
+	); err != nil {
+		return fmt.Errorf("delete projection rows: %w", err)
+	}
+
+	// Insert new rows. Build per-row insert SQL once.
+	insertCols := append([]string{"projection_key", "global_counter"}, p.columnNames()...)
+	placeholders := []string{"$1", "$2"}
+	for i, fi := range p.fields {
+		ph := fmt.Sprintf("$%d", i+3)
+		if fi.isJSON {
+			ph += "::jsonb"
+		}
+		placeholders = append(placeholders, ph)
+	}
+	insertSQL := fmt.Sprintf(
+		`INSERT INTO %s (%s) VALUES (%s)`,
+		quoteIdent(p.tableName),
+		strings.Join(quoteIdents(insertCols), ", "),
+		strings.Join(placeholders, ", "),
+	)
+
+	for _, ps := range sets {
+		for _, v := range ps.Values {
+			args := p.argsForRow(ps.Key, v, globalCounter)
+			if _, err := tx.Exec(ctx, insertSQL, args...); err != nil {
+				return fmt.Errorf("insert projection row %q: %w", ps.Key, err)
+			}
 		}
 	}
 
@@ -226,15 +355,14 @@ func (p *ProjectionPersistence[V]) argsForRow(key monotonic.ProjectionKey, value
 	return args
 }
 
-// Migrate creates the projection table and a global_counter index if they do not already exist.
-// When allowMigrationRebuild is true, the existing table is dropped and recreated if its columns
-// or types do not match the expected schema derived from V.
+// Migrate creates the projection table and supporting indexes if they do not already exist.
+// When allowMigrationRebuild is true, the existing table is dropped and recreated if its columns,
+// types, or constraint shape do not match the expected schema derived from V and the mode.
 // Call once during application startup before using Get, Set, or LatestGlobalCounter.
 func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 	var zero V
 	t := reflect.TypeOf(zero)
 
-	// Build the expected column type map (includes the two fixed columns).
 	expectedCols := map[string]string{
 		"projection_key": "TEXT",
 		"global_counter": "BIGINT",
@@ -254,7 +382,7 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 	}
 	if schemaChanged {
 		if !p.allowMigrationRebuild {
-			return fmt.Errorf("projection table %q schema does not match expected columns/types; set allowMigrationRebuild to automatically drop and recreate", p.tableName)
+			return fmt.Errorf("projection table %q schema does not match expected columns/types/mode; set allowMigrationRebuild to automatically drop and recreate", p.tableName)
 		}
 		slog.Info("projection schema has changed, dropping table for migration rebuild", "table", p.tableName)
 		if err := p.dropTable(ctx); err != nil {
@@ -263,10 +391,15 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 	}
 
 	colDefs := make([]string, 0, 2+len(p.fields))
-	colDefs = append(colDefs,
-		`"projection_key" TEXT NOT NULL PRIMARY KEY`,
-		`"global_counter" BIGINT NOT NULL`,
-	)
+	switch p.mode {
+	case monotonic.ReconcileUpsert:
+		colDefs = append(colDefs, `"projection_key" TEXT NOT NULL PRIMARY KEY`)
+	case monotonic.ReconcileReplace:
+		colDefs = append(colDefs, `"projection_key" TEXT NOT NULL`)
+	default:
+		return fmt.Errorf("migrate: unknown reconciliation mode %s", p.mode)
+	}
+	colDefs = append(colDefs, `"global_counter" BIGINT NOT NULL`)
 	for _, fi := range p.fields {
 		colDefs = append(colDefs, fmt.Sprintf("%s %s NOT NULL", quoteIdent(fi.column), expectedCols[fi.column]))
 	}
@@ -279,13 +412,20 @@ func (p *ProjectionPersistence[V]) Migrate(ctx context.Context) error {
 		quoteIdent("idx_"+p.tableName+"_gc"),
 		quoteIdent(p.tableName),
 	)
+	if p.mode == monotonic.ReconcileReplace {
+		// Replace mode has no PK on projection_key, so add a non-unique index for fast delete-by-key.
+		ddl += fmt.Sprintf(";\nCREATE INDEX IF NOT EXISTS %s ON %s (projection_key)",
+			quoteIdent("idx_"+p.tableName+"_pk"),
+			quoteIdent(p.tableName),
+		)
+	}
 	if _, err := p.pool.Exec(ctx, ddl); err != nil {
 		return fmt.Errorf("migrate projection table %q: %w", p.tableName, err)
 	}
 	return nil
 }
 
-// schemaChanged returns true when the existing table's columns or types do not match expectedCols.
+// schemaChanged returns true when the existing table's columns, types, or projection_key constraint shape do not match what this persistence expects.
 // Returns false if the table does not exist yet (no columns found).
 func (p *ProjectionPersistence[V]) schemaChanged(ctx context.Context, expectedCols map[string]string) (bool, error) {
 	rows, err := p.pool.Query(ctx,
@@ -323,15 +463,52 @@ func (p *ProjectionPersistence[V]) schemaChanged(ctx context.Context, expectedCo
 			return true, nil
 		}
 	}
+
+	// Check projection_key constraint shape matches the mode: upsert mode requires a PK, replace mode requires no PK.
+	hasPK, err := p.projectionKeyHasPrimaryKey(ctx)
+	if err != nil {
+		return false, err
+	}
+	switch p.mode {
+	case monotonic.ReconcileUpsert:
+		if !hasPK {
+			return true, nil
+		}
+	case monotonic.ReconcileReplace:
+		if hasPK {
+			return true, nil
+		}
+	}
 	return false, nil
 }
 
-// dropTable drops the projection table and its global_counter index.
+// projectionKeyHasPrimaryKey reports whether the projection_key column is the primary key on the existing table.
+func (p *ProjectionPersistence[V]) projectionKeyHasPrimaryKey(ctx context.Context) (bool, error) {
+	var hasPK bool
+	err := p.pool.QueryRow(ctx,
+		`SELECT EXISTS (
+		   SELECT 1 FROM information_schema.table_constraints tc
+		   JOIN information_schema.key_column_usage kcu
+		     ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
+		   WHERE tc.table_name = $1 AND tc.table_schema = 'public'
+		     AND tc.constraint_type = 'PRIMARY KEY'
+		     AND kcu.column_name = 'projection_key'
+		 )`,
+		p.tableName,
+	).Scan(&hasPK)
+	if err != nil {
+		return false, fmt.Errorf("query projection_key PK for %q: %w", p.tableName, err)
+	}
+	return hasPK, nil
+}
+
+// dropTable drops the projection table and its supporting indexes.
 func (p *ProjectionPersistence[V]) dropTable(ctx context.Context) error {
 	drop := fmt.Sprintf(
-		"DROP TABLE IF EXISTS %s; DROP INDEX IF EXISTS %s",
+		"DROP TABLE IF EXISTS %s; DROP INDEX IF EXISTS %s; DROP INDEX IF EXISTS %s",
 		quoteIdent(p.tableName),
 		quoteIdent("idx_"+p.tableName+"_gc"),
+		quoteIdent("idx_"+p.tableName+"_pk"),
 	)
 	if _, err := p.pool.Exec(ctx, drop); err != nil {
 		return fmt.Errorf("drop projection table %q for rebuild: %w", p.tableName, err)

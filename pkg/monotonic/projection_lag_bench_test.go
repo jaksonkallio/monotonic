@@ -19,10 +19,10 @@ func (l *lagLogic) EventFilters() []monotonic.EventFilter {
 	return []monotonic.EventFilter{{AggregateType: benchAggregateType}}
 }
 
-func (l *lagLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], event monotonic.AggregateEvent) ([]monotonic.Projected[int], error) {
+func (l *lagLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], event monotonic.AggregateEvent) ([]monotonic.ProjectedSet[int], error) {
 	l.walltime.Record(time.Since(event.Event.AcceptedAt))
 	// Emit one update so InMemoryProjectionPersistence.Set runs the full write path on every event instead of being a no-op.
-	return []monotonic.Projected[int]{{Key: monotonic.ProjectionKeySummary, Value: 1}}, nil
+	return []monotonic.ProjectedSet[int]{{Key: monotonic.ProjectionKeySummary, Mode: monotonic.ReconcileUpsert, Values: []int{1}}}, nil
 }
 
 // BenchmarkProjection_LagSteadyState runs a rate-limited writer alongside a Projector and samples projection lag two ways:
@@ -50,7 +50,7 @@ func BenchmarkProjection_LagSteadyState(b *testing.B) {
 			defer cancel()
 
 			store := monotonic.NewInMemoryStore()
-			persist := monotonic.NewInMemoryProjectionPersistence[int]()
+			persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 			walltimeLag := mtest.NewLatencies()
 			// Each event-lag sample is stored in a Latencies as time.Duration(N) — N is the count of events behind. Reusing Latencies' percentile machinery; units are interpreted as "events" when reading back.
 			eventsLag := mtest.NewLatencies()

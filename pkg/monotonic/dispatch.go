@@ -3,7 +3,7 @@ package monotonic
 import "context"
 
 // DispatchHandler processes a single event for a Dispatch and returns the projection updates it produced.
-type DispatchHandler[V any] func(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]Projected[V], error)
+type DispatchHandler[V any] func(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]ProjectedSet[V], error)
 
 // dispatchKey identifies a registered handler by aggregate type and event type.
 type dispatchKey struct {
@@ -38,7 +38,7 @@ func (d *Dispatch[V]) EventFilters() []EventFilter {
 }
 
 // Apply routes the event to its registered handler; events with no matching handler are a no-op (which shouldn't occur if the projector subscribes via EventFilters).
-func (d *Dispatch[V]) Apply(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]Projected[V], error) {
+func (d *Dispatch[V]) Apply(ctx context.Context, reader ProjectionReader[V], event AggregateEvent) ([]ProjectedSet[V], error) {
 	h, ok := d.handlers[dispatchKey{event.AggregateType, event.Event.Type}]
 	if !ok {
 		return nil, nil

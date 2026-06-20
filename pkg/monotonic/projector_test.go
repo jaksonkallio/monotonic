@@ -18,7 +18,7 @@ type noopLogic[V any] struct{}
 func (noopLogic[V]) EventFilters() []monotonic.EventFilter {
 	return []monotonic.EventFilter{{AggregateType: "test"}}
 }
-func (noopLogic[V]) Apply(_ context.Context, _ monotonic.ProjectionReader[V], _ monotonic.AggregateEvent) ([]monotonic.Projected[V], error) {
+func (noopLogic[V]) Apply(_ context.Context, _ monotonic.ProjectionReader[V], _ monotonic.AggregateEvent) ([]monotonic.ProjectedSet[V], error) {
 	return nil, nil
 }
 
@@ -28,9 +28,9 @@ type countingLogic struct{ applied int }
 func (l *countingLogic) EventFilters() []monotonic.EventFilter {
 	return []monotonic.EventFilter{{AggregateType: "test"}}
 }
-func (l *countingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.Projected[int], error) {
+func (l *countingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.ProjectedSet[int], error) {
 	l.applied++
-	return []monotonic.Projected[int]{{Key: monotonic.ProjectionKeySummary, Value: l.applied}}, nil
+	return []monotonic.ProjectedSet[int]{{Key: monotonic.ProjectionKeySummary, Mode: monotonic.ReconcileUpsert, Values: []int{l.applied}}}, nil
 }
 
 // failingLogic always returns an error from Apply.
@@ -39,7 +39,7 @@ type failingLogic struct{ err error }
 func (l *failingLogic) EventFilters() []monotonic.EventFilter {
 	return []monotonic.EventFilter{{AggregateType: "test"}}
 }
-func (l *failingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.Projected[int], error) {
+func (l *failingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.ProjectedSet[int], error) {
 	return nil, l.err
 }
 
@@ -65,7 +65,7 @@ func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter
 func TestProjector_UpdateReturnsZeroWhenNoPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	p, err := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
 	if err != nil {
@@ -89,7 +89,7 @@ func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 	emitEvent(ctx, t, store, 2)
 	emitEvent(ctx, t, store, 3)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic := &countingLogic{}
 	p, err := monotonic.NewProjector(ctx, store, logic, persist, 0)
 	if err != nil {
@@ -111,7 +111,7 @@ func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 func TestProjector_GlobalCounterIsZeroInitially(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	p, err := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
 	if err != nil {
@@ -128,7 +128,7 @@ func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 	emitEvent(ctx, t, store, 2)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	p, _ := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
 
 	p.Update(ctx)
@@ -143,7 +143,7 @@ func TestProjector_UpdateIsIdempotentWhenCaughtUp(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic := &countingLogic{}
 	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
 
@@ -168,7 +168,7 @@ func TestProjector_ResumesFromExistingPersistenceState(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 	emitEvent(ctx, t, store, 2)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic1 := &countingLogic{}
 	p1, _ := monotonic.NewProjector(ctx, store, logic1, persist, 0)
 	p1.Update(ctx)
@@ -200,8 +200,8 @@ func TestProjector_NewProjectorReadsLatestGlobalCounterFromPersistence(t *testin
 	store := monotonic.NewInMemoryStore()
 
 	// Pre-populate persistence as if events 1–5 were already processed.
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: monotonic.ProjectionKeySummary, Value: 0}}, 5)
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
+	persist.Set(ctx, []monotonic.ProjectedSet[int]{{Key: monotonic.ProjectionKeySummary, Mode: monotonic.ReconcileUpsert, Values: []int{0}}}, 5)
 
 	// Also emit 6 events into the store.
 	for i := int64(1); i <= 6; i++ {
@@ -229,7 +229,7 @@ func TestProjector_UpdatePropagatesApplyError(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("apply boom")}, persist, 0)
 
 	_, err := p.Update(ctx)
@@ -243,7 +243,7 @@ func TestProjector_UpdateDoesNotAdvanceCounterAfterApplyError(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("boom")}, persist, 0)
 
 	p.Update(ctx)
@@ -256,7 +256,7 @@ func TestProjector_UpdateDoesNotAdvanceCounterAfterApplyError(t *testing.T) {
 func TestProjector_RunStopsOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	p, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, persist, 0)
 
 	done := make(chan error, 1)
@@ -279,7 +279,7 @@ func TestProjector_RunReturnsErrorFromUpdate(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("run boom")}, persist, 0)
 
 	err := p.Run(ctx, time.Millisecond)
@@ -301,7 +301,7 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 		emitEvent(ctx, t, store, i)
 	}
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic := &countingLogic{}
 	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
 
@@ -334,7 +334,7 @@ func TestProjector_RebuildReplaysAllEvents(t *testing.T) {
 	emitEvent(ctx, t, store, 2)
 	emitEvent(ctx, t, store, 3)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic := &countingLogic{}
 	p, err := monotonic.NewProjector(ctx, store, logic, persist, 0)
 	if err != nil {
@@ -367,7 +367,7 @@ func TestProjector_RebuildClearsPersistence(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	logic := &countingLogic{}
 	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
 	p.Update(ctx)
@@ -397,7 +397,7 @@ func TestRunProjectors_AllStopOnContextCancellation(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 
 	makeProjector := func() monotonic.ProjectorRunner {
-		persist := monotonic.NewInMemoryProjectionPersistence[int]()
+		persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 		p, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, persist, 0)
 		return p
 	}
@@ -424,10 +424,10 @@ func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	failPersist := monotonic.NewInMemoryProjectionPersistence[int]()
+	failPersist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	failP, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("fail")}, failPersist, 0)
 
-	okPersist := monotonic.NewInMemoryProjectionPersistence[int]()
+	okPersist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 	okP, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, okPersist, 0)
 
 	err := monotonic.RunProjectors(ctx, time.Millisecond, failP, okP)
@@ -440,7 +440,7 @@ func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
 
 func TestMutateByKey_AppliesZeroValueWhenKeyMissing(t *testing.T) {
 	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	updates, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
 		*v += 10
@@ -452,15 +452,15 @@ func TestMutateByKey_AppliesZeroValueWhenKeyMissing(t *testing.T) {
 	if len(updates) != 1 {
 		t.Fatalf("expected 1 update, got %d", len(updates))
 	}
-	if updates[0].Key != "k" || updates[0].Value != 10 {
+	if updates[0].Key != "k" || len(updates[0].Values) != 1 || updates[0].Values[0] != 10 {
 		t.Errorf("unexpected update: %+v", updates[0])
 	}
 }
 
 func TestMutateByKey_ReadsExistingValueBeforeMutating(t *testing.T) {
 	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 5}}, 1)
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
+	persist.Set(ctx, []monotonic.ProjectedSet[int]{{Key: "k", Mode: monotonic.ReconcileUpsert, Values: []int{5}}}, 1)
 
 	updates, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
 		*v += 10
@@ -469,14 +469,14 @@ func TestMutateByKey_ReadsExistingValueBeforeMutating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MutateByKey: %v", err)
 	}
-	if updates[0].Value != 15 {
-		t.Errorf("expected 15 (5+10), got %d", updates[0].Value)
+	if updates[0].Values[0] != 15 {
+		t.Errorf("expected 15 (5+10), got %d", updates[0].Values[0])
 	}
 }
 
 func TestMutateByKey_PropagatesMutationError(t *testing.T) {
 	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	_, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
 		return errors.New("mutation failed")
@@ -488,8 +488,8 @@ func TestMutateByKey_PropagatesMutationError(t *testing.T) {
 
 func TestMutateByKey_DoesNotMutateReaderOnError(t *testing.T) {
 	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 42}}, 1)
+	persist := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
+	persist.Set(ctx, []monotonic.ProjectedSet[int]{{Key: "k", Mode: monotonic.ReconcileUpsert, Values: []int{42}}}, 1)
 
 	monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
 		*v = 999

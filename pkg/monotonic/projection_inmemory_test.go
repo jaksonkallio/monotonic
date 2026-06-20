@@ -9,9 +9,13 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
+func upsertSet[V any](key monotonic.ProjectionKey, value V) []monotonic.ProjectedSet[V] {
+	return []monotonic.ProjectedSet[V]{{Key: key, Mode: monotonic.ReconcileUpsert, Values: []V{value}}}
+}
+
 func TestInMemoryProjectionPersistence_GetMissingReturnsZero(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[string]()
+	p := monotonic.NewInMemoryProjectionPersistence[string](monotonic.ReconcileUpsert)
 
 	val, err := p.Get(ctx, "missing")
 	if err != nil {
@@ -24,9 +28,9 @@ func TestInMemoryProjectionPersistence_GetMissingReturnsZero(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_SetThenGet(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[string]()
+	p := monotonic.NewInMemoryProjectionPersistence[string](monotonic.ReconcileUpsert)
 
-	if err := p.Set(ctx, []monotonic.Projected[string]{{Key: "k", Value: "hello"}}, 1); err != nil {
+	if err := p.Set(ctx, upsertSet[string]("k", "hello"), 1); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 
@@ -41,10 +45,10 @@ func TestInMemoryProjectionPersistence_SetThenGet(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_OverwriteWithHigherCounter(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 1}}, 1)
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 2}}, 2)
+	p.Set(ctx, upsertSet[int]("k", 1), 1)
+	p.Set(ctx, upsertSet[int]("k", 2), 2)
 
 	val, _ := p.Get(ctx, "k")
 	if val != 2 {
@@ -54,7 +58,7 @@ func TestInMemoryProjectionPersistence_OverwriteWithHigherCounter(t *testing.T) 
 
 func TestInMemoryProjectionPersistence_LatestGlobalCounterInitiallyZero(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	c, err := p.LatestGlobalCounter(ctx)
 	if err != nil {
@@ -67,10 +71,10 @@ func TestInMemoryProjectionPersistence_LatestGlobalCounterInitiallyZero(t *testi
 
 func TestInMemoryProjectionPersistence_LatestGlobalCounterAdvances(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	for _, counter := range []uint64{1, 3, 7} {
-		if err := p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 0}}, counter); err != nil {
+		if err := p.Set(ctx, upsertSet[int]("k", 0), counter); err != nil {
 			t.Fatalf("Set at counter %d: %v", counter, err)
 		}
 		got, _ := p.LatestGlobalCounter(ctx)
@@ -82,18 +86,12 @@ func TestInMemoryProjectionPersistence_LatestGlobalCounterAdvances(t *testing.T)
 
 func TestInMemoryProjectionPersistence_LatestGlobalCounterDoesNotDecreaseForMultipleKeys(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "a", Value: 0}}, 10)
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "b", Value: 0}}, 5) // stale for b, but b doesn't exist yet
+	p.Set(ctx, upsertSet[int]("a", 0), 10)
+	p.Set(ctx, upsertSet[int]("b", 0), 5)
 
-	// "a" was at counter 10, "b" write at counter 5 should fail (b doesn't exist yet,
-	// but counter 5 < maxCounter of 10... actually no. ErrProjectionStale is per-key,
-	// not global. "b" has no stored counter so 5 > 0, which succeeds.)
-	// Let's verify: the stale check is "existing.globalCounter > globalCounter".
-	// For b (new key), existing.globalCounter=0, so 0 > 5 is false → write succeeds.
 	c, _ := p.LatestGlobalCounter(ctx)
-	// maxCounter should still be 10 (not replaced by 5)
 	if c != 10 {
 		t.Errorf("LatestGlobalCounter should not decrease: got %d, want 10", c)
 	}
@@ -101,16 +99,15 @@ func TestInMemoryProjectionPersistence_LatestGlobalCounterDoesNotDecreaseForMult
 
 func TestInMemoryProjectionPersistence_StaleWriteRejected(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 1}}, 5)
+	p.Set(ctx, upsertSet[int]("k", 1), 5)
 
-	err := p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 2}}, 3)
+	err := p.Set(ctx, upsertSet[int]("k", 2), 3)
 	if !errors.Is(err, monotonic.ErrProjectionStale) {
 		t.Errorf("expected ErrProjectionStale, got %v", err)
 	}
 
-	// Value must be unchanged.
 	val, _ := p.Get(ctx, "k")
 	if val != 1 {
 		t.Errorf("value should be unchanged after stale write: got %d", val)
@@ -119,23 +116,23 @@ func TestInMemoryProjectionPersistence_StaleWriteRejected(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_EqualCounterIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 1}}, 5)
+	p.Set(ctx, upsertSet[int]("k", 1), 5)
 
-	if err := p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 1}}, 5); err != nil {
+	if err := p.Set(ctx, upsertSet[int]("k", 1), 5); err != nil {
 		t.Errorf("same-counter write should succeed (idempotent), got %v", err)
 	}
 }
 
 func TestInMemoryProjectionPersistence_EmptyBatchIsNoOp(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	if err := p.Set(ctx, nil, 1); err != nil {
 		t.Errorf("empty batch should not error, got %v", err)
 	}
-	if err := p.Set(ctx, []monotonic.Projected[int]{}, 1); err != nil {
+	if err := p.Set(ctx, []monotonic.ProjectedSet[int]{}, 1); err != nil {
 		t.Errorf("empty slice batch should not error, got %v", err)
 	}
 
@@ -147,9 +144,9 @@ func TestInMemoryProjectionPersistence_EmptyBatchIsNoOp(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_ZeroCounterRejected(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	err := p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 1}}, 0)
+	err := p.Set(ctx, upsertSet[int]("k", 1), 0)
 	if err == nil {
 		t.Error("expected error for globalCounter=0")
 	}
@@ -157,26 +154,22 @@ func TestInMemoryProjectionPersistence_ZeroCounterRejected(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_BatchAtomicOnStale(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	// k1 written at counter=5.
-	p.Set(ctx, []monotonic.Projected[int]{{Key: "k1", Value: 10}}, 5)
+	p.Set(ctx, upsertSet[int]("k1", 10), 5)
 
-	// Batch: k2 (new) + k1 (stale at counter=3 < 5). Must fail atomically.
-	err := p.Set(ctx, []monotonic.Projected[int]{
-		{Key: "k2", Value: 20},
-		{Key: "k1", Value: 99},
+	err := p.Set(ctx, []monotonic.ProjectedSet[int]{
+		{Key: "k2", Mode: monotonic.ReconcileUpsert, Values: []int{20}},
+		{Key: "k1", Mode: monotonic.ReconcileUpsert, Values: []int{99}},
 	}, 3)
 	if !errors.Is(err, monotonic.ErrProjectionStale) {
 		t.Errorf("expected ErrProjectionStale, got %v", err)
 	}
 
-	// k2 must NOT have been written (atomic rollback).
 	val, _ := p.Get(ctx, "k2")
 	if val != 0 {
 		t.Errorf("k2 must not be written when batch is stale: got %d", val)
 	}
-	// k1 must still hold its original value.
 	val, _ = p.Get(ctx, "k1")
 	if val != 10 {
 		t.Errorf("k1 must be unchanged: got %d", val)
@@ -185,12 +178,12 @@ func TestInMemoryProjectionPersistence_BatchAtomicOnStale(t *testing.T) {
 
 func TestInMemoryProjectionPersistence_MultipleKeysInBatch(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
-	err := p.Set(ctx, []monotonic.Projected[int]{
-		{Key: "a", Value: 1},
-		{Key: "b", Value: 2},
-		{Key: "c", Value: 3},
+	err := p.Set(ctx, []monotonic.ProjectedSet[int]{
+		{Key: "a", Mode: monotonic.ReconcileUpsert, Values: []int{1}},
+		{Key: "b", Mode: monotonic.ReconcileUpsert, Values: []int{2}},
+		{Key: "c", Mode: monotonic.ReconcileUpsert, Values: []int{3}},
 	}, 1)
 	if err != nil {
 		t.Fatalf("Set: %v", err)
@@ -207,14 +200,13 @@ func TestInMemoryProjectionPersistence_MultipleKeysInBatch(t *testing.T) {
 func TestInMemoryProjectionPersistence_GetDoesNotMutateInternalState(t *testing.T) {
 	ctx := context.Background()
 	type mutable struct{ V int }
-	p := monotonic.NewInMemoryProjectionPersistence[mutable]()
+	p := monotonic.NewInMemoryProjectionPersistence[mutable](monotonic.ReconcileUpsert)
 
-	p.Set(ctx, []monotonic.Projected[mutable]{{Key: "k", Value: mutable{V: 42}}}, 1)
+	p.Set(ctx, upsertSet[mutable]("k", mutable{V: 42}), 1)
 
 	got, _ := p.Get(ctx, "k")
-	got.V = 999 // mutate the returned copy
+	got.V = 999
 
-	// Internal state must not change.
 	got2, _ := p.Get(ctx, "k")
 	if got2.V != 42 {
 		t.Errorf("internal state was mutated: got %d, want 42", got2.V)
@@ -223,7 +215,7 @@ func TestInMemoryProjectionPersistence_GetDoesNotMutateInternalState(t *testing.
 
 func TestInMemoryProjectionPersistence_ConcurrentReadWrite(t *testing.T) {
 	ctx := context.Background()
-	p := monotonic.NewInMemoryProjectionPersistence[int]()
+	p := monotonic.NewInMemoryProjectionPersistence[int](monotonic.ReconcileUpsert)
 
 	var wg sync.WaitGroup
 	const goroutines = 50
@@ -231,7 +223,7 @@ func TestInMemoryProjectionPersistence_ConcurrentReadWrite(t *testing.T) {
 		wg.Add(1)
 		go func(counter uint64) {
 			defer wg.Done()
-			p.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: int(counter)}}, counter)
+			p.Set(ctx, upsertSet[int]("k", int(counter)), counter)
 			p.Get(ctx, "k")
 			p.LatestGlobalCounter(ctx)
 		}(uint64(i))

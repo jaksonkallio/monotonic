@@ -225,7 +225,7 @@ func TestProjector(t *testing.T) {
 	c2, _ := loadCounter(ctx, store, "c2")
 	c2.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 10}))
 
-	persistence := NewInMemoryProjectionPersistence[incrementSummary]()
+	persistence := NewInMemoryProjectionPersistence[incrementSummary](ReconcileUpsert)
 
 	projector, err := NewProjector(ctx, store, newIncrementLogic(), persistence, 0)
 	if err != nil {
@@ -289,7 +289,7 @@ func newIncrementLogic() ProjectorLogic[incrementSummary] {
 		On("counter", eventIncremented, applyIncrement)
 }
 
-func applyIncrement(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]Projected[incrementSummary], error) {
+func applyIncrement(ctx context.Context, reader ProjectionReader[incrementSummary], event AggregateEvent) ([]ProjectedSet[incrementSummary], error) {
 	payload, err := ParsePayload[incrementedPayload](event.Event)
 	if err != nil {
 		return nil, err

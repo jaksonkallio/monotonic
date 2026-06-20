@@ -53,13 +53,13 @@ func TestLedgerScenario(t *testing.T) {
 	}
 
 	// Spin up both projectors against the same store.
-	balancePersist := monotonic.NewInMemoryProjectionPersistence[AccountBalance]()
+	balancePersist := monotonic.NewInMemoryProjectionPersistence[AccountBalance](monotonic.ReconcileUpsert)
 	balanceProjector, err := monotonic.NewProjector(ctx, store, NewBalanceLogic(), balancePersist, 0)
 	if err != nil {
 		t.Fatalf("NewProjector balance: %v", err)
 	}
 
-	statsPersist := monotonic.NewInMemoryProjectionPersistence[LedgerStats]()
+	statsPersist := monotonic.NewInMemoryProjectionPersistence[LedgerStats](monotonic.ReconcileUpsert)
 	statsProjector, err := monotonic.NewProjector(ctx, store, NewStatsLogic(), statsPersist, 0)
 	if err != nil {
 		t.Fatalf("NewProjector stats: %v", err)
