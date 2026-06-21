@@ -90,3 +90,35 @@ func (b *ProjectorBackend) RunEvent(
 	}
 	return nil
 }
+
+// ResetState opens a tx, hands it to reset, sets projector_state back to 0, and commits.
+func (b *ProjectorBackend) ResetState(
+	ctx context.Context,
+	projectorName string,
+	reset func(ctx context.Context, tx pgx.Tx) error,
+) error {
+	tx, err := b.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := reset(ctx, tx); err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO projector_state (projector_name, global_counter, updated_at)
+		VALUES ($1, 0, now())
+		ON CONFLICT (projector_name) DO UPDATE
+		SET global_counter = 0, updated_at = now()
+	`, projectorName)
+	if err != nil {
+		return fmt.Errorf("reset projector_state for %q: %w", projectorName, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit projector_state reset for %q: %w", projectorName, err)
+	}
+	return nil
+}

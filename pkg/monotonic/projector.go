@@ -23,6 +23,10 @@ type ProjectorBackend[Sink any] interface {
 	// RunEvent runs apply and records (projectorName, counter) atomically.
 	// On apply error, neither the handler's writes nor the state advance are committed.
 	RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, sink Sink) error) error
+
+	// ResetState runs reset and sets projectorName's counter back to 0, atomically.
+	// On reset error, neither reset's writes nor the counter reset are committed.
+	ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, sink Sink) error) error
 }
 
 // Projector reads events from a Store and dispatches each one through a Dispatch,
@@ -97,6 +101,21 @@ func (p *Projector[Sink]) Update(ctx context.Context) (int, error) {
 	}
 
 	return processed, nil
+}
+
+// Reset runs reset and rewinds the projector back to the beginning of the event stream, atomically.
+// reset is responsible for clearing whatever state the projector's handlers have written (e.g. truncating
+// the implementer's own tables); it runs with the same Sink a handler would get. Callers must ensure no
+// concurrent Run/Update loop is driving this projector, since Reset does not stop one.
+func (p *Projector[Sink]) Reset(ctx context.Context, reset func(ctx context.Context, sink Sink) error) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.backend.ResetState(ctx, p.name, reset); err != nil {
+		return fmt.Errorf("reset projector %q: %w", p.name, err)
+	}
+	p.counter = 0
+	return nil
 }
 
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.

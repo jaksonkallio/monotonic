@@ -216,6 +216,90 @@ func TestProjectorBackend_ReplayingSeenCounterIsIdempotent(t *testing.T) {
 	}
 }
 
+// TestProjectorBackend_ResetClearsProjectionAndCounterAtomically verifies that Projector.Reset
+// truncates the implementer's table and rewinds projector_state in the same commit, and that a
+// subsequent Update replays the full event stream from the beginning.
+func TestProjectorBackend_ResetClearsProjectionAndCounterAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_reset")
+
+	dispatch := monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+			_, err := tx.Exec(ctx, `INSERT INTO proj_reset (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_reset.n + 1`, event.AggregateID)
+			return err
+		})
+
+	appendTestEvent(t, store, "x", 1, "did")
+	appendTestEvent(t, store, "x", 2, "did")
+
+	p, err := monotonic.NewProjector(ctx, "reset", store, dispatch, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if n, err := p.Update(ctx); err != nil || n != 2 {
+		t.Fatalf("Update: n=%d err=%v", n, err)
+	}
+
+	if err := p.Reset(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `TRUNCATE proj_reset`)
+		return err
+	}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	if p.GlobalCounter() != 0 {
+		t.Errorf("projector counter must be 0 after Reset, got %d", p.GlobalCounter())
+	}
+	got, _ := backend.GetState(ctx, "reset")
+	if got != 0 {
+		t.Errorf("projector_state must be 0 after Reset, got %d", got)
+	}
+	var count int
+	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_reset`).Scan(&count)
+	if count != 0 {
+		t.Errorf("proj_reset row count: want 0 after Reset, got %d", count)
+	}
+
+	if n, err := p.Update(ctx); err != nil || n != 2 {
+		t.Fatalf("Update after Reset: n=%d err=%v, want 2 (full replay)", n, err)
+	}
+}
+
+// TestProjectorBackend_ResetRollsBackOnResetFuncError verifies that if the reset func errors,
+// neither its writes nor the projector_state rewind are committed.
+func TestProjectorBackend_ResetRollsBackOnResetFuncError(t *testing.T) {
+	ctx := context.Background()
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_reset_rb")
+
+	if err := backend.RunEvent(ctx, "reset_rb", 7, func(_ context.Context, _ pgx.Tx) error { return nil }); err != nil {
+		t.Fatalf("seed RunEvent: %v", err)
+	}
+
+	wantErr := errors.New("simulated reset failure")
+	err := backend.ResetState(ctx, "reset_rb", func(ctx context.Context, tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `INSERT INTO proj_reset_rb (k, n) VALUES ('x', 1)`); err != nil {
+			return err
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
+	}
+
+	var count int
+	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_reset_rb`).Scan(&count)
+	if count != 0 {
+		t.Errorf("proj_reset_rb row count: want 0 (rolled back), got %d", count)
+	}
+	got, _ := backend.GetState(ctx, "reset_rb")
+	if got != 7 {
+		t.Errorf("projector_state must not be rewound on reset func error, got %d", got)
+	}
+}
+
 // TestProjectorBackend_GetStateMissingProjectorReturnsZero verifies the empty-state default.
 func TestProjectorBackend_GetStateMissingProjectorReturnsZero(t *testing.T) {
 	ctx := context.Background()

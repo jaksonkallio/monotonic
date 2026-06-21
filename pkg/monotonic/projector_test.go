@@ -23,6 +23,8 @@ type fakeBackend struct {
 	failOnEvent uint64 // if non-zero, RunEvent returns failErr for this counter
 	failErr     error
 	runCalls    int
+	resetErr    error // if non-nil, ResetState returns this error without resetting state
+	resetCalls  int
 }
 
 func newFakeBackend() *fakeBackend {
@@ -49,6 +51,23 @@ func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counte
 	}
 	b.mu.Lock()
 	b.state[projectorName] = counter
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, sink testSink) error) error {
+	b.mu.Lock()
+	b.resetCalls++
+	b.mu.Unlock()
+
+	if b.resetErr != nil {
+		return b.resetErr
+	}
+	if err := reset(ctx, testSink{}); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.state[projectorName] = 0
 	b.mu.Unlock()
 	return nil
 }
@@ -234,6 +253,80 @@ func TestProjector_ResumesFromBackendState(t *testing.T) {
 	}
 	if cr.n != 1 {
 		t.Errorf("handler should have been called for 1 event, got %d", cr.n)
+	}
+}
+
+func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 3; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if p.GlobalCounter() != 3 {
+		t.Fatalf("expected counter 3 before reset, got %d", p.GlobalCounter())
+	}
+
+	resetFuncCalled := false
+	if err := p.Reset(ctx, func(ctx context.Context, sink testSink) error {
+		resetFuncCalled = true
+		return nil
+	}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	if !resetFuncCalled {
+		t.Error("reset func was not invoked")
+	}
+	if p.GlobalCounter() != 0 {
+		t.Errorf("expected counter 0 after reset, got %d", p.GlobalCounter())
+	}
+	if got, _ := backend.GetState(ctx, "p1"); got != 0 {
+		t.Errorf("expected backend state 0 after reset, got %d", got)
+	}
+
+	n, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after reset: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected reset projector to replay all 3 events, got %d", n)
+	}
+}
+
+func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	wantErr := errors.New("reset boom")
+	err = p.Reset(ctx, func(ctx context.Context, sink testSink) error {
+		return wantErr
+	})
+	if err == nil {
+		t.Fatal("expected error from Reset when reset func fails")
+	}
+	if p.GlobalCounter() != 1 {
+		t.Errorf("counter must not change when reset func fails, got %d", p.GlobalCounter())
 	}
 }
 
