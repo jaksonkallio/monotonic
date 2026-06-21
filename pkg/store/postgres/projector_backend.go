@@ -52,8 +52,35 @@ func (b *ProjectorBackend) GetState(ctx context.Context, projectorName string) (
 	return uint64(counter), nil
 }
 
-// RunEvent opens a tx, hands it to apply, upserts projector_state, and commits.
-// The upsert's WHERE clause keeps replays of an already-seen counter idempotent.
+// lockState ensures a projector_state row exists for projectorName and returns its current
+// counter, having taken a row lock that is held until the caller's transaction ends. Concurrent
+// callers (other instances of the same projector) block here until the lock holder commits or
+// rolls back, then see its committed counter rather than a stale snapshot.
+func lockState(ctx context.Context, tx pgx.Tx, projectorName string) (uint64, error) {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO projector_state (projector_name, global_counter)
+		VALUES ($1, 0)
+		ON CONFLICT (projector_name) DO NOTHING
+	`, projectorName); err != nil {
+		return 0, fmt.Errorf("ensure projector_state row for %q: %w", projectorName, err)
+	}
+
+	var counter int64
+	err := tx.QueryRow(ctx,
+		`SELECT global_counter FROM projector_state WHERE projector_name = $1 FOR UPDATE`,
+		projectorName,
+	).Scan(&counter)
+	if err != nil {
+		return 0, fmt.Errorf("lock projector_state for %q: %w", projectorName, err)
+	}
+	return uint64(counter), nil
+}
+
+// RunEvent opens a tx, locks projector_state for projectorName, and skips apply entirely if
+// counter has already been recorded (by this or another instance of the same projector racing
+// concurrently). Otherwise it runs apply, advances projector_state to counter, and commits both
+// atomically. The row lock serializes concurrent RunEvent/ResetState calls for the same
+// projectorName, so two instances racing on the same event can never both run apply.
 func (b *ProjectorBackend) RunEvent(
 	ctx context.Context,
 	projectorName string,
@@ -70,19 +97,24 @@ func (b *ProjectorBackend) RunEvent(
 	}
 	defer tx.Rollback(ctx)
 
+	current, err := lockState(ctx, tx, projectorName)
+	if err != nil {
+		return err
+	}
+	if current >= counter {
+		// Already applied by this or another instance; nothing left to do.
+		return tx.Commit(ctx)
+	}
+
 	if err := apply(ctx, tx); err != nil {
 		return err
 	}
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO projector_state (projector_name, global_counter, updated_at)
-		VALUES ($1, $2, now())
-		ON CONFLICT (projector_name) DO UPDATE
-		SET global_counter = EXCLUDED.global_counter, updated_at = now()
-		WHERE projector_state.global_counter <= EXCLUDED.global_counter
-	`, projectorName, int64(counter))
-	if err != nil {
-		return fmt.Errorf("upsert projector_state for %q: %w", projectorName, err)
+	if _, err := tx.Exec(ctx,
+		`UPDATE projector_state SET global_counter = $2, updated_at = now() WHERE projector_name = $1`,
+		projectorName, int64(counter),
+	); err != nil {
+		return fmt.Errorf("advance projector_state for %q: %w", projectorName, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {

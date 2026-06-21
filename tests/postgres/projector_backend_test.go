@@ -3,6 +3,8 @@ package postgres_integration_test
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,6 +215,74 @@ func TestProjectorBackend_ReplayingSeenCounterIsIdempotent(t *testing.T) {
 	got, _ = backend.GetState(ctx, "idem")
 	if got != 5 {
 		t.Errorf("equal-counter replay regressed: got %d, want 5", got)
+	}
+}
+
+// TestProjectorBackend_RunEventSkipsAlreadyProcessedCounter verifies that apply is not
+// re-invoked when RunEvent is called again for a counter already recorded.
+func TestProjectorBackend_RunEventSkipsAlreadyProcessedCounter(t *testing.T) {
+	ctx := context.Background()
+	backend := resetProjectorState(t)
+
+	applyCalls := 0
+	apply := func(_ context.Context, _ pgx.Tx) error {
+		applyCalls++
+		return nil
+	}
+
+	if err := backend.RunEvent(ctx, "skip", 5, apply); err != nil {
+		t.Fatalf("first RunEvent: %v", err)
+	}
+	if applyCalls != 1 {
+		t.Fatalf("expected apply called once, got %d", applyCalls)
+	}
+
+	// Replaying the same counter must not re-run apply.
+	if err := backend.RunEvent(ctx, "skip", 5, apply); err != nil {
+		t.Fatalf("replay RunEvent: %v", err)
+	}
+	if applyCalls != 1 {
+		t.Errorf("apply must not run again for an already-processed counter, calls=%d", applyCalls)
+	}
+}
+
+// TestProjectorBackend_RunEventConcurrentInstancesApplyExactlyOnce simulates two instances of
+// the same projector racing to process the same event concurrently. The row lock taken inside
+// RunEvent must serialize them so apply runs exactly once, regardless of which instance wins.
+func TestProjectorBackend_RunEventConcurrentInstancesApplyExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	backend := resetProjectorState(t)
+
+	var applyCalls atomic.Int32
+	apply := func(_ context.Context, _ pgx.Tx) error {
+		applyCalls.Add(1)
+		// Hold the lock briefly so both goroutines are guaranteed to overlap.
+		time.Sleep(50 * time.Millisecond)
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = backend.RunEvent(ctx, "race", 9, apply)
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("instance %d RunEvent: %v", i, err)
+		}
+	}
+	if got := applyCalls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 apply across both racing instances, got %d", got)
+	}
+	got, _ := backend.GetState(ctx, "race")
+	if got != 9 {
+		t.Errorf("expected counter 9 after race, got %d", got)
 	}
 }
 
