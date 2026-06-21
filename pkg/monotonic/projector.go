@@ -13,28 +13,29 @@ import (
 const DefaultUpdateBatchSize = 100
 
 // ProjectorBackend is the store-specific glue that runs each event atomically alongside
-// the projector's resume-counter advance. Implementations open a transaction (or equivalent),
-// inject backend resources into the ctx passed to apply, and commit only if apply succeeds.
-type ProjectorBackend interface {
+// the projector's resume-counter advance. Sink is the per-event handle the backend
+// hands to handlers (e.g. a Postgres pgx.Tx, a pipeline, a producer). Implementations open a transaction
+// (or equivalent), construct a Sink bound to it, invoke apply, and commit only if apply succeeds.
+type ProjectorBackend[Sink any] interface {
 	// GetState returns the resume counter for projectorName, or 0 if none.
 	GetState(ctx context.Context, projectorName string) (uint64, error)
 
 	// RunEvent runs apply and records (projectorName, counter) atomically.
 	// On apply error, neither the handler's writes nor the state advance are committed.
-	RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context) error) error
+	RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, sink Sink) error) error
 }
 
 // Projector reads events from a Store and dispatches each one through a Dispatch,
 // using a ProjectorBackend to commit the handler's work atomically with the counter advance.
-type Projector struct {
+type Projector[Sink any] struct {
 	// name identifies this projector in the backend's state store.
 	name string
 	// store is the event source the projector reads from.
 	store Store
 	// dispatch routes events to handlers and supplies EventFilters.
-	dispatch *Dispatch
+	dispatch *Dispatch[Sink]
 	// backend runs each event atomically with the counter advance.
-	backend ProjectorBackend
+	backend ProjectorBackend[Sink]
 	// mu serializes Update calls and protects counter.
 	mu sync.Mutex
 	// counter is the resume position; events with global_counter > this are pending.
@@ -44,14 +45,14 @@ type Projector struct {
 }
 
 // NewProjector creates a Projector and derives its resume position from backend.GetState.
-func NewProjector(
+func NewProjector[Sink any](
 	ctx context.Context,
 	name string,
 	store Store,
-	dispatch *Dispatch,
-	backend ProjectorBackend,
+	dispatch *Dispatch[Sink],
+	backend ProjectorBackend[Sink],
 	updateBatchSize int,
-) (*Projector, error) {
+) (*Projector[Sink], error) {
 	if name == "" {
 		return nil, fmt.Errorf("NewProjector: name must be non-empty")
 	}
@@ -62,7 +63,7 @@ func NewProjector(
 	if err != nil {
 		return nil, fmt.Errorf("init projector %q: %w", name, err)
 	}
-	return &Projector{
+	return &Projector[Sink]{
 		name:            name,
 		store:           store,
 		dispatch:        dispatch,
@@ -73,7 +74,7 @@ func NewProjector(
 }
 
 // Update processes a batch of pending events and returns the count, or 0 if caught up.
-func (p *Projector) Update(ctx context.Context) (int, error) {
+func (p *Projector[Sink]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -85,8 +86,8 @@ func (p *Projector) Update(ctx context.Context) (int, error) {
 	processed := 0
 	for _, event := range events {
 		counter := uint64(event.Event.GlobalCounter)
-		err := p.backend.RunEvent(ctx, p.name, counter, func(ctx context.Context) error {
-			return p.dispatch.Apply(ctx, event)
+		err := p.backend.RunEvent(ctx, p.name, counter, func(ctx context.Context, sink Sink) error {
+			return p.dispatch.Apply(ctx, sink, event)
 		})
 		if err != nil {
 			return processed, fmt.Errorf("apply event %d: %w", event.Event.GlobalCounter, err)
@@ -99,7 +100,7 @@ func (p *Projector) Update(ctx context.Context) (int, error) {
 }
 
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.
-func (p *Projector) Run(ctx context.Context, pollInterval time.Duration) error {
+func (p *Projector[Sink]) Run(ctx context.Context, pollInterval time.Duration) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -127,19 +128,20 @@ func (p *Projector) Run(ctx context.Context, pollInterval time.Duration) error {
 }
 
 // GlobalCounter returns the highest global counter the projector has processed.
-func (p *Projector) GlobalCounter() uint64 {
+func (p *Projector[Sink]) GlobalCounter() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.counter
 }
 
 // Name returns the projector name used in the backend's state store.
-func (p *Projector) Name() string {
+func (p *Projector[Sink]) Name() string {
 	return p.name
 }
 
 // ProjectorRunner is implemented by any projector that can be driven by RunProjectors.
-// *Projector satisfies this interface automatically.
+// *Projector[Sink] satisfies this interface for any Sink, so RunProjectors can drive
+// projectors with different sink types together.
 type ProjectorRunner interface {
 	Run(ctx context.Context, pollInterval time.Duration) error
 }

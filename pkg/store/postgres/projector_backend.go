@@ -6,45 +6,16 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// txCtxKey is the unexported context key used to carry a pgx.Tx through to a Handler.
-type txCtxKey struct{}
-
-// withTx returns a new ctx carrying tx; TxFromContext retrieves it.
-func withTx(ctx context.Context, tx pgx.Tx) context.Context {
-	return context.WithValue(ctx, txCtxKey{}, tx)
-}
-
-// TxFromContext returns the pgx.Tx the Postgres ProjectorBackend injected, if any.
-// Handlers fetch it to do their writes inside the framework's atomic per-event transaction.
-func TxFromContext(ctx context.Context) (pgx.Tx, bool) {
-	tx, ok := ctx.Value(txCtxKey{}).(pgx.Tx)
-	return tx, ok
-}
-
-// TxHandler adapts a tx-aware function into a monotonic.Handler.
-// Use this at handler registration so handler bodies can take a typed pgx.Tx
-// without the dispatch core having to know about transactions.
-func TxHandler(h func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error) monotonic.Handler {
-	return func(ctx context.Context, event monotonic.AggregateEvent) error {
-		tx, ok := TxFromContext(ctx)
-		if !ok {
-			return fmt.Errorf("postgres: handler invoked without tx in context")
-		}
-		return h(ctx, tx, event)
-	}
-}
-
-// ProjectorBackend implements monotonic.ProjectorBackend on top of Postgres,
+// ProjectorBackend implements monotonic.ProjectorBackend[pgx.Tx] on top of Postgres,
 // opening a transaction per event and committing the handler's writes
 // atomically with the projector_state advance.
 type ProjectorBackend struct {
 	pool *pgxpool.Pool
 }
 
-// NewProjectorBackend creates a Postgres-backed monotonic.ProjectorBackend.
+// NewProjectorBackend creates a Postgres-backed monotonic.ProjectorBackend[pgx.Tx].
 func NewProjectorBackend(pool *pgxpool.Pool) *ProjectorBackend {
 	return &ProjectorBackend{pool: pool}
 }
@@ -81,13 +52,13 @@ func (b *ProjectorBackend) GetState(ctx context.Context, projectorName string) (
 	return uint64(counter), nil
 }
 
-// RunEvent opens a tx, injects it into ctx, runs apply, upserts projector_state, and commits.
+// RunEvent opens a tx, hands it to apply, upserts projector_state, and commits.
 // The upsert's WHERE clause keeps replays of an already-seen counter idempotent.
 func (b *ProjectorBackend) RunEvent(
 	ctx context.Context,
 	projectorName string,
 	counter uint64,
-	apply func(ctx context.Context) error,
+	apply func(ctx context.Context, tx pgx.Tx) error,
 ) error {
 	if counter == 0 {
 		return fmt.Errorf("projector_state counter must be > 0")
@@ -99,7 +70,7 @@ func (b *ProjectorBackend) RunEvent(
 	}
 	defer tx.Rollback(ctx)
 
-	if err := apply(withTx(ctx, tx)); err != nil {
+	if err := apply(ctx, tx); err != nil {
 		return err
 	}
 

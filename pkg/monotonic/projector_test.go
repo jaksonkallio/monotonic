@@ -11,7 +11,11 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// fakeBackend is an in-memory monotonic.ProjectorBackend used by projector unit tests.
+// testSink is the trivial Sink type the unit tests parameterize over; handlers
+// don't actually need any per-event environment, so a struct{} suffices.
+type testSink struct{}
+
+// fakeBackend is an in-memory monotonic.ProjectorBackend[testSink] used by projector unit tests.
 // It records per-projector counters and exposes hooks for failure injection.
 type fakeBackend struct {
 	mu          sync.Mutex
@@ -31,7 +35,7 @@ func (b *fakeBackend) GetState(_ context.Context, projectorName string) (uint64,
 	return b.state[projectorName], nil
 }
 
-func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context) error) error {
+func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, sink testSink) error) error {
 	b.mu.Lock()
 	b.runCalls++
 	shouldFail := b.failOnEvent != 0 && counter == b.failOnEvent
@@ -40,7 +44,7 @@ func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counte
 	if shouldFail {
 		return b.failErr
 	}
-	if err := apply(ctx); err != nil {
+	if err := apply(ctx, testSink{}); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -58,21 +62,21 @@ func (b *fakeBackend) seed(projectorName string, counter uint64) {
 // countingDispatch returns a Dispatch that counts handler invocations.
 type counterRef struct{ n int }
 
-func countingDispatch(c *counterRef) *monotonic.Dispatch {
-	return monotonic.NewDispatch().On("test", "happened", func(_ context.Context, _ monotonic.AggregateEvent) error {
+func countingDispatch(c *counterRef) *monotonic.Dispatch[testSink] {
+	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
 		c.n++
 		return nil
 	})
 }
 
-func failingDispatch(err error) *monotonic.Dispatch {
-	return monotonic.NewDispatch().On("test", "happened", func(_ context.Context, _ monotonic.AggregateEvent) error {
+func failingDispatch(err error) *monotonic.Dispatch[testSink] {
+	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
 		return err
 	})
 }
 
-func noopDispatch() *monotonic.Dispatch {
-	return monotonic.NewDispatch().On("test", "happened", func(_ context.Context, _ monotonic.AggregateEvent) error {
+func noopDispatch() *monotonic.Dispatch[testSink] {
+	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
 		return nil
 	})
 }
@@ -96,9 +100,9 @@ func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter
 // --- Dispatch tests ---
 
 func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
-	d := monotonic.NewDispatch().
-		On("a", "x", func(context.Context, monotonic.AggregateEvent) error { return nil }).
-		On("b", "y", func(context.Context, monotonic.AggregateEvent) error { return nil })
+	d := monotonic.NewDispatch[testSink]().
+		On("a", "x", func(context.Context, testSink, monotonic.AggregateEvent) error { return nil }).
+		On("b", "y", func(context.Context, testSink, monotonic.AggregateEvent) error { return nil })
 
 	filters := d.EventFilters()
 	if len(filters) != 2 {
@@ -115,11 +119,11 @@ func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
 
 func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 	called := false
-	d := monotonic.NewDispatch().On("a", "x", func(_ context.Context, _ monotonic.AggregateEvent) error {
+	d := monotonic.NewDispatch[testSink]().On("a", "x", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
 		called = true
 		return nil
 	})
-	err := d.Apply(context.Background(), monotonic.AggregateEvent{
+	err := d.Apply(context.Background(), testSink{}, monotonic.AggregateEvent{
 		AggregateType: "a",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "x"}},
 	})
@@ -132,8 +136,8 @@ func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 }
 
 func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
-	d := monotonic.NewDispatch()
-	err := d.Apply(context.Background(), monotonic.AggregateEvent{
+	d := monotonic.NewDispatch[testSink]()
+	err := d.Apply(context.Background(), testSink{}, monotonic.AggregateEvent{
 		AggregateType: "x",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "y"}},
 	})

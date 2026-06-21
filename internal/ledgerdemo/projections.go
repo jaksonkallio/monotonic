@@ -6,7 +6,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
-	pgstore "github.com/jaksonkallio/monotonic/pkg/store/postgres"
 )
 
 // Projector names registered in projector_state.
@@ -46,12 +45,12 @@ func MigrateProjections(ctx context.Context, tx pgx.Tx) error {
 }
 
 // NewBalanceDispatch builds the per-account balance Dispatch.
-func NewBalanceDispatch() *monotonic.Dispatch {
-	return monotonic.NewDispatch().
-		On(AggregateAccount, EventAccountOpened, pgstore.TxHandler(balanceOnAccountOpened)).
-		On(AggregateAccount, EventFundsDeposited, pgstore.TxHandler(balanceOnFundsDeposited)).
-		On(AggregateAccount, EventFundsWithdrawn, pgstore.TxHandler(balanceOnFundsWithdrawn)).
-		On(AggregateTransfer, EventTransferCompleted, pgstore.TxHandler(balanceOnTransferCompleted))
+func NewBalanceDispatch() *monotonic.Dispatch[pgx.Tx] {
+	return monotonic.NewDispatch[pgx.Tx]().
+		On(AggregateAccount, EventAccountOpened, balanceOnAccountOpened).
+		On(AggregateAccount, EventFundsDeposited, balanceOnFundsDeposited).
+		On(AggregateAccount, EventFundsWithdrawn, balanceOnFundsWithdrawn).
+		On(AggregateTransfer, EventTransferCompleted, balanceOnTransferCompleted)
 }
 
 func balanceOnAccountOpened(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
@@ -110,12 +109,12 @@ func balanceOnTransferCompleted(ctx context.Context, tx pgx.Tx, event monotonic.
 }
 
 // NewStatsDispatch builds the summary stats Dispatch.
-func NewStatsDispatch() *monotonic.Dispatch {
-	return monotonic.NewDispatch().
-		On(AggregateAccount, EventAccountOpened, pgstore.TxHandler(statsOnAccountOpened)).
-		On(AggregateAccount, EventFundsDeposited, pgstore.TxHandler(statsOnFundsDeposited)).
-		On(AggregateAccount, EventFundsWithdrawn, pgstore.TxHandler(statsOnFundsWithdrawn)).
-		On(AggregateTransfer, EventTransferCompleted, pgstore.TxHandler(statsOnTransferCompleted))
+func NewStatsDispatch() *monotonic.Dispatch[pgx.Tx] {
+	return monotonic.NewDispatch[pgx.Tx]().
+		On(AggregateAccount, EventAccountOpened, statsOnAccountOpened).
+		On(AggregateAccount, EventFundsDeposited, statsOnFundsDeposited).
+		On(AggregateAccount, EventFundsWithdrawn, statsOnFundsWithdrawn).
+		On(AggregateTransfer, EventTransferCompleted, statsOnTransferCompleted)
 }
 
 func statsOnAccountOpened(ctx context.Context, tx pgx.Tx, _ monotonic.AggregateEvent) error {

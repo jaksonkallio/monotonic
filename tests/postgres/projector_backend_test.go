@@ -70,8 +70,8 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 	resetProjectionTable(t, "proj_a")
 	resetProjectionTable(t, "proj_b")
 
-	dispatch := monotonic.NewDispatch().
-		On("thing", "did", pgstore.TxHandler(func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+	dispatch := monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 			if _, err := tx.Exec(ctx, `INSERT INTO proj_a (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_a.n + 1`, event.AggregateID); err != nil {
 				return err
 			}
@@ -79,7 +79,7 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 				return err
 			}
 			return nil
-		}))
+		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
@@ -117,13 +117,13 @@ func TestProjectorBackend_RollsBackOnHandlerError(t *testing.T) {
 	resetProjectionTable(t, "proj_rb")
 
 	wantErr := errors.New("simulated handler failure")
-	dispatch := monotonic.NewDispatch().
-		On("thing", "did", pgstore.TxHandler(func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+	dispatch := monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 			if _, err := tx.Exec(ctx, `INSERT INTO proj_rb (k, n) VALUES ($1, 1)`, event.AggregateID); err != nil {
 				return err
 			}
 			return wantErr
-		}))
+		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 
@@ -154,12 +154,12 @@ func TestProjectorBackend_ResumeFromStoredCounter(t *testing.T) {
 	resetProjectionTable(t, "proj_resume")
 
 	cr := 0
-	dispatch := monotonic.NewDispatch().
-		On("thing", "did", pgstore.TxHandler(func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+	dispatch := monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 			cr++
 			_, err := tx.Exec(ctx, `INSERT INTO proj_resume (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_resume.n + 1`, event.AggregateID)
 			return err
-		}))
+		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
@@ -193,7 +193,7 @@ func TestProjectorBackend_ReplayingSeenCounterIsIdempotent(t *testing.T) {
 	_ = testStore(t)
 	backend := resetProjectorState(t)
 
-	apply := func(_ context.Context) error { return nil }
+	apply := func(_ context.Context, _ pgx.Tx) error { return nil }
 
 	if err := backend.RunEvent(ctx, "idem", 5, apply); err != nil {
 		t.Fatalf("first RunEvent: %v", err)
