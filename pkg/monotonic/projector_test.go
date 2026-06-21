@@ -11,11 +11,11 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// testSink is the trivial Sink type the unit tests parameterize over; handlers
+// testModificationTx is the trivial ModificationTx type the unit tests parameterize over; handlers
 // don't actually need any per-event environment, so a struct{} suffices.
-type testSink struct{}
+type testModificationTx struct{}
 
-// fakeBackend is an in-memory monotonic.ProjectorBackend[testSink] used by projector unit tests.
+// fakeBackend is an in-memory monotonic.ProjectorBackend[testModificationTx] used by projector unit tests.
 // It records per-projector counters and exposes hooks for failure injection.
 type fakeBackend struct {
 	mu          sync.Mutex
@@ -37,7 +37,7 @@ func (b *fakeBackend) GetState(_ context.Context, projectorName string) (uint64,
 	return b.state[projectorName], nil
 }
 
-func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, sink testSink) error) error {
+func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx testModificationTx) error) error {
 	b.mu.Lock()
 	b.runCalls++
 	shouldFail := b.failOnEvent != 0 && counter == b.failOnEvent
@@ -46,7 +46,7 @@ func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counte
 	if shouldFail {
 		return b.failErr
 	}
-	if err := apply(ctx, testSink{}); err != nil {
+	if err := apply(ctx, testModificationTx{}); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -55,7 +55,7 @@ func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counte
 	return nil
 }
 
-func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, sink testSink) error) error {
+func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx testModificationTx) error) error {
 	b.mu.Lock()
 	b.resetCalls++
 	b.mu.Unlock()
@@ -63,7 +63,7 @@ func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, rese
 	if b.resetErr != nil {
 		return b.resetErr
 	}
-	if err := reset(ctx, testSink{}); err != nil {
+	if err := reset(ctx, testModificationTx{}); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -81,21 +81,21 @@ func (b *fakeBackend) seed(projectorName string, counter uint64) {
 // countingDispatch returns a Dispatch that counts handler invocations.
 type counterRef struct{ n int }
 
-func countingDispatch(c *counterRef) *monotonic.Dispatch[testSink] {
-	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
+func countingDispatch(c *counterRef) *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
 		c.n++
 		return nil
 	})
 }
 
-func failingDispatch(err error) *monotonic.Dispatch[testSink] {
-	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
+func failingDispatch(err error) *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
 		return err
 	})
 }
 
-func noopDispatch() *monotonic.Dispatch[testSink] {
-	return monotonic.NewDispatch[testSink]().On("test", "happened", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
+func noopDispatch() *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
 		return nil
 	})
 }
@@ -119,9 +119,9 @@ func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter
 // --- Dispatch tests ---
 
 func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
-	d := monotonic.NewDispatch[testSink]().
-		On("a", "x", func(context.Context, testSink, monotonic.AggregateEvent) error { return nil }).
-		On("b", "y", func(context.Context, testSink, monotonic.AggregateEvent) error { return nil })
+	d := monotonic.NewDispatch[testModificationTx]().
+		On("a", "x", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil }).
+		On("b", "y", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil })
 
 	filters := d.EventFilters()
 	if len(filters) != 2 {
@@ -138,11 +138,11 @@ func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
 
 func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 	called := false
-	d := monotonic.NewDispatch[testSink]().On("a", "x", func(_ context.Context, _ testSink, _ monotonic.AggregateEvent) error {
+	d := monotonic.NewDispatch[testModificationTx]().On("a", "x", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
 		called = true
 		return nil
 	})
-	err := d.Apply(context.Background(), testSink{}, monotonic.AggregateEvent{
+	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
 		AggregateType: "a",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "x"}},
 	})
@@ -155,8 +155,8 @@ func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 }
 
 func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
-	d := monotonic.NewDispatch[testSink]()
-	err := d.Apply(context.Background(), testSink{}, monotonic.AggregateEvent{
+	d := monotonic.NewDispatch[testModificationTx]()
+	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
 		AggregateType: "x",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "y"}},
 	})
@@ -277,7 +277,7 @@ func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
 	}
 
 	resetFuncCalled := false
-	if err := p.Reset(ctx, func(ctx context.Context, sink testSink) error {
+	if err := p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
 		resetFuncCalled = true
 		return nil
 	}); err != nil {
@@ -319,7 +319,7 @@ func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
 	}
 
 	wantErr := errors.New("reset boom")
-	err = p.Reset(ctx, func(ctx context.Context, sink testSink) error {
+	err = p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
 		return wantErr
 	})
 	if err == nil {
