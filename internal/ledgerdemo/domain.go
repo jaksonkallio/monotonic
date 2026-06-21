@@ -39,13 +39,13 @@ type TransferCompletedPayload struct {
 	Amount      int64
 }
 
-// account is a minimal aggregate that tracks balance for ShouldAccept invariants.
-type account struct {
+// Account is a minimal aggregate that tracks balance for ShouldAccept invariants.
+type Account struct {
 	*monotonic.AggregateBase
 	Balance int64
 }
 
-func (a *account) Apply(event monotonic.AcceptedEvent) {
+func (a *Account) Apply(event monotonic.AcceptedEvent) {
 	switch event.Type {
 	case EventFundsDeposited:
 		if p, err := monotonic.ParsePayload[FundsMovedPayload](event); err == nil {
@@ -58,7 +58,7 @@ func (a *account) Apply(event monotonic.AcceptedEvent) {
 	}
 }
 
-func (a *account) ShouldAccept(event monotonic.Event) error {
+func (a *Account) ShouldAccept(event monotonic.Event) error {
 	if event.Type == EventFundsWithdrawn {
 		p, err := monotonic.ParsePayload[FundsMovedPayload](monotonic.AcceptedEvent{Event: event})
 		if err != nil {
@@ -71,24 +71,25 @@ func (a *account) ShouldAccept(event monotonic.Event) error {
 	return nil
 }
 
-// loadAccount hydrates an account aggregate from the store.
-func loadAccount(ctx context.Context, store monotonic.Store, id string) (*account, error) {
-	return monotonic.Hydrate(ctx, store, AggregateAccount, id, func(base *monotonic.AggregateBase) *account {
-		return &account{AggregateBase: base}
+// LoadAccount hydrates an Account aggregate from the store.
+func LoadAccount(ctx context.Context, store monotonic.Store, id string) (*Account, error) {
+	return monotonic.Hydrate(ctx, store, AggregateAccount, id, func(base *monotonic.AggregateBase) *Account {
+		return &Account{AggregateBase: base}
 	})
 }
 
-// transfer is a minimal aggregate; transfers are immutable once completed.
-type transfer struct {
+// Transfer is a minimal aggregate; transfers are immutable once completed.
+type Transfer struct {
 	*monotonic.AggregateBase
 }
 
-func (t *transfer) Apply(event monotonic.AcceptedEvent) {}
+func (t *Transfer) Apply(event monotonic.AcceptedEvent) {}
 
-func (t *transfer) ShouldAccept(event monotonic.Event) error { return nil }
+func (t *Transfer) ShouldAccept(event monotonic.Event) error { return nil }
 
-func loadTransfer(ctx context.Context, store monotonic.Store, id string) (*transfer, error) {
-	return monotonic.Hydrate(ctx, store, AggregateTransfer, id, func(base *monotonic.AggregateBase) *transfer {
-		return &transfer{AggregateBase: base}
+// LoadTransfer hydrates a Transfer aggregate from the store.
+func LoadTransfer(ctx context.Context, store monotonic.Store, id string) (*Transfer, error) {
+	return monotonic.Hydrate(ctx, store, AggregateTransfer, id, func(base *monotonic.AggregateBase) *Transfer {
+		return &Transfer{AggregateBase: base}
 	})
 }

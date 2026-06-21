@@ -3,63 +3,103 @@ package monotonic
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 )
 
+// DefaultUpdateBatchSize is a sensible default maximum number of events loaded per Update call.
+const DefaultUpdateBatchSize = 100
+
+// ProjectorBackend is the store-specific glue that runs each event atomically alongside
+// the projector's resume-counter advance. Implementations open a transaction (or equivalent),
+// inject backend resources into the ctx passed to apply, and commit only if apply succeeds.
+type ProjectorBackend interface {
+	// GetState returns the resume counter for projectorName, or 0 if none.
+	GetState(ctx context.Context, projectorName string) (uint64, error)
+
+	// RunEvent runs apply and records (projectorName, counter) atomically.
+	// On apply error, neither the handler's writes nor the state advance are committed.
+	RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context) error) error
+}
+
+// Projector reads events from a Store and dispatches each one through a Dispatch,
+// using a ProjectorBackend to commit the handler's work atomically with the counter advance.
+type Projector struct {
+	// name identifies this projector in the backend's state store.
+	name string
+	// store is the event source the projector reads from.
+	store Store
+	// dispatch routes events to handlers and supplies EventFilters.
+	dispatch *Dispatch
+	// backend runs each event atomically with the counter advance.
+	backend ProjectorBackend
+	// mu serializes Update calls and protects counter.
+	mu sync.Mutex
+	// counter is the resume position; events with global_counter > this are pending.
+	counter uint64
+	// updateBatchSize caps the number of events loaded per Update call.
+	updateBatchSize int
+}
+
+// NewProjector creates a Projector and derives its resume position from backend.GetState.
+func NewProjector(
+	ctx context.Context,
+	name string,
+	store Store,
+	dispatch *Dispatch,
+	backend ProjectorBackend,
+	updateBatchSize int,
+) (*Projector, error) {
+	if name == "" {
+		return nil, fmt.Errorf("NewProjector: name must be non-empty")
+	}
+	if updateBatchSize <= 0 {
+		updateBatchSize = DefaultUpdateBatchSize
+	}
+	counter, err := backend.GetState(ctx, name)
+	if err != nil {
+		return nil, fmt.Errorf("init projector %q: %w", name, err)
+	}
+	return &Projector{
+		name:            name,
+		store:           store,
+		dispatch:        dispatch,
+		backend:         backend,
+		counter:         counter,
+		updateBatchSize: updateBatchSize,
+	}, nil
+}
+
 // Update processes a batch of pending events and returns the count, or 0 if caught up.
-func (p *Projector[V]) Update(ctx context.Context) (int, error) {
+func (p *Projector) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.logic.EventFilters(), int64(p.globalCounter), p.updateBatchSize)
+	events, err := p.store.LoadGlobalEvents(ctx, p.dispatch.EventFilters(), int64(p.counter), p.updateBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}
 
 	processed := 0
 	for _, event := range events {
-		updates, err := p.logic.Apply(ctx, p.persistence, event)
+		counter := uint64(event.Event.GlobalCounter)
+		err := p.backend.RunEvent(ctx, p.name, counter, func(ctx context.Context) error {
+			return p.dispatch.Apply(ctx, event)
+		})
 		if err != nil {
 			return processed, fmt.Errorf("apply event %d: %w", event.Event.GlobalCounter, err)
 		}
-
-		// One Set per event keeps the batch atomic; on failure globalCounter does not advance, so retry replays.
-		if err := p.persistence.Set(ctx, updates, uint64(event.Event.GlobalCounter)); err != nil {
-			return processed, fmt.Errorf("persist event %d: %w", event.Event.GlobalCounter, err)
-		}
-
-		p.globalCounter = uint64(event.Event.GlobalCounter)
+		p.counter = counter
 		processed++
 	}
 
 	return processed, nil
 }
 
-// Rebuild truncates the projection and replays all events from the beginning.
-func (p *Projector[V]) Rebuild(ctx context.Context) error {
-	p.mu.Lock()
-	if err := p.persistence.Truncate(ctx); err != nil {
-		p.mu.Unlock()
-		return fmt.Errorf("truncate projection: %w", err)
-	}
-	p.globalCounter = 0
-	p.mu.Unlock()
-
-	for {
-		n, err := p.Update(ctx)
-		if err != nil {
-			return fmt.Errorf("rebuild replay: %w", err)
-		}
-		if n == 0 {
-			return nil
-		}
-	}
-}
-
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.
-func (p *Projector[V]) Run(ctx context.Context, pollInterval time.Duration) error {
+func (p *Projector) Run(ctx context.Context, pollInterval time.Duration) error {
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -87,14 +127,19 @@ func (p *Projector[V]) Run(ctx context.Context, pollInterval time.Duration) erro
 }
 
 // GlobalCounter returns the highest global counter the projector has processed.
-func (p *Projector[V]) GlobalCounter() uint64 {
+func (p *Projector) GlobalCounter() uint64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.globalCounter
+	return p.counter
+}
+
+// Name returns the projector name used in the backend's state store.
+func (p *Projector) Name() string {
+	return p.name
 }
 
 // ProjectorRunner is implemented by any projector that can be driven by RunProjectors.
-// *Projector[V] satisfies this interface automatically.
+// *Projector satisfies this interface automatically.
 type ProjectorRunner interface {
 	Run(ctx context.Context, pollInterval time.Duration) error
 }
