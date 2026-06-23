@@ -95,8 +95,12 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 	}
 
 	var a, b int64
-	sharedPool.QueryRow(ctx, `SELECT n FROM proj_a WHERE k = 'x'`).Scan(&a)
-	sharedPool.QueryRow(ctx, `SELECT n FROM proj_b WHERE k = 'x'`).Scan(&b)
+	if err := sharedPool.QueryRow(ctx, `SELECT n FROM proj_a WHERE k = 'x'`).Scan(&a); err != nil {
+		t.Fatalf("query proj_a: %v", err)
+	}
+	if err := sharedPool.QueryRow(ctx, `SELECT n FROM proj_b WHERE k = 'x'`).Scan(&b); err != nil {
+		t.Fatalf("query proj_b: %v", err)
+	}
 	if a != 2 || b != 2 {
 		t.Errorf("expected both tables to show 2 events, got a=%d b=%d", a, b)
 	}
@@ -129,8 +133,11 @@ func TestProjectorBackend_RollsBackOnHandlerError(t *testing.T) {
 
 	appendTestEvent(t, store, "x", 1, "did")
 
-	p, _ := monotonic.NewProjector(ctx, "rb", store, dispatch, backend, 0)
-	_, err := p.Update(ctx)
+	p, err := monotonic.NewProjector(ctx, "rb", store, dispatch, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	_, err = p.Update(ctx)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
 	}
@@ -166,8 +173,11 @@ func TestProjectorBackend_ResumeFromStoredCounter(t *testing.T) {
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p1, _ := monotonic.NewProjector(ctx, "resume", store, dispatch, backend, 0)
-	if n, _ := p1.Update(ctx); n != 2 {
+	p1, err := monotonic.NewProjector(ctx, "resume", store, dispatch, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if n, err := p1.Update(ctx); err != nil || n != 2 {
 		t.Fatalf("first Update n=%d, want 2", n)
 	}
 

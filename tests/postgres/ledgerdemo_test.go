@@ -40,14 +40,20 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	if err := alice.AcceptThenApply(ctx, monotonic.NewEvent(ledgerdemo.EventAccountOpened, ledgerdemo.AccountOpenedPayload{HolderName: "Alice"})); err != nil {
 		t.Fatalf("open alice: %v", err)
 	}
-	bob, _ := ledgerdemo.LoadAccount(ctx, store, "bob")
+	bob, err := ledgerdemo.LoadAccount(ctx, store, "bob")
+	if err != nil {
+		t.Fatalf("load bob: %v", err)
+	}
 	if err := bob.AcceptThenApply(ctx, monotonic.NewEvent(ledgerdemo.EventAccountOpened, ledgerdemo.AccountOpenedPayload{HolderName: "Bob"})); err != nil {
 		t.Fatalf("open bob: %v", err)
 	}
 	if err := alice.AcceptThenApply(ctx, monotonic.NewEvent(ledgerdemo.EventFundsDeposited, ledgerdemo.FundsMovedPayload{Amount: 100})); err != nil {
 		t.Fatalf("deposit alice: %v", err)
 	}
-	xfer, _ := ledgerdemo.LoadTransfer(ctx, store, "xfer-1")
+	xfer, err := ledgerdemo.LoadTransfer(ctx, store, "xfer-1")
+	if err != nil {
+		t.Fatalf("load transfer: %v", err)
+	}
 	if err := xfer.AcceptThenApply(ctx, monotonic.NewEvent(ledgerdemo.EventTransferCompleted, ledgerdemo.TransferCompletedPayload{
 		FromAccount: "alice", ToAccount: "bob", Amount: 30,
 	})); err != nil {
@@ -76,8 +82,12 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	// Verify per-account balances.
 	var aliceBal, bobBal int64
 	var aliceName, bobName string
-	sharedPool.QueryRow(ctx, `SELECT holder_name, balance FROM account_balances WHERE account_id = 'alice'`).Scan(&aliceName, &aliceBal)
-	sharedPool.QueryRow(ctx, `SELECT holder_name, balance FROM account_balances WHERE account_id = 'bob'`).Scan(&bobName, &bobBal)
+	if err := sharedPool.QueryRow(ctx, `SELECT holder_name, balance FROM account_balances WHERE account_id = 'alice'`).Scan(&aliceName, &aliceBal); err != nil {
+		t.Fatalf("query alice balance: %v", err)
+	}
+	if err := sharedPool.QueryRow(ctx, `SELECT holder_name, balance FROM account_balances WHERE account_id = 'bob'`).Scan(&bobName, &bobBal); err != nil {
+		t.Fatalf("query bob balance: %v", err)
+	}
 	if aliceBal != 50 {
 		t.Errorf("alice balance: want 50, got %d", aliceBal)
 	}
@@ -95,10 +105,12 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	var stats struct {
 		AccountsOpened, TotalDeposited, TotalWithdrawn, TransfersCompleted, TotalTransferAmount int64
 	}
-	sharedPool.QueryRow(ctx, `
+	if err := sharedPool.QueryRow(ctx, `
 		SELECT accounts_opened, total_deposited, total_withdrawn, transfers_completed, total_transfer_amount
 		FROM ledger_stats WHERE id = 1
-	`).Scan(&stats.AccountsOpened, &stats.TotalDeposited, &stats.TotalWithdrawn, &stats.TransfersCompleted, &stats.TotalTransferAmount)
+	`).Scan(&stats.AccountsOpened, &stats.TotalDeposited, &stats.TotalWithdrawn, &stats.TransfersCompleted, &stats.TotalTransferAmount); err != nil {
+		t.Fatalf("query ledger_stats: %v", err)
+	}
 
 	if stats.AccountsOpened != 2 || stats.TotalDeposited != 100 || stats.TotalWithdrawn != 20 ||
 		stats.TransfersCompleted != 1 || stats.TotalTransferAmount != 30 {
@@ -117,7 +129,9 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	if n, err := resumed.Update(ctx); err != nil || n != 1 {
 		t.Errorf("resumed Update n=%d err=%v, want n=1", n, err)
 	}
-	sharedPool.QueryRow(ctx, `SELECT balance FROM account_balances WHERE account_id = 'alice'`).Scan(&aliceBal)
+	if err := sharedPool.QueryRow(ctx, `SELECT balance FROM account_balances WHERE account_id = 'alice'`).Scan(&aliceBal); err != nil {
+		t.Fatalf("query alice balance after resume: %v", err)
+	}
 	if aliceBal != 55 {
 		t.Errorf("alice balance after resume: want 55, got %d", aliceBal)
 	}
