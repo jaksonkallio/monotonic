@@ -4,46 +4,102 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// --- test helpers ---
+// testModificationTx is the trivial ModificationTx type the unit tests parameterize over; handlers
+// don't actually need any per-event environment, so a struct{} suffices.
+type testModificationTx struct{}
 
-// noopLogic satisfies ProjectorLogic but does nothing.
-type noopLogic[V any] struct{}
-
-func (noopLogic[V]) EventFilters() []monotonic.EventFilter {
-	return []monotonic.EventFilter{{AggregateType: "test"}}
-}
-func (noopLogic[V]) Apply(_ context.Context, _ monotonic.ProjectionReader[V], _ monotonic.AggregateEvent) ([]monotonic.Projected[V], error) {
-	return nil, nil
-}
-
-// countingLogic counts Apply calls and emits one update per event.
-type countingLogic struct{ applied int }
-
-func (l *countingLogic) EventFilters() []monotonic.EventFilter {
-	return []monotonic.EventFilter{{AggregateType: "test"}}
-}
-func (l *countingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.Projected[int], error) {
-	l.applied++
-	return []monotonic.Projected[int]{{Key: monotonic.ProjectionKeySummary, Value: l.applied}}, nil
+// fakeBackend is an in-memory monotonic.ProjectorBackend[testModificationTx] used by projector unit tests.
+// It records per-projector counters and exposes hooks for failure injection.
+type fakeBackend struct {
+	mu          sync.Mutex
+	state       map[string]uint64
+	failOnEvent uint64 // if non-zero, RunEvent returns failErr for this counter
+	failErr     error
+	runCalls    int
+	resetErr    error // if non-nil, ResetState returns this error without resetting state
+	resetCalls  int
 }
 
-// failingLogic always returns an error from Apply.
-type failingLogic struct{ err error }
-
-func (l *failingLogic) EventFilters() []monotonic.EventFilter {
-	return []monotonic.EventFilter{{AggregateType: "test"}}
-}
-func (l *failingLogic) Apply(_ context.Context, _ monotonic.ProjectionReader[int], _ monotonic.AggregateEvent) ([]monotonic.Projected[int], error) {
-	return nil, l.err
+func newFakeBackend() *fakeBackend {
+	return &fakeBackend{state: make(map[string]uint64)}
 }
 
-// emitEvent appends a single event to the store for aggregate "test"/"agg-1".
+func (b *fakeBackend) GetState(_ context.Context, projectorName string) (uint64, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state[projectorName], nil
+}
+
+func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx testModificationTx) error) error {
+	b.mu.Lock()
+	b.runCalls++
+	shouldFail := b.failOnEvent != 0 && counter == b.failOnEvent
+	b.mu.Unlock()
+
+	if shouldFail {
+		return b.failErr
+	}
+	if err := apply(ctx, testModificationTx{}); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.state[projectorName] = counter
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx testModificationTx) error) error {
+	b.mu.Lock()
+	b.resetCalls++
+	b.mu.Unlock()
+
+	if b.resetErr != nil {
+		return b.resetErr
+	}
+	if err := reset(ctx, testModificationTx{}); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.state[projectorName] = 0
+	b.mu.Unlock()
+	return nil
+}
+
+func (b *fakeBackend) seed(projectorName string, counter uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.state[projectorName] = counter
+}
+
+// countingDispatch returns a Dispatch that counts handler invocations.
+type counterRef struct{ n int }
+
+func countingDispatch(c *counterRef) *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+		c.n++
+		return nil
+	})
+}
+
+func failingDispatch(err error) *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+		return err
+	})
+}
+
+func noopDispatch() *monotonic.Dispatch[testModificationTx] {
+	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+		return nil
+	})
+}
+
 func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter int64) {
 	t.Helper()
 	err := store.Append(ctx, monotonic.AggregateEvent{
@@ -60,14 +116,64 @@ func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter
 	}
 }
 
+// --- Dispatch tests ---
+
+func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
+	d := monotonic.NewDispatch[testModificationTx]().
+		On("a", "x", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil }).
+		On("b", "y", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil })
+
+	filters := d.EventFilters()
+	if len(filters) != 2 {
+		t.Fatalf("expected 2 filters, got %d", len(filters))
+	}
+	seen := map[string]bool{}
+	for _, f := range filters {
+		seen[f.AggregateType+"/"+f.EventType] = true
+	}
+	if !seen["a/x"] || !seen["b/y"] {
+		t.Errorf("missing expected filters: %v", seen)
+	}
+}
+
+func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
+	called := false
+	d := monotonic.NewDispatch[testModificationTx]().On("a", "x", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+		called = true
+		return nil
+	})
+	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
+		AggregateType: "a",
+		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "x"}},
+	})
+	if err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !called {
+		t.Error("handler was not invoked")
+	}
+}
+
+func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
+	d := monotonic.NewDispatch[testModificationTx]()
+	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
+		AggregateType: "x",
+		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "y"}},
+	})
+	if err != nil {
+		t.Errorf("Apply on unregistered should be no-op, got %v", err)
+	}
+}
+
 // --- Projector tests ---
 
 func TestProjector_UpdateReturnsZeroWhenNoPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
+	backend := newFakeBackend()
+	cr := &counterRef{}
 
-	p, err := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -84,14 +190,13 @@ func TestProjector_UpdateReturnsZeroWhenNoPendingEvents(t *testing.T) {
 func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-
 	emitEvent(ctx, t, store, 1)
 	emitEvent(ctx, t, store, 2)
 	emitEvent(ctx, t, store, 3)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic := &countingLogic{}
-	p, err := monotonic.NewProjector(ctx, store, logic, persist, 0)
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -103,22 +208,8 @@ func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 	if n != 3 {
 		t.Errorf("expected 3 processed, got %d", n)
 	}
-	if logic.applied != 3 {
-		t.Errorf("logic.Apply called %d times, want 3", logic.applied)
-	}
-}
-
-func TestProjector_GlobalCounterIsZeroInitially(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-
-	p, err := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
-	if err != nil {
-		t.Fatalf("NewProjector: %v", err)
-	}
-	if p.GlobalCounter() != 0 {
-		t.Errorf("initial GlobalCounter should be 0, got %d", p.GlobalCounter())
+	if cr.n != 3 {
+		t.Errorf("handler called %d times, want 3", cr.n)
 	}
 }
 
@@ -128,9 +219,8 @@ func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 	emitEvent(ctx, t, store, 2)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	p, _ := monotonic.NewProjector(ctx, store, &countingLogic{}, persist, 0)
-
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(&counterRef{}), backend, 0)
 	p.Update(ctx)
 
 	if p.GlobalCounter() == 0 {
@@ -138,126 +228,169 @@ func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
 	}
 }
 
-func TestProjector_UpdateIsIdempotentWhenCaughtUp(t *testing.T) {
+func TestProjector_ResumesFromBackendState(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-	emitEvent(ctx, t, store, 1)
-
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic := &countingLogic{}
-	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
-
-	p.Update(ctx)
-
-	n, err := p.Update(ctx)
-	if err != nil {
-		t.Fatalf("second Update: %v", err)
-	}
-	if n != 0 {
-		t.Errorf("second Update should return 0 when caught up, got %d", n)
-	}
-	if logic.applied != 1 {
-		t.Errorf("Apply should have been called exactly once, got %d", logic.applied)
-	}
-}
-
-func TestProjector_ResumesFromExistingPersistenceState(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-
-	emitEvent(ctx, t, store, 1)
-	emitEvent(ctx, t, store, 2)
-
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic1 := &countingLogic{}
-	p1, _ := monotonic.NewProjector(ctx, store, logic1, persist, 0)
-	p1.Update(ctx)
-
-	// Append a new event AFTER p1 has caught up.
-	emitEvent(ctx, t, store, 3)
-
-	// A fresh projector against the same persistence should pick up only event 3.
-	logic2 := &countingLogic{}
-	p2, err := monotonic.NewProjector(ctx, store, logic2, persist, 0)
-	if err != nil {
-		t.Fatalf("resume NewProjector: %v", err)
-	}
-
-	n, err := p2.Update(ctx)
-	if err != nil {
-		t.Fatalf("resumed Update: %v", err)
-	}
-	if n != 1 {
-		t.Errorf("resumed projector should process exactly 1 new event, got %d", n)
-	}
-	if logic2.applied != 1 {
-		t.Errorf("resumed logic applied %d events, want 1", logic2.applied)
-	}
-}
-
-func TestProjector_NewProjectorReadsLatestGlobalCounterFromPersistence(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-
-	// Pre-populate persistence as if events 1–5 were already processed.
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: monotonic.ProjectionKeySummary, Value: 0}}, 5)
-
-	// Also emit 6 events into the store.
 	for i := int64(1); i <= 6; i++ {
 		emitEvent(ctx, t, store, i)
 	}
 
-	logic := &countingLogic{}
-	p, err := monotonic.NewProjector(ctx, store, logic, persist, 0)
+	backend := newFakeBackend()
+	backend.seed("p1", 5)
+
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
 	if p.GlobalCounter() != 5 {
-		t.Errorf("NewProjector should resume at counter 5, got %d", p.GlobalCounter())
+		t.Errorf("expected resume at counter 5, got %d", p.GlobalCounter())
 	}
 
-	// Only event 6 is pending.
 	n, _ := p.Update(ctx)
 	if n != 1 {
-		t.Errorf("expected 1 pending event, got %d", n)
+		t.Errorf("expected 1 pending event past counter 5, got %d", n)
+	}
+	if cr.n != 1 {
+		t.Errorf("handler should have been called for 1 event, got %d", cr.n)
 	}
 }
 
-func TestProjector_UpdatePropagatesApplyError(t *testing.T) {
+func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 3; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if p.GlobalCounter() != 3 {
+		t.Fatalf("expected counter 3 before reset, got %d", p.GlobalCounter())
+	}
+
+	resetFuncCalled := false
+	if err := p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
+		resetFuncCalled = true
+		return nil
+	}); err != nil {
+		t.Fatalf("Reset: %v", err)
+	}
+
+	if !resetFuncCalled {
+		t.Error("reset func was not invoked")
+	}
+	if p.GlobalCounter() != 0 {
+		t.Errorf("expected counter 0 after reset, got %d", p.GlobalCounter())
+	}
+	if got, _ := backend.GetState(ctx, "p1"); got != 0 {
+		t.Errorf("expected backend state 0 after reset, got %d", got)
+	}
+
+	n, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after reset: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("expected reset projector to replay all 3 events, got %d", n)
+	}
+}
+
+func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("apply boom")}, persist, 0)
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	wantErr := errors.New("reset boom")
+	err = p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
+		return wantErr
+	})
+	if err == nil {
+		t.Fatal("expected error from Reset when reset func fails")
+	}
+	if p.GlobalCounter() != 1 {
+		t.Errorf("counter must not change when reset func fails, got %d", p.GlobalCounter())
+	}
+}
+
+func TestProjector_UpdatePropagatesHandlerError(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(errors.New("apply boom")), backend, 0)
 
 	_, err := p.Update(ctx)
 	if err == nil {
-		t.Error("expected error from Update when Apply fails, got nil")
+		t.Error("expected error from Update when handler fails")
 	}
 }
 
-func TestProjector_UpdateDoesNotAdvanceCounterAfterApplyError(t *testing.T) {
+func TestProjector_CounterDoesNotAdvanceOnHandlerError(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("boom")}, persist, 0)
-
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(errors.New("boom")), backend, 0)
 	p.Update(ctx)
 
 	if p.GlobalCounter() != 0 {
-		t.Errorf("GlobalCounter must not advance after Apply error: got %d", p.GlobalCounter())
+		t.Errorf("GlobalCounter must not advance after handler error, got %d", p.GlobalCounter())
+	}
+	if got, _ := backend.GetState(ctx, "p1"); got != 0 {
+		t.Errorf("backend state must not advance after handler error, got %d", got)
+	}
+}
+
+func TestProjector_BackendErrorStopsBatch(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
+	emitEvent(ctx, t, store, 3)
+
+	backend := newFakeBackend()
+	backend.failOnEvent = 2
+	backend.failErr = errors.New("backend boom")
+	cr := &counterRef{}
+
+	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	processed, err := p.Update(ctx)
+	if err == nil {
+		t.Fatal("expected error from backend failure")
+	}
+	if processed != 1 {
+		t.Errorf("expected 1 processed before failure, got %d", processed)
+	}
+	if p.GlobalCounter() != 1 {
+		t.Errorf("counter should sit at last successful event (1), got %d", p.GlobalCounter())
 	}
 }
 
 func TestProjector_RunStopsOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store := monotonic.NewInMemoryStore()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	p, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, persist, 0)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector(ctx, "p1", store, noopDispatch(), backend, 0)
 
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx, time.Millisecond) }()
@@ -270,7 +403,7 @@ func TestProjector_RunStopsOnContextCancellation(t *testing.T) {
 			t.Errorf("Run should return nil on context cancel, got %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Error("Run did not stop within 2s after context cancellation")
+		t.Error("Run did not stop within 2s after cancellation")
 	}
 }
 
@@ -279,8 +412,8 @@ func TestProjector_RunReturnsErrorFromUpdate(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	p, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("run boom")}, persist, 0)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(fmt.Errorf("run boom")), backend, 0)
 
 	err := p.Run(ctx, time.Millisecond)
 	if err == nil {
@@ -289,9 +422,6 @@ func TestProjector_RunReturnsErrorFromUpdate(t *testing.T) {
 }
 
 func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
-	// Emit many events and verify they are all processed in a single Run that
-	// does NOT use a long poll interval — if Run slept between each event the
-	// test would time out.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -301,16 +431,14 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 		emitEvent(ctx, t, store, i)
 	}
 
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic := &countingLogic{}
-	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
 
-	// Poll every 10s — if Run sleeps between events it would time out.
 	go func() {
 		p.Run(ctx, 10*time.Second)
 	}()
 
-	// Wait until all events are processed or timeout.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if p.GlobalCounter() == numEvents {
@@ -320,73 +448,17 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 	}
 
 	if p.GlobalCounter() != uint64(numEvents) {
-		t.Errorf("Run processed %d events, want %d", p.GlobalCounter(), numEvents)
+		t.Errorf("processed counter=%d, want %d", p.GlobalCounter(), numEvents)
 	}
 }
 
-// --- Rebuild tests ---
-
-func TestProjector_RebuildReplaysAllEvents(t *testing.T) {
+func TestProjector_NameRequired(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
-
-	emitEvent(ctx, t, store, 1)
-	emitEvent(ctx, t, store, 2)
-	emitEvent(ctx, t, store, 3)
-
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic := &countingLogic{}
-	p, err := monotonic.NewProjector(ctx, store, logic, persist, 0)
-	if err != nil {
-		t.Fatalf("NewProjector: %v", err)
-	}
-
-	// Catch up first.
-	if _, err := p.Update(ctx); err != nil {
-		t.Fatalf("Update: %v", err)
-	}
-	if logic.applied != 3 {
-		t.Fatalf("expected 3 applies before rebuild, got %d", logic.applied)
-	}
-
-	// Rebuild should replay all events from scratch.
-	logic.applied = 0
-	if err := p.Rebuild(ctx); err != nil {
-		t.Fatalf("Rebuild: %v", err)
-	}
-	if logic.applied != 3 {
-		t.Errorf("expected 3 applies after rebuild, got %d", logic.applied)
-	}
-	if p.GlobalCounter() != 3 {
-		t.Errorf("expected GlobalCounter=3 after rebuild, got %d", p.GlobalCounter())
-	}
-}
-
-func TestProjector_RebuildClearsPersistence(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-	emitEvent(ctx, t, store, 1)
-
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	logic := &countingLogic{}
-	p, _ := monotonic.NewProjector(ctx, store, logic, persist, 0)
-	p.Update(ctx)
-
-	// Verify data exists.
-	val, _ := persist.Get(ctx, monotonic.ProjectionKeySummary)
-	if val == 0 {
-		t.Fatal("expected non-zero value before rebuild")
-	}
-
-	// After rebuild, the projection should have been truncated and re-populated.
-	logic.applied = 0
-	if err := p.Rebuild(ctx); err != nil {
-		t.Fatalf("Rebuild: %v", err)
-	}
-
-	val, _ = persist.Get(ctx, monotonic.ProjectionKeySummary)
-	if val != 1 {
-		t.Errorf("expected value=1 after rebuild, got %d", val)
+	backend := newFakeBackend()
+	_, err := monotonic.NewProjector(ctx, "", store, noopDispatch(), backend, 0)
+	if err == nil {
+		t.Error("expected error when name is empty")
 	}
 }
 
@@ -395,16 +467,16 @@ func TestProjector_RebuildClearsPersistence(t *testing.T) {
 func TestRunProjectors_AllStopOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
 
-	makeProjector := func() monotonic.ProjectorRunner {
-		persist := monotonic.NewInMemoryProjectionPersistence[int]()
-		p, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, persist, 0)
+	makeProjector := func(name string) monotonic.ProjectorRunner {
+		p, _ := monotonic.NewProjector(ctx, name, store, noopDispatch(), backend, 0)
 		return p
 	}
 
 	done := make(chan error, 1)
 	go func() {
-		done <- monotonic.RunProjectors(ctx, time.Millisecond, makeProjector(), makeProjector(), makeProjector())
+		done <- monotonic.RunProjectors(ctx, time.Millisecond, makeProjector("a"), makeProjector("b"), makeProjector("c"))
 	}()
 
 	cancel()
@@ -424,82 +496,12 @@ func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
-	failPersist := monotonic.NewInMemoryProjectionPersistence[int]()
-	failP, _ := monotonic.NewProjector(ctx, store, &failingLogic{err: fmt.Errorf("fail")}, failPersist, 0)
-
-	okPersist := monotonic.NewInMemoryProjectionPersistence[int]()
-	okP, _ := monotonic.NewProjector(ctx, store, noopLogic[int]{}, okPersist, 0)
+	backend := newFakeBackend()
+	failP, _ := monotonic.NewProjector(ctx, "fail", store, failingDispatch(errors.New("fail")), backend, 0)
+	okP, _ := monotonic.NewProjector(ctx, "ok", store, noopDispatch(), backend, 0)
 
 	err := monotonic.RunProjectors(ctx, time.Millisecond, failP, okP)
 	if err == nil {
 		t.Error("expected error when one projector fails")
-	}
-}
-
-// --- MutateByKey tests ---
-
-func TestMutateByKey_AppliesZeroValueWhenKeyMissing(t *testing.T) {
-	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-
-	updates, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
-		*v += 10
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("MutateByKey: %v", err)
-	}
-	if len(updates) != 1 {
-		t.Fatalf("expected 1 update, got %d", len(updates))
-	}
-	if updates[0].Key != "k" || updates[0].Value != 10 {
-		t.Errorf("unexpected update: %+v", updates[0])
-	}
-}
-
-func TestMutateByKey_ReadsExistingValueBeforeMutating(t *testing.T) {
-	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 5}}, 1)
-
-	updates, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
-		*v += 10
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("MutateByKey: %v", err)
-	}
-	if updates[0].Value != 15 {
-		t.Errorf("expected 15 (5+10), got %d", updates[0].Value)
-	}
-}
-
-func TestMutateByKey_PropagatesMutationError(t *testing.T) {
-	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-
-	_, err := monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
-		return errors.New("mutation failed")
-	})
-	if err == nil {
-		t.Error("expected error from mutate function, got nil")
-	}
-}
-
-func TestMutateByKey_DoesNotMutateReaderOnError(t *testing.T) {
-	ctx := context.Background()
-	persist := monotonic.NewInMemoryProjectionPersistence[int]()
-	persist.Set(ctx, []monotonic.Projected[int]{{Key: "k", Value: 42}}, 1)
-
-	monotonic.MutateByKey(ctx, persist, "k", func(v *int) error {
-		*v = 999
-		return errors.New("mutation rejected")
-	})
-
-	// The returned updates are discarded (caller never calls Set). The reader
-	// must still hold the original value.
-	val, _ := persist.Get(ctx, "k")
-	if val != 42 {
-		t.Errorf("reader must not change when mutate errors: got %d", val)
 	}
 }
