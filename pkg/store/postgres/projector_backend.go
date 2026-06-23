@@ -123,7 +123,9 @@ func (b *ProjectorBackend) RunEvent(
 	return nil
 }
 
-// ResetState opens a tx, hands it to reset, sets projector_state back to 0, and commits.
+// ResetState opens a tx, locks projector_state for projectorName, hands the tx to reset, sets
+// projector_state back to 0, and commits. The row lock serializes against concurrent RunEvent
+// calls for the same projectorName, so reset cannot race with an in-flight apply.
 func (b *ProjectorBackend) ResetState(
 	ctx context.Context,
 	projectorName string,
@@ -135,17 +137,18 @@ func (b *ProjectorBackend) ResetState(
 	}
 	defer tx.Rollback(ctx)
 
+	if _, err := lockState(ctx, tx, projectorName); err != nil {
+		return err
+	}
+
 	if err := reset(ctx, tx); err != nil {
 		return err
 	}
 
-	_, err = tx.Exec(ctx, `
-		INSERT INTO projector_state (projector_name, global_counter, updated_at)
-		VALUES ($1, 0, now())
-		ON CONFLICT (projector_name) DO UPDATE
-		SET global_counter = 0, updated_at = now()
-	`, projectorName)
-	if err != nil {
+	if _, err := tx.Exec(ctx,
+		`UPDATE projector_state SET global_counter = 0, updated_at = now() WHERE projector_name = $1`,
+		projectorName,
+	); err != nil {
 		return fmt.Errorf("reset projector_state for %q: %w", projectorName, err)
 	}
 
