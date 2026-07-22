@@ -107,7 +107,7 @@ func main() {
 	)
 
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
-	// Projections need some "backend" implementation... here's we're using an in-memory projection, but production typically would use a Postgres backend.
+	// Projections need some "backend" implementation... here we're using an in-memory projection, but production typically would use a Postgres backend.
 	summaries := m.NewInMemoryProjection[AccountSummary]()
 	projector, _ := m.NewProjector(ctx, "account-summary", store, NewAccountSummaryDispatch(), summaries, 0)
 	projector.Update(ctx)
@@ -211,8 +211,7 @@ type AccountSummary struct {
 	Closed     bool
 }
 
-// NewAccountSummaryDispatch builds a dispatch that routes each account event type to its projection handler.
-// Handlers write into the backend's per-event transaction; here that's an in-memory table of AccountSummary rows.
+// NewAccountSummaryDispatch builds a dispatch that routes each account event type to a projection handler.
 func NewAccountSummaryDispatch() *m.Dispatch[*m.InMemoryProjectionTx[AccountSummary]] {
 	return m.NewDispatch[*m.InMemoryProjectionTx[AccountSummary]]().
 		On("account", "account-opened", applyAccountOpened).
