@@ -80,7 +80,7 @@ func main() {
 	fmt.Println(fresh.Balance)    // 70
 
 	// Close the account, this sets the closed flag and drains the balance to zero.
-	fresh.AcceptThenApply(ctx, m.NewEvent("account-closed", nil))
+	fresh.AcceptThenApply(ctx, m.NewEvent[any]("account-closed", nil))
 	fmt.Println(fresh.Balance) // 0
 	fmt.Println(fresh.Closed)  // true
 
@@ -107,18 +107,19 @@ func main() {
 	)
 
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
-	summaries := m.NewInMemoryProjectionPersistence[AccountSummary]()
-	projector, _ := m.NewProjector(ctx, store, NewAccountSummaryLogic(), summaries)
+	// Projections need some "backend" implementation... here's we're using an in-memory projection, but production typically would use a Postgres backend.
+	summaries := m.NewInMemoryProjection[AccountSummary]()
+	projector, _ := m.NewProjector(ctx, "account-summary", store, NewAccountSummaryDispatch(), summaries, 0)
 	projector.Update(ctx)
 
-	// Projected rows, from our account summary projection logic.
-	// This could be persisted as a plain ol' Postgres table, Redis key value, in-memory table, etc. for easy querying/reading.
-	// One common pattern is to persist projection as a Postgres table and use something like `sqlc` to generate type-safe read queries.
 	// | key   | HolderName | Balance | Closed |
 	// |-------|------------|---------|--------|
 	// | alice | Alice      | 0       | true   |
 	// | bob   | Bob        | 175     | false  |
 	// | carol | Carol      | 75      | false  |
+	for key, summary := range summaries.All() {
+		fmt.Printf("%s: %+v\n", key, summary)
+	}
 }
 
 // Account aggregate representing a bank account.
@@ -210,58 +211,53 @@ type AccountSummary struct {
 	Closed     bool
 }
 
-// NewAccountSummaryLogic builds a dispatch that routes each account event type to its projection handler.
-func NewAccountSummaryLogic() m.ProjectorLogic[AccountSummary] {
-	return m.NewDispatch[AccountSummary]().
+// NewAccountSummaryDispatch builds a dispatch that routes each account event type to its projection handler.
+// Handlers write into the backend's per-event transaction; here that's an in-memory table of AccountSummary rows.
+func NewAccountSummaryDispatch() *m.Dispatch[*m.InMemoryProjectionTx[AccountSummary]] {
+	return m.NewDispatch[*m.InMemoryProjectionTx[AccountSummary]]().
 		On("account", "account-opened", applyAccountOpened).
 		On("account", "funds-deposited", applyFundsDeposited).
 		On("account", "funds-withdrawn", applyFundsWithdrawn).
 		On("account", "account-closed", applyAccountClosed)
 }
 
-func applyAccountOpened(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyAccountOpened(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[AccountOpened](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return []m.Projected[AccountSummary]{
-		{
-			Key: m.ProjectionKey(event.AggregateID),
-			Value: AccountSummary{
-				HolderName: p.HolderName
-			}
-		}
-	}, nil
+	tx.Set(event.AggregateID, AccountSummary{HolderName: p.HolderName})
+	return nil
 }
 
-func applyFundsDeposited(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyFundsDeposited(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[FundsMoved](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance += p.Amount
-		return nil
-	})
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance += p.Amount
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 
-func applyFundsWithdrawn(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyFundsWithdrawn(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[FundsMoved](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance -= p.Amount
-		return nil
-	})
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance -= p.Amount
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 
-func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance = 0
-		s.Closed = true
-		return nil
-	})
+func applyAccountClosed(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance = 0
+	summary.Closed = true
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 ```
 
