@@ -14,6 +14,14 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
+// Advisory lock keys used to serialize global_counter assignment; see Append.
+// The two-int4 form of pg_advisory_xact_lock occupies a lock space distinct from the single-bigint form, so these keys cannot collide with an application's own advisory locks in the same database.
+// globalOrderLockClass spells "MONO" in ASCII, which makes the lock recognizable in pg_locks.
+const (
+	globalOrderLockClass = 0x4D4F4E4F
+	globalOrderLockKey   = 1
+)
+
 // Store is a Postgres-backed implementation of monotonic.Store.
 type Store struct {
 	pool *pgxpool.Pool
@@ -114,6 +122,11 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 			)
 		}
 		eventsInBatch[key]++
+	}
+
+	// Serialize global_counter assignment so that sequence order is commit order.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, globalOrderLockClass, globalOrderLockKey); err != nil {
+		return fmt.Errorf("acquire global order lock: %w", err)
 	}
 
 	for _, ae := range events {

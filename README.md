@@ -267,7 +267,7 @@ func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSu
 
 ## Benchmarks
 
-TL;DR about scalability of Monotonic: Under realistic load, projection lag stays in the single-digit-millisecond range, optimistic concurrency retries are cheap and bounded, and a single Postgres instance handles tens of thousands of events per second.
+TL;DR about scalability of Monotonic: Under realistic load, projection lag stays in the single-digit-millisecond range and optimistic concurrency retries are cheap and bounded. A single Postgres instance handles low thousands of events per second, bounded primarily by global event ordering.
 
 Two common concerns with scalability of event sourced systems is whether the optimistic concurrency will kill throughput under contention, and also the staleness of projections reacting to a high-volume event stream. Here are some benchmarks to test these scenarios and provide some real numbers. These were collected on a MacBook Pro M1 against an in-memory store to isolate just the frameworks itself, Postgres store figures would be higher (there are also Postgres benchmarks in `tests/postgres`). This is just the benchmark of one single machine, try running them yourself with `make bench`!
 
@@ -303,16 +303,15 @@ In a realistic-load row (100 aggregates, Pareto-ish skew, 8 concurrent writers),
 
 The previous benchmarks were against an in-memory store to isolate performance of just the framework itself. In real applications, you'll likely be using a store backed by Postgres or some other mature database implementation. Here are some similar benchmarks running against a real Postgres 16 instance in a test container. You can run these yourself with `make bench-integration`, assuming you've got Docker running.
 
-A single writer doing one event at a time lands at around 1.1ms per event, which is mostly the cost of the Postgres transaction itself (begin, counter validation select, insert, commit). Throughput scales as you add concurrent writers hitting different aggregates:
+A single writer doing one event at a time lands at around 1.5ms per event, which is mostly the cost of the Postgres transaction itself (begin, counter validation select, advisory lock, insert, commit).
 
 | Concurrency | Latency per op | Aggregate throughput |
 |-------------|----------------|----------------------|
-| 1           | 1.08ms         | 930 e/s              |
-| 2           | 650μs          | 3,080 e/s            |
-| 4           | 422μs          | 9,490 e/s            |
-| 8           | 302μs          | 26,500 e/s           |
+| 1           | 1.46ms         | 685 e/s              |
+| 4           | 647μs          | 1,545 e/s            |
+| 8           | 661μs          | 1,510 e/s            |
 
-With 8 writers connected to a single Postgres instance, you're looking at handling mid-tens-of-thousands of events per second.
+These numbers come from a Postgres 16 test container started with `fsync=off`, so treat them as an upper bound. On durable storage the absolute numbers drop and the relative cost of serialization rises.
 
 Under worst-case optimistic concurrency with all writers contending for a single aggregate (significantly worse case than the Zipfian benchmark above), latency degrades gracefully:
 
@@ -332,7 +331,7 @@ Hydration time is the time required to load all events of an aggregate for repla
 
 ## Avoid Monotonic If...
 
-**If you need more than 30,000 events per second of sustained write throughput**, because at this point you've outgrown a single Postgres instance. Monotonic funnels every event write through one global event log, which is what makes the optimistic concurrency model possible.
+**If you need more than a couple of thousand events per second of sustained write throughput**, because Monotonic funnels every event write through one global event log and serializes assignment of positions in it. That is what makes both the optimistic concurrency model and correct projection resumption possible, and it caps a single Postgres instance in the low thousands of events per second. Batching several events into one `Append` call amortizes the cost if your writes arrive in groups.
 
 **If your aggregates individually accumulate 10,000+ events over their lifetime**, because Monotonic hydrates the full aggregate state by replaying all of its events. This time scales linearly (see above benchmark) but at a certain point it becomes user-perceptible. You can always roll-forward aggregates to prune history where performance is important, but this isn't a built-in feature of Monotonic (yet).
 
