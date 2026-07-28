@@ -269,6 +269,8 @@ You can implement your own store as long as the store is capable of enforcing:
 
 The reason for this is that projectors (or any event log reader) will need to be able to poll for new events from the event log via `global_counter > $n`. Visibility order must match actual global counter order. This strict visibility = actual order is a guarantee we provide to event log readers so that they can poll for new events with a cursor safely.
 
+Gaps in the global counter are acceptable. Gaps can happen when event batches are rolled back due to optimistic concurrency rejections.
+
 SQL database auto-increment implementations (such as Postgres BIGSERIAL, MySQL AUTO_INCREMENT, SQLite AUTOINCREMENT) typically do NOT satisfy these requirements on their own, because the value is determined at call time, but commit time is what determines visibility of the values. These auto-increment implementations can be used as long as the commit ordering is enforced by some other mechanism.
 
 Without this, the failure case example would be:
