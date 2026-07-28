@@ -14,6 +14,14 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
+// Advisory lock keys used to serialize global_counter assignment; see Append.
+// The two-int4 form of pg_advisory_xact_lock occupies a lock space distinct from the single-bigint form, so these keys cannot collide with an application's own advisory locks in the same database.
+// globalOrderLockClass spells "MONO" in ASCII, which makes the lock recognizable in pg_locks.
+const (
+	globalOrderLockClass = 0x4D4F4E4F
+	globalOrderLockKey   = 1
+)
+
 // Store is a Postgres-backed implementation of monotonic.Store.
 type Store struct {
 	pool *pgxpool.Pool
@@ -114,6 +122,16 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 			)
 		}
 		eventsInBatch[key]++
+	}
+
+	// Serialize global_counter assignment so that sequence order is commit order.
+	// global_counter is a BIGSERIAL, and nextval is non-transactional: it hands out values in call order, but transactions commit in an arbitrary order.
+	// Without this lock a projector resuming on `global_counter > n` can read a higher counter whose transaction committed first, advance past it, and then never see the lower counter once its transaction commits, silently dropping that event from every projection.
+	// Holding the lock from before the first insert until commit guarantees that any transaction assigned a higher counter can only do so after the holder of the lower counter has committed and become visible.
+	// The lock is transaction-scoped, so it is released by commit or rollback with no cleanup path.
+	// It is taken after the counter reads above rather than at the top of the transaction, which keeps the serialized section to the inserts plus the commit. The cost is that two concurrent appends can both read the same max counter and the loser is caught by the unique constraint below rather than by pre-validation.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, globalOrderLockClass, globalOrderLockKey); err != nil {
+		return fmt.Errorf("acquire global order lock: %w", err)
 	}
 
 	for _, ae := range events {

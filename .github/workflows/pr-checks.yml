@@ -33,4 +33,23 @@ jobs:
       run: go build -v ./...
 
     - name: Run tests
-      run: go test -v ./...
+      run: go test -v -race ./...
+      env:
+        CGO_ENABLED: 1
+
+    # tests/postgres and pkg/store/postgres/pgtest are separate Go modules, so the root
+    # `go test ./...` above does not reach them. Without these steps every Postgres test —
+    # including the global_counter ordering guards in tests/postgres/global_order_test.go —
+    # would never run on a pull request. ubuntu-latest ships a working Docker daemon, which
+    # is what testcontainers needs.
+    - name: Run Postgres integration tests
+      run: go test -v -race ./...
+      working-directory: tests/postgres
+      env:
+        CGO_ENABLED: 1
+
+    - name: Run pgtest module tests
+      run: go test -v -race ./...
+      working-directory: pkg/store/postgres/pgtest
+      env:
+        CGO_ENABLED: 1

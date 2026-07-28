@@ -31,6 +31,9 @@ func TestMain(m *testing.M) {
 		tcpostgres.WithDatabase("monotonic_test"),
 		tcpostgres.WithUsername("postgres"),
 		tcpostgres.WithPassword("postgres"),
+		// track_commit_timestamp lets TestGlobalCounterMatchesCommitOrder read pg_xact_commit_timestamp and assert that global_counter order is commit order.
+		// WithCmdArgs appends, so the module's own "-c fsync=off" is preserved.
+		testcontainers.WithCmdArgs("-c", "track_commit_timestamp=on"),
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
