@@ -8,6 +8,12 @@ import (
 )
 
 // InMemoryProjection is an in-memory ProjectorBackend that stores projected rows of type T keyed by string, useful for tests and development.
+//
+// T must be a type whose copy is independent of the original, meaning a struct of scalars, strings, or other values that own their memory.
+// Buffering works by cloning the row map, and a map clone copies values shallowly, so if T contains a pointer, slice, or map then the buffered copy and the committed row share that memory.
+// A handler that reaches through such a field and mutates it in place edits committed state directly, and that edit survives even when the handler returns an error, which breaks the all-or-nothing guarantee ProjectorBackend documents.
+// The rule that keeps this safe regardless of T is to treat anything InMemoryProjectionTx.Get returns as read-only: derive a new value from it and hand that to Set, rather than mutating what you were given.
+// Enforcing this in the type system would mean requiring every T to supply a deep-copy method, which is a lot of ceremony to impose on the common case of a flat struct, so it is a documented contract instead.
 type InMemoryProjection[T any] struct {
 	// mu guards rows and state across concurrent RunEvent, ResetState, and reads.
 	mu sync.RWMutex
@@ -31,6 +37,7 @@ type InMemoryProjectionTx[T any] struct {
 }
 
 // Get returns the row for key and whether it exists.
+// Treat the result as read-only and pass any modification back through Set; see InMemoryProjection for why that matters when T holds a pointer, slice, or map.
 func (tx *InMemoryProjectionTx[T]) Get(key string) (T, bool) {
 	v, ok := tx.rows[key]
 	return v, ok
@@ -59,6 +66,14 @@ func (p *InMemoryProjection[T]) GetState(_ context.Context, projectorName string
 }
 
 // RunEvent runs apply against a buffered copy of the rows and commits that copy plus the counter advance only if apply succeeds.
+//
+// The lock is held for the whole call, apply included, and that is deliberate rather than an oversight.
+// Buffering clones the current rows and then replaces them wholesale on success, so the clone and the commit have to be one indivisible step.
+// Release the lock around apply and two concurrent calls both clone the same starting rows, then the second commit discards everything the first one wrote.
+// This mirrors the Postgres backend, which likewise holds its projector_state row lock across apply, so both backends serialize event application the same way.
+//
+// The cost is that reads block for as long as a handler runs, and that a handler must never call back into the projection's own Get or All, since RWMutex is not reentrant and doing so deadlocks.
+// Handlers already have everything they need on the tx they are given, which reads the buffered rows and is the only correct way to see writes made earlier in the same call.
 func (p *InMemoryProjection[T]) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
 	if counter == 0 {
 		return fmt.Errorf("projection counter must be > 0")

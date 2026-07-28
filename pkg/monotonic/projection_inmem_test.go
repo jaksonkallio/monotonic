@@ -3,6 +3,8 @@ package monotonic_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,5 +158,56 @@ func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
 	}
 	if c, _ := proj.GetState(ctx, "p"); c != 0 {
 		t.Errorf("counter = %d, want 0 after reset", c)
+	}
+}
+
+// TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites pins the reason RunEvent holds its lock
+// across apply. Buffering clones the rows and then swaps them in wholesale, so clone-and-commit has to
+// be indivisible; if the lock were released while a handler ran, concurrent calls would clone the same
+// starting rows and the last commit would discard the others. Each call below writes a distinct key, so
+// any lost commit shows up as a missing key.
+//
+// One InMemoryProjection backing several projectors is the case that makes this reachable: Projector.Update
+// serializes calls from a single projector, but RunProjectors drives multiple projectors concurrently.
+func TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites(t *testing.T) {
+	ctx := context.Background()
+	projection := monotonic.NewInMemoryProjection[summaryRow]()
+
+	const writers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			key := fmt.Sprintf("account-%d", i)
+			// Distinct projector names so the already-applied skip in RunEvent never suppresses a call.
+			err := projection.RunEvent(ctx, key, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+				// Widen the window a concurrent commit could slip into, so an unlocked apply loses writes
+				// reliably rather than occasionally.
+				time.Sleep(2 * time.Millisecond)
+				tx.Set(key, summaryRow{Balance: int64(i)})
+				return nil
+			})
+			if err != nil {
+				t.Errorf("run event for %s: %v", key, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	rows := projection.All()
+	if len(rows) != writers {
+		t.Fatalf("projection has %d rows, want %d; concurrent commits clobbered each other", len(rows), writers)
+	}
+	for i := 0; i < writers; i++ {
+		key := fmt.Sprintf("account-%d", i)
+		row, ok := rows[key]
+		if !ok {
+			t.Errorf("row %s missing", key)
+			continue
+		}
+		if row.Balance != int64(i) {
+			t.Errorf("row %s has balance %d, want %d", key, row.Balance, i)
+		}
 	}
 }
