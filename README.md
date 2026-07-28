@@ -265,34 +265,9 @@ func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSu
 }
 ```
 
-## Global ordering
-
-Projectors resume from a position in the global event log: they read events with `global_counter` greater than the last one they processed. That rule is only safe if a lower `global_counter` can never become visible after a higher one has already been read, and getting that right needs a little care in the store.
-
-In the Postgres store, `global_counter` is a `BIGSERIAL`. Sequences are deliberately non-transactional — `nextval` hands out values in the order it is called, and never rolls one back — but transactions commit in whatever order they finish. So the two orders are independent, and left alone they will disagree:
-
-```
-tx A: INSERT event -> global_counter 100        (not committed yet)
-tx B: INSERT event -> global_counter 101, COMMIT
-      projector polls, sees only 101, advances its position to 101
-tx A: COMMIT                                    (100 is visible now)
-      projector polls for > 101, and never sees 100 again
-```
-
-Event 100 is silently dropped from every projection, forever. No error is raised, and the per-aggregate `counter` sequence is untouched, so nothing else in the system notices.
-
-`Store.Append` therefore takes a transaction-scoped advisory lock before its first insert and holds it until commit. Any transaction assigned a higher `global_counter` can only get there after the holder of a lower one has committed and become visible, which makes sequence order and commit order the same thing. **This is not configurable.** An opt-out would be a footgun: the failure mode is a missing event discovered months later, with no error and no failing test to point at it.
-
-Two consequences worth knowing:
-
-- Appends serialize, so write throughput does not scale past a few concurrent writers. See the [Postgres benchmarks](#postgres-backed-event-store) for what that costs.
-- `global_counter` can still contain gaps, because a rolled-back append consumes its sequence value permanently. Projectors handle this correctly by design — they never wait for a specific counter to appear. Do not "fix" gaps by waiting for a contiguous run; that deadlocks on the first aborted transaction.
-
-The in-memory store gets this for free, since it holds a mutex across the whole append.
-
 ## Benchmarks
 
-TL;DR about scalability of Monotonic: Under realistic load, projection lag stays in the single-digit-millisecond range and optimistic concurrency retries are cheap and bounded. A single Postgres instance handles low thousands of events per second, bounded by the serialized global ordering described above.
+TL;DR about scalability of Monotonic: Under realistic load, projection lag stays in the single-digit-millisecond range and optimistic concurrency retries are cheap and bounded. A single Postgres instance handles low thousands of events per second, bounded primarily by global event ordering.
 
 Two common concerns with scalability of event sourced systems is whether the optimistic concurrency will kill throughput under contention, and also the staleness of projections reacting to a high-volume event stream. Here are some benchmarks to test these scenarios and provide some real numbers. These were collected on a MacBook Pro M1 against an in-memory store to isolate just the frameworks itself, Postgres store figures would be higher (there are also Postgres benchmarks in `tests/postgres`). This is just the benchmark of one single machine, try running them yourself with `make bench`!
 
@@ -328,7 +303,7 @@ In a realistic-load row (100 aggregates, Pareto-ish skew, 8 concurrent writers),
 
 The previous benchmarks were against an in-memory store to isolate performance of just the framework itself. In real applications, you'll likely be using a store backed by Postgres or some other mature database implementation. Here are some similar benchmarks running against a real Postgres 16 instance in a test container. You can run these yourself with `make bench-integration`, assuming you've got Docker running.
 
-A single writer doing one event at a time lands at around 1.5ms per event, which is mostly the cost of the Postgres transaction itself (begin, counter validation select, advisory lock, insert, commit). Adding concurrent writers on different aggregates improves throughput up to a point, then flattens out:
+A single writer doing one event at a time lands at around 1.5ms per event, which is mostly the cost of the Postgres transaction itself (begin, counter validation select, advisory lock, insert, commit).
 
 | Concurrency | Latency per op | Aggregate throughput |
 |-------------|----------------|----------------------|
@@ -336,13 +311,7 @@ A single writer doing one event at a time lands at around 1.5ms per event, which
 | 4           | 647μs          | 1,545 e/s            |
 | 8           | 661μs          | 1,510 e/s            |
 
-Two things to read carefully here.
-
-First, these benchmarks split `b.N` across the concurrent writers (`opsPerGoroutine := b.N / concurrency`), so Go's reported ns/op is already the *aggregate* time per event across the whole system. Throughput is `1 / latency`, not `concurrency / latency`. An earlier version of this table multiplied by concurrency a second time and reported figures around 26,000 e/s at concurrency 8. That was a unit error — the tell is that it implied an 28x speedup from 8 writers, which is superlinear and impossible.
-
-Second, throughput stops improving past about 4 writers because `Append` serializes `global_counter` assignment through commit (see [Global ordering](#global-ordering)). Removing that lock measures about 2,660 e/s at concurrency 8 instead of 1,510, so safe global ordering costs roughly 1.75x of peak write throughput. That trade is deliberate and not configurable.
-
-These numbers come from a Postgres 16 test container started with `fsync=off`, so treat them as an upper bound. On durable storage the absolute numbers drop and the relative cost of serialization rises, because the serialized section contains the commit.
+These numbers come from a Postgres 16 test container started with `fsync=off`, so treat them as an upper bound. On durable storage the absolute numbers drop and the relative cost of serialization rises.
 
 Under worst-case optimistic concurrency with all writers contending for a single aggregate (significantly worse case than the Zipfian benchmark above), latency degrades gracefully:
 
@@ -362,7 +331,7 @@ Hydration time is the time required to load all events of an aggregate for repla
 
 ## Avoid Monotonic If...
 
-**If you need more than a couple of thousand events per second of sustained write throughput**, because Monotonic funnels every event write through one global event log and serializes assignment of positions in it (see [Global ordering](#global-ordering)). That is what makes both the optimistic concurrency model and correct projection resumption possible, and it caps a single Postgres instance in the low thousands of events per second. Batching several events into one `Append` call amortizes the cost if your writes arrive in groups.
+**If you need more than a couple of thousand events per second of sustained write throughput**, because Monotonic funnels every event write through one global event log and serializes assignment of positions in it. That is what makes both the optimistic concurrency model and correct projection resumption possible, and it caps a single Postgres instance in the low thousands of events per second. Batching several events into one `Append` call amortizes the cost if your writes arrive in groups.
 
 **If your aggregates individually accumulate 10,000+ events over their lifetime**, because Monotonic hydrates the full aggregate state by replaying all of its events. This time scales linearly (see above benchmark) but at a certain point it becomes user-perceptible. You can always roll-forward aggregates to prune history where performance is important, but this isn't a built-in feature of Monotonic (yet).
 
