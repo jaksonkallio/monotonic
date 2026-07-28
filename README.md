@@ -53,7 +53,7 @@ import (
 
 func main() {
 	// Store is where the actual events are stored, there's an in-memory store for testing/experimenting, and a Postgres one for production.
-	// It's easy to implement your own store! You just need some sort of database that can read + insert counter values atomically.
+	// You can implement your own store, see the section below.
 	store := m.NewInMemoryStore()
 	ctx := context.TODO()
 
@@ -259,6 +259,26 @@ func applyAccountClosed(ctx context.Context, tx *m.InMemoryProjectionTx[AccountS
 	return nil
 }
 ```
+
+## Store Implementations and Global Counters
+
+You can implement your own store as long as the store is capable of enforcing:
+- Per-aggregate atomic read-then-insert of dense counters.
+- Committing global counter values in an order that matches visibility order of the global counters. That is, once a reader can see counter N, nothing below N may become visible later.
+- Global counters are strictly increasing (gaps are okay for global counters).
+
+The reason for this is that projectors (or any event log reader) will need to be able to poll for new events from the event log via `global_counter > $n`. Visibility order must match actual global counter order. This strict visibility = actual order is a guarantee we provide to event log readers so that they can poll for new events with a cursor safely.
+
+SQL database auto-increment implementations (such as Postgres BIGSERIAL, MySQL AUTO_INCREMENT, SQLite AUTOINCREMENT) typically do NOT satisfy these requirements on their own, because the value is determined at call time, but commit time is what determines visibility of the values. These auto-increment implementations can be used as long as the commit ordering is enforced by some other mechanism.
+
+Without this, the failure case example would be:
+1. Tx A adds event with global counter 100
+2. Tx B adds event with global counter 101
+3. Tx B commits
+4. Event log reader polling from cursor `global_counter > 99` would only get back event with global counter 101.
+5. Event log reader sets its new cursor to the latest event it saw, global counter 101.
+6. Tx A commits
+7. Event log readers permanently skipped event with global counter 100, never having been read.
 
 ## Benchmarks
 
