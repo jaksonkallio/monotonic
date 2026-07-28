@@ -53,7 +53,7 @@ import (
 
 func main() {
 	// Store is where the actual events are stored, there's an in-memory store for testing/experimenting, and a Postgres one for production.
-	// It's easy to implement your own store! You just need some sort of database that can read + insert counter values atomically.
+	// You can implement your own store, see the section below.
 	store := m.NewInMemoryStore()
 	ctx := context.TODO()
 
@@ -80,7 +80,7 @@ func main() {
 	fmt.Println(fresh.Balance)    // 70
 
 	// Close the account, this sets the closed flag and drains the balance to zero.
-	fresh.AcceptThenApply(ctx, m.NewEvent("account-closed", nil))
+	fresh.AcceptThenApply(ctx, m.NewEvent[any]("account-closed", nil))
 	fmt.Println(fresh.Balance) // 0
 	fmt.Println(fresh.Closed)  // true
 
@@ -107,18 +107,19 @@ func main() {
 	)
 
 	// Build a per-account projection of holder and balance, then catch up on every event in the store.
-	summaries := m.NewInMemoryProjectionPersistence[AccountSummary]()
-	projector, _ := m.NewProjector(ctx, store, NewAccountSummaryLogic(), summaries)
+	// Projections need some "backend" implementation... here we're using an in-memory projection, but production typically would use a Postgres backend.
+	summaries := m.NewInMemoryProjection[AccountSummary]()
+	projector, _ := m.NewProjector(ctx, "account-summary", store, NewAccountSummaryDispatch(), summaries, 0)
 	projector.Update(ctx)
 
-	// Projected rows, from our account summary projection logic.
-	// This could be persisted as a plain ol' Postgres table, Redis key value, in-memory table, etc. for easy querying/reading.
-	// One common pattern is to persist projection as a Postgres table and use something like `sqlc` to generate type-safe read queries.
 	// | key   | HolderName | Balance | Closed |
 	// |-------|------------|---------|--------|
 	// | alice | Alice      | 0       | true   |
 	// | bob   | Bob        | 175     | false  |
 	// | carol | Carol      | 75      | false  |
+	for key, summary := range summaries.All() {
+		fmt.Printf("%s: %+v\n", key, summary)
+	}
 }
 
 // Account aggregate representing a bank account.
@@ -210,60 +211,76 @@ type AccountSummary struct {
 	Closed     bool
 }
 
-// NewAccountSummaryLogic builds a dispatch that routes each account event type to its projection handler.
-func NewAccountSummaryLogic() m.ProjectorLogic[AccountSummary] {
-	return m.NewDispatch[AccountSummary]().
+// NewAccountSummaryDispatch builds a dispatch that routes each account event type to a projection handler.
+func NewAccountSummaryDispatch() *m.Dispatch[*m.InMemoryProjectionTx[AccountSummary]] {
+	return m.NewDispatch[*m.InMemoryProjectionTx[AccountSummary]]().
 		On("account", "account-opened", applyAccountOpened).
 		On("account", "funds-deposited", applyFundsDeposited).
 		On("account", "funds-withdrawn", applyFundsWithdrawn).
 		On("account", "account-closed", applyAccountClosed)
 }
 
-func applyAccountOpened(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyAccountOpened(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[AccountOpened](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return []m.Projected[AccountSummary]{
-		{
-			Key: m.ProjectionKey(event.AggregateID),
-			Value: AccountSummary{
-				HolderName: p.HolderName
-			}
-		}
-	}, nil
+	tx.Set(event.AggregateID, AccountSummary{HolderName: p.HolderName})
+	return nil
 }
 
-func applyFundsDeposited(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyFundsDeposited(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[FundsMoved](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance += p.Amount
-		return nil
-	})
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance += p.Amount
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 
-func applyFundsWithdrawn(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
+func applyFundsWithdrawn(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
 	p, err := m.ParsePayload[FundsMoved](event.Event)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance -= p.Amount
-		return nil
-	})
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance -= p.Amount
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 
-func applyAccountClosed(ctx context.Context, reader m.ProjectionReader[AccountSummary], event m.AggregateEvent) ([]m.Projected[AccountSummary], error) {
-	return m.MutateByKey(ctx, reader, m.ProjectionKey(event.AggregateID), func(s *AccountSummary) error {
-		s.Balance = 0
-		s.Closed = true
-		return nil
-	})
+func applyAccountClosed(ctx context.Context, tx *m.InMemoryProjectionTx[AccountSummary], event m.AggregateEvent) error {
+	summary, _ := tx.Get(event.AggregateID)
+	summary.Balance = 0
+	summary.Closed = true
+	tx.Set(event.AggregateID, summary)
+	return nil
 }
 ```
+
+## Store Implementations and Global Counters
+
+You can implement your own store as long as the store is capable of enforcing:
+- Per-aggregate atomic read-then-insert of dense counters.
+- Committing global counter values in an order that matches visibility order of the global counters. That is, once a reader can see counter N, nothing below N may become visible later.
+- Global counters are strictly increasing (gaps are okay for global counters).
+
+The reason for this is that projectors (or any event log reader) will need to be able to poll for new events from the event log via `global_counter > $n`. Visibility order must match actual global counter order. This strict visibility = actual order is a guarantee we provide to event log readers so that they can poll for new events with a cursor safely.
+
+Gaps in the global counter are acceptable. Gaps can happen when event batches are rolled back due to optimistic concurrency rejections.
+
+SQL database auto-increment implementations (such as Postgres BIGSERIAL, MySQL AUTO_INCREMENT, SQLite AUTOINCREMENT) typically do NOT satisfy these requirements on their own, because the value is determined at call time, but commit time is what determines visibility of the values. These auto-increment implementations can be used as long as the commit ordering is enforced by some other mechanism.
+
+Without this, the failure case example would be:
+1. Tx A adds event with global counter 100
+2. Tx B adds event with global counter 101
+3. Tx B commits
+4. Event log reader polling from cursor `global_counter > 99` would only get back event with global counter 101.
+5. Event log reader sets its new cursor to the latest event it saw, global counter 101.
+6. Tx A commits
+7. Event log readers permanently skipped event with global counter 100, never having been read.
 
 ## Benchmarks
 
