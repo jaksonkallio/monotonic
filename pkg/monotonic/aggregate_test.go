@@ -680,3 +680,210 @@ func TestConcurrentAppends_RapidFire(t *testing.T) {
 		t.Errorf("expected final value %d, got %d", expectedValue, finalCounter.Value)
 	}
 }
+
+func TestAcceptThenApply_BatchSeesPrecedingEvents(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	c, _ := loadCounter(ctx, store, "c1")
+
+	// The decrement is only valid once the increment ahead of it in the batch has been applied:
+	// against the starting state of 0 it would take the counter negative.
+	err := c.AcceptThenApply(ctx,
+		NewEvent(eventIncremented, incrementedPayload{Amount: 5}),
+		NewEvent(eventDecremented, incrementedPayload{Amount: 3}),
+	)
+	if err != nil {
+		t.Fatalf("batch should be accepted against mid-batch state: %v", err)
+	}
+
+	if c.Value != 2 {
+		t.Errorf("expected 2, got %d", c.Value)
+	}
+	if c.Counter() != 2 {
+		t.Errorf("expected counter 2, got %d", c.Counter())
+	}
+
+	// Rehydrating must agree, which proves both events were persisted.
+	fresh, _ := loadCounter(ctx, store, "c1")
+	if fresh.Value != 2 {
+		t.Errorf("rehydrated value: expected 2, got %d", fresh.Value)
+	}
+}
+
+func TestAcceptThenApply_BatchRejectedOnMidBatchState(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	c, _ := loadCounter(ctx, store, "c1")
+
+	// Validating the decrement against the starting state of 0 would be wrong in the other
+	// direction too: after the increment the counter is 1, so decrementing 5 must still be rejected.
+	err := c.AcceptThenApply(ctx,
+		NewEvent(eventIncremented, incrementedPayload{Amount: 1}),
+		NewEvent(eventDecremented, incrementedPayload{Amount: 5}),
+	)
+	if err == nil {
+		t.Fatal("expected rejection error, got nil")
+	}
+
+	// The whole batch is refused and the live aggregate is left untouched.
+	if c.Value != 0 {
+		t.Errorf("value should be unchanged, got %d", c.Value)
+	}
+	if c.Counter() != 0 {
+		t.Errorf("counter should be unchanged, got %d", c.Counter())
+	}
+
+	events, err := store.LoadAggregateEvents(ctx, "counter", "c1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Errorf("no events should have been persisted, got %d", len(events))
+	}
+}
+
+func TestAccept_BatchRejectionLeavesLiveAggregateUsable(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	c, _ := loadCounter(ctx, store, "c1")
+	if err := c.AcceptThenApply(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 10})); err != nil {
+		t.Fatal(err)
+	}
+
+	// Speculative applies land on the copy, so a rejected batch must not leave the live aggregate
+	// partially advanced.
+	if _, err := c.Accept(ctx,
+		NewEvent(eventDecremented, incrementedPayload{Amount: 4}),
+		NewEvent(eventDecremented, incrementedPayload{Amount: 100}),
+	); err == nil {
+		t.Fatal("expected rejection error, got nil")
+	}
+	if c.Value != 10 {
+		t.Fatalf("value should be unchanged after rejected batch, got %d", c.Value)
+	}
+
+	// The aggregate still works for subsequent operations.
+	if err := c.AcceptThenApply(ctx, NewEvent(eventDecremented, incrementedPayload{Amount: 4})); err != nil {
+		t.Fatalf("aggregate should still be usable: %v", err)
+	}
+	if c.Value != 6 {
+		t.Errorf("expected 6, got %d", c.Value)
+	}
+}
+
+func TestAccept_BatchDoesNotApplyToLiveAggregate(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	c, _ := loadCounter(ctx, store, "c1")
+
+	accepted, err := c.Accept(ctx,
+		NewEvent(eventIncremented, incrementedPayload{Amount: 5}),
+		NewEvent(eventDecremented, incrementedPayload{Amount: 3}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(accepted) != 2 {
+		t.Fatalf("expected 2 accepted events, got %d", len(accepted))
+	}
+
+	// Accept only validates; the caller still owns appending and applying.
+	if c.Value != 0 {
+		t.Errorf("value should be 0 after Accept, got %d", c.Value)
+	}
+	if c.Counter() != 0 {
+		t.Errorf("counter should be 0 after Accept, got %d", c.Counter())
+	}
+}
+
+func TestAccept_BatchOnNonHydratedAggregate(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	// A base built outside Hydrate has no way to construct the copy a batch needs.
+	base := &AggregateBase{eventStream: eventStream{ID: NewAggregateID("counter", "c1"), store: store}}
+	c := &counter{AggregateBase: base}
+	base.self = c
+
+	if _, err := c.Accept(ctx,
+		NewEvent(eventIncremented, incrementedPayload{Amount: 1}),
+		NewEvent(eventIncremented, incrementedPayload{Amount: 1}),
+	); err == nil {
+		t.Fatal("expected an error for a batch on a non-hydrated aggregate")
+	}
+
+	// A single event needs no copy, so it still works.
+	if _, err := c.Accept(ctx, NewEvent(eventIncremented, incrementedPayload{Amount: 1})); err != nil {
+		t.Fatalf("single event should not require a copy: %v", err)
+	}
+}
+
+// counterProbe records the base stream position visible to each ShouldAccept call. The sink is
+// shared by pointer so the speculative copy reports into the same place as the live aggregate.
+type counterProbe struct {
+	*AggregateBase
+	seen *[]int64
+}
+
+func (p *counterProbe) Apply(event AcceptedEvent) {}
+
+func (p *counterProbe) ShouldAccept(event Event) error {
+	*p.seen = append(*p.seen, p.Counter())
+	return nil
+}
+
+func TestAccept_BatchAdvancesCopyStreamPosition(t *testing.T) {
+	store := NewInMemoryStore()
+	ctx := context.Background()
+
+	sink := &[]int64{}
+	p, err := Hydrate(ctx, store, "probe", "p1", func(base *AggregateBase) *counterProbe {
+		return &counterProbe{AggregateBase: base, seen: sink}
+	})
+	if err != nil {
+		t.Fatalf("Hydrate: %v", err)
+	}
+
+	// Seed one event so the pre-batch stream position is a non-zero 1.
+	if err := p.AcceptThenApply(ctx, NewEvent("probed", struct{}{})); err != nil {
+		t.Fatal(err)
+	}
+	*sink = (*sink)[:0]
+
+	accepted, err := p.Accept(ctx,
+		NewEvent("probed", struct{}{}),
+		NewEvent("probed", struct{}{}),
+		NewEvent("probed", struct{}{}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Each event must be validated against the stream position its predecessors leave behind, so
+	// the copy's Counter() tracks its domain state instead of staying pinned at the pre-batch value.
+	want := []int64{1, 2, 3}
+	if len(*sink) != len(want) {
+		t.Fatalf("expected %d ShouldAccept calls, got %d", len(want), len(*sink))
+	}
+	for i, w := range want {
+		if (*sink)[i] != w {
+			t.Errorf("ShouldAccept %d saw Counter() %d, want %d (full: %v)", i, (*sink)[i], w, *sink)
+		}
+	}
+
+	// The position each event is validated against is exactly the one before its own counter.
+	for i, a := range accepted {
+		if (*sink)[i] != a.Counter-1 {
+			t.Errorf("event %d: validated at counter %d but assigned counter %d", i, (*sink)[i], a.Counter)
+		}
+	}
+
+	// Accept must leave the live aggregate's stream position untouched.
+	if p.Counter() != 1 {
+		t.Errorf("live counter should be unchanged at 1, got %d", p.Counter())
+	}
+}

@@ -34,6 +34,17 @@ type Logic interface {
 type AggregateBase struct {
 	eventStream
 	self Logic
+
+	// newInstance builds a fresh, zero-state instance of the concrete aggregate type.
+	// Captured by Hydrate so Accept can replay a throwaway copy of the aggregate when validating a multi-event batch.
+	newInstance func(*AggregateBase) Logic
+}
+
+// applyAccepted applies an accepted event to the aggregate and advances the stream position.
+// Applying without marking leaves base counter metadata behind the aggregate state.
+func (b *AggregateBase) applyAccepted(event AcceptedEvent) {
+	b.self.Apply(event)
+	b.applied(event)
 }
 
 // AcceptThenApply applies the event to the aggregate after it has been accepted, effectively recording the event and updating the state in one step.
@@ -66,8 +77,7 @@ func (b *AggregateBase) AcceptThenApply(ctx context.Context, events ...Event) er
 
 	// Apply all accepted and appended events to local state
 	for _, acceptedEvent := range acceptedEvents {
-		b.self.Apply(acceptedEvent)
-		b.applied(acceptedEvent)
+		b.applyAccepted(acceptedEvent)
 	}
 
 	return nil
@@ -107,9 +117,21 @@ func (b *AggregateBase) Accept(ctx context.Context, events ...Event) ([]Accepted
 	// Capture the counter, all accepted events will be an incremental sequence from this value
 	acceptMultiCounter := b.nextCounter()
 
+	// When accepting a single event, there is no need to create a speculative copy.
+	// The current aggregate can be used directly because there's nothing to "roll back" if the accept fails.
+	speculative := len(events) > 1
+	candidate := b
+	if speculative {
+		copied, err := b.copyState(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("copy state for batch validation: %w", err)
+		}
+		candidate = copied
+	}
+
 	acceptedEvents := make([]AcceptedEvent, len(events))
 	for i, event := range events {
-		if err := b.self.ShouldAccept(event); err != nil {
+		if err := candidate.self.ShouldAccept(event); err != nil {
 			return nil, fmt.Errorf("event %d: %w", i, err)
 		}
 		acceptedEvents[i] = AcceptedEvent{
@@ -117,9 +139,46 @@ func (b *AggregateBase) Accept(ctx context.Context, events ...Event) ([]Accepted
 			AcceptedAt: time.Now(),
 			Counter:    acceptMultiCounter + int64(i),
 		}
+		if speculative {
+			// Advance the copy, state and stream position together, so the next event's ShouldAccept sees this event's effect.
+			candidate.applyAccepted(acceptedEvents[i])
+		}
 	}
 
 	return acceptedEvents, nil
+}
+
+// copyState builds a throwaway copy of the aggregate's current state by replaying its history into a fresh instance of the concrete aggregate type.
+func (b *AggregateBase) copyState(ctx context.Context) (*AggregateBase, error) {
+	if b.newInstance == nil {
+		return nil, fmt.Errorf("aggregate was not built by Hydrate, so its state cannot be copied")
+	}
+
+	copyBase := &AggregateBase{
+		eventStream: eventStream{
+			ID:    b.ID,
+			store: b.store,
+		},
+		newInstance: b.newInstance,
+	}
+	copied := b.newInstance(copyBase)
+	copyBase.self = copied
+
+	events, err := b.store.LoadAggregateEvents(ctx, b.ID.Type, b.ID.ID, 0)
+	if err != nil {
+		return nil, fmt.Errorf("load events: %w", err)
+	}
+
+	// Replay only as far as the live aggregate has seen.
+	// A concurrent writer may have appended past that point, and those events are not reflected in the counters this batch is being assigned.
+	for _, event := range events {
+		if event.Counter > b.counter {
+			break
+		}
+		copyBase.applyAccepted(event)
+	}
+
+	return copyBase, nil
 }
 
 // Hydrate loads an aggregate from the store by replaying all events.
@@ -136,13 +195,13 @@ func Hydrate[T Logic](ctx context.Context, store Store, aggType, id string, init
 			ID:    NewAggregateID(aggType, id),
 			store: store,
 		},
+		newInstance: func(b *AggregateBase) Logic { return init(b) },
 	}
 	agg := init(base)
 	base.self = agg
 
 	for _, e := range events {
-		agg.Apply(e)
-		base.applied(e)
+		base.applyAccepted(e)
 	}
 
 	return agg, nil
