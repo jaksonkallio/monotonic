@@ -34,12 +34,12 @@ func TestHarnessSmoke(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	got, err := c.Backend.GetState(ctx, "never-ran")
+	state, err := c.Backend.GetState(ctx, "never-ran")
 	if err != nil {
 		t.Fatalf("GetState: %v", err)
 	}
-	if got != 0 {
-		t.Errorf("fresh projector state must be 0, got %d", got)
+	if state != (monotonic.ProjectorState{}) {
+		t.Errorf("fresh projector state must be zero-valued, got %+v", state)
 	}
 }
 

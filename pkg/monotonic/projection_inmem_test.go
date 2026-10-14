@@ -84,7 +84,7 @@ func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
 	// A successful event establishes committed state.
-	if err := proj.RunEvent(ctx, "p", 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	if _, err := proj.RunEvent(ctx, "p", 0, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Set("alice", summaryRow{Balance: 10})
 		return nil
 	}); err != nil {
@@ -93,7 +93,7 @@ func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
 
 	// A failing event mutates the buffer then errors; neither the write nor the counter should commit.
 	wantErr := errors.New("boom")
-	err := proj.RunEvent(ctx, "p", 2, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	_, err := proj.RunEvent(ctx, "p", 1, 2, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Set("alice", summaryRow{Balance: 999})
 		tx.Set("mallory", summaryRow{Balance: 1})
 		return wantErr
@@ -108,8 +108,8 @@ func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
 	if _, ok := proj.Get("mallory"); ok {
 		t.Error("mallory row should not have been committed")
 	}
-	if c, _ := proj.GetState(ctx, "p"); c != 1 {
-		t.Errorf("counter = %d, want 1 (not advanced)", c)
+	if state, _ := proj.GetState(ctx, "p"); state.Counter != 1 {
+		t.Errorf("counter = %d, want 1 (not advanced)", state.Counter)
 	}
 }
 
@@ -124,11 +124,11 @@ func TestInMemoryProjection_SkipsAlreadyAppliedCounter(t *testing.T) {
 		}
 	}
 
-	if err := proj.RunEvent(ctx, "p", 5, apply(10)); err != nil {
+	if _, err := proj.RunEvent(ctx, "p", 0, 5, apply(10)); err != nil {
 		t.Fatalf("RunEvent 5: %v", err)
 	}
 	// Replaying counter 5 (or lower) must be a no-op, leaving the committed row untouched.
-	if err := proj.RunEvent(ctx, "p", 5, apply(999)); err != nil {
+	if _, err := proj.RunEvent(ctx, "p", 5, 5, apply(999)); err != nil {
 		t.Fatalf("RunEvent replay: %v", err)
 	}
 	if row, _ := proj.Get("alice"); row.Balance != 10 {
@@ -139,25 +139,48 @@ func TestInMemoryProjection_SkipsAlreadyAppliedCounter(t *testing.T) {
 func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
-	if err := proj.RunEvent(ctx, "p", 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	if _, err := proj.RunEvent(ctx, "p", 0, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Set("alice", summaryRow{Balance: 10})
 		return nil
 	}); err != nil {
 		t.Fatalf("RunEvent: %v", err)
 	}
 
-	if err := proj.ResetState(ctx, "p", func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	clearRows := func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Clear()
 		return nil
-	}); err != nil {
-		t.Fatalf("ResetState: %v", err)
+	}
+
+	// Nothing pending yet, so there is nothing to claim.
+	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || claimed {
+		t.Fatalf("ClaimReset with no pending request: claimed=%v err=%v, want false/nil", claimed, err)
+	}
+
+	if err := proj.RequestReset(ctx, "p"); err != nil {
+		t.Fatalf("RequestReset: %v", err)
+	}
+	if state, _ := proj.GetState(ctx, "p"); !state.ResetRequested {
+		t.Error("GetState should report the pending reset request")
+	}
+
+	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || !claimed {
+		t.Fatalf("ClaimReset: claimed=%v err=%v, want true/nil", claimed, err)
 	}
 
 	if got := len(proj.All()); got != 0 {
 		t.Errorf("All() len = %d, want 0 after reset", got)
 	}
-	if c, _ := proj.GetState(ctx, "p"); c != 0 {
-		t.Errorf("counter = %d, want 0 after reset", c)
+	state, _ := proj.GetState(ctx, "p")
+	if state.Counter != 0 {
+		t.Errorf("counter = %d, want 0 after reset", state.Counter)
+	}
+	if state.ResetRequested {
+		t.Error("reset request should be cleared once claimed")
+	}
+
+	// A second claimant finds the request already serviced.
+	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || claimed {
+		t.Errorf("second ClaimReset: claimed=%v err=%v, want false/nil", claimed, err)
 	}
 }
 
@@ -181,7 +204,7 @@ func TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites(t *testing.T) {
 			defer wg.Done()
 			key := fmt.Sprintf("account-%d", i)
 			// Distinct projector names so the already-applied skip in RunEvent never suppresses a call.
-			err := projection.RunEvent(ctx, key, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+			_, err := projection.RunEvent(ctx, key, 0, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 				// Widen the window a concurrent commit could slip into, so an unlocked apply loses writes
 				// reliably rather than occasionally.
 				time.Sleep(2 * time.Millisecond)
