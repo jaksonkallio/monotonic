@@ -72,16 +72,15 @@ type Projector[ModificationTx any] struct {
 	dispatch *Dispatch[ModificationTx]
 	// backend runs each event atomically with the counter advance.
 	backend ProjectorBackend[ModificationTx]
-	// mu serializes Update calls and protects counter.
+	// mu serializes Update calls against each other, and against a Reset claimed in-process.
 	mu sync.Mutex
-	// counter caches the backend's resume position; events with global_counter > this are pending.
-	// Only ever a cache: Update re-reads the backend's copy before each batch.
-	counter uint64
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
 }
 
-// NewProjector creates a Projector and derives its resume position from backend.GetState.
+// NewProjector creates a Projector. It reads the backend's state once as a startup check, so a
+// misconfigured backend (most often one whose Migrate was never called) fails here rather than on
+// the first Update. A Projector holds no position of its own: every batch reads the backend's.
 func NewProjector[ModificationTx any](
 	ctx context.Context,
 	name string,
@@ -96,8 +95,7 @@ func NewProjector[ModificationTx any](
 	if updateBatchSize <= 0 {
 		updateBatchSize = DefaultUpdateBatchSize
 	}
-	state, err := backend.GetState(ctx, name)
-	if err != nil {
+	if _, err := backend.GetState(ctx, name); err != nil {
 		return nil, fmt.Errorf("init projector %q: %w", name, err)
 	}
 	return &Projector[ModificationTx]{
@@ -105,7 +103,6 @@ func NewProjector[ModificationTx any](
 		store:           store,
 		dispatch:        dispatch,
 		backend:         backend,
-		counter:         state.Counter,
 		updateBatchSize: updateBatchSize,
 	}, nil
 }
@@ -116,24 +113,23 @@ func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// The backend's stored position is authoritative and p.counter is only a cache of it. Other
-	// instances of this projector share that position and may have moved it since the last batch,
-	// forwards by processing events or backwards by servicing a reset, so re-read it before
-	// loading anything. Adopting a position ahead of ours just skips work another instance already
-	// did; adopting one behind ours is what makes a reset elsewhere visible here.
+	// The backend holds the only resume position there is. Every instance of this projector shares
+	// it and may have moved it since the last batch, forwards by processing events or backwards by
+	// servicing a reset, so a position cached between batches would be a guess. Read it instead.
 	state, err := p.backend.GetState(ctx, p.name)
 	if err != nil {
 		return 0, fmt.Errorf("load state for projector %q: %w", p.name, err)
 	}
-	p.counter = state.Counter
+	position := state.Counter
 
 	if state.ResetRequested {
-		if err := p.serviceReset(ctx); err != nil {
+		if err := p.claimReset(ctx); err != nil {
 			return 0, err
 		}
+		position = 0
 	}
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.dispatch.EventFilters(), int64(p.counter), p.updateBatchSize)
+	events, err := p.store.LoadGlobalEvents(ctx, p.dispatch.EventFilters(), int64(position), p.updateBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}
@@ -141,7 +137,7 @@ func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 	processed := 0
 	for _, event := range events {
 		counter := uint64(event.Event.GlobalCounter)
-		current, err := p.backend.RunEvent(ctx, p.name, p.counter, counter, func(ctx context.Context, tx ModificationTx) error {
+		current, err := p.backend.RunEvent(ctx, p.name, position, counter, func(ctx context.Context, tx ModificationTx) error {
 			return p.dispatch.Apply(ctx, tx, event)
 		})
 		if err != nil {
@@ -151,21 +147,20 @@ func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 			// The stored position did not end up where this event would have left it, so the
 			// backend declined to apply: another instance raced ahead of us, reset the projector
 			// underneath us, or a reset is now pending. Either way the rest of this batch was
-			// loaded against a position that no longer holds. Adopt the stored one and let the
-			// next Update reload from there.
-			p.counter = current
+			// loaded against a position that no longer holds, so drop it and let the next Update
+			// reload from wherever the backend is now.
 			return processed, nil
 		}
-		p.counter = counter
+		position = counter
 		processed++
 	}
 
 	return processed, nil
 }
 
-// serviceReset claims a pending reset and rewinds this projector to the beginning of the stream.
-// Callers must hold p.mu.
-func (p *Projector[ModificationTx]) serviceReset(ctx context.Context) error {
+// claimReset services a pending reset, clearing the projection and rewinding the backend's counter
+// to the beginning of the stream. Callers must hold p.mu.
+func (p *Projector[ModificationTx]) claimReset(ctx context.Context) error {
 	reset := p.dispatch.ResetFunc()
 	if reset == nil {
 		return fmt.Errorf(
@@ -174,13 +169,12 @@ func (p *Projector[ModificationTx]) serviceReset(ctx context.Context) error {
 		)
 	}
 
-	// claimed is false when another instance got there first. Either way the projector is now
-	// rewound, so our cached position is stale regardless of who did the work. Starting from 0 is
-	// safe even if the winner has already replayed past it, since RunEvent skips what is applied.
+	// claimed is false when another instance got there first, which is not an error: the reset
+	// happened exactly once either way, and the caller resumes from 0 regardless. Starting from 0
+	// is safe even if the winner has already replayed past it, since RunEvent skips what is applied.
 	if _, err := p.backend.ClaimReset(ctx, p.name, reset); err != nil {
 		return fmt.Errorf("claim reset for projector %q: %w", p.name, err)
 	}
-	p.counter = 0
 	return nil
 }
 
@@ -218,7 +212,7 @@ func (p *Projector[ModificationTx]) Reset(ctx context.Context) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.serviceReset(ctx)
+	return p.claimReset(ctx)
 }
 
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.
@@ -249,11 +243,17 @@ func (p *Projector[ModificationTx]) Run(ctx context.Context, pollInterval time.D
 	}
 }
 
-// GlobalCounter returns the highest global counter the projector has processed.
-func (p *Projector[ModificationTx]) GlobalCounter() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.counter
+// GlobalCounter reads the highest global counter committed for this projector from the backend.
+// That position is shared by every instance of the projector, so it reports how far the projector
+// has got overall rather than how much of it this particular instance did.
+//
+// It takes no lock, so polling it for metrics does not queue behind an in-flight Update batch.
+func (p *Projector[ModificationTx]) GlobalCounter(ctx context.Context) (uint64, error) {
+	state, err := p.backend.GetState(ctx, p.name)
+	if err != nil {
+		return 0, fmt.Errorf("read counter for projector %q: %w", p.name, err)
+	}
+	return state.Counter, nil
 }
 
 // Name returns the projector name used in the backend's state store.

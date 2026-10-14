@@ -109,8 +109,8 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetState: %v", err)
 	}
-	if state.Counter != p.GlobalCounter() {
-		t.Errorf("backend state %d != projector counter %d", state.Counter, p.GlobalCounter())
+	if state.Counter != 2 {
+		t.Errorf("projector_state counter = %d, want 2 committed alongside the table writes", state.Counter)
 	}
 }
 
@@ -183,12 +183,13 @@ func TestProjectorBackend_ResumeFromStoredCounter(t *testing.T) {
 
 	appendTestEvent(t, store, "x", 3, "did")
 
+	if state, _ := backend.GetState(ctx, "resume"); state.Counter != 2 {
+		t.Fatalf("stored counter before resume = %d, want 2", state.Counter)
+	}
+
 	p2, err := monotonic.NewProjector(ctx, "resume", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("resume NewProjector: %v", err)
-	}
-	if p2.GlobalCounter() != p1.GlobalCounter() {
-		t.Errorf("resumed counter %d, want %d", p2.GlobalCounter(), p1.GlobalCounter())
 	}
 	if n, err := p2.Update(ctx); err != nil || n != 1 {
 		t.Errorf("resumed Update should process exactly 1 event, got n=%d err=%v", n, err)
@@ -330,9 +331,6 @@ func TestProjectorBackend_ResetClearsProjectionAndCounterAtomically(t *testing.T
 		t.Fatalf("Reset: %v", err)
 	}
 
-	if p.GlobalCounter() != 0 {
-		t.Errorf("projector counter must be 0 after Reset, got %d", p.GlobalCounter())
-	}
 	state, _ := backend.GetState(ctx, "reset")
 	if state.Counter != 0 {
 		t.Errorf("projector_state must be 0 after Reset, got %d", state.Counter)

@@ -271,7 +271,7 @@ func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 	}
 }
 
-func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
+func TestProjector_GlobalCounterReportsBackendPosition(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
@@ -279,10 +279,33 @@ func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
 
 	backend := newFakeBackend()
 	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(&counterRef{}), backend, 0)
-	p.Update(ctx)
 
-	if p.GlobalCounter() == 0 {
-		t.Error("GlobalCounter should have advanced after Update")
+	// A projector keeps no position of its own, so GlobalCounter reports the backend's, which is
+	// shared with every other instance of the same projector.
+	got, err := p.GlobalCounter(ctx)
+	if err != nil {
+		t.Fatalf("GlobalCounter: %v", err)
+	}
+	if got != 0 {
+		t.Errorf("GlobalCounter before any Update = %d, want 0", got)
+	}
+
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	got, err = p.GlobalCounter(ctx)
+	if err != nil {
+		t.Fatalf("GlobalCounter: %v", err)
+	}
+	if got != backend.counterOf("p1") {
+		t.Errorf("GlobalCounter = %d, want the backend's %d", got, backend.counterOf("p1"))
+	}
+
+	// Progress made by another instance shows up here too, since the position is not ours to hold.
+	backend.seed("p1", 99)
+	if got, _ := p.GlobalCounter(ctx); got != 99 {
+		t.Errorf("GlobalCounter = %d, want 99 (another instance advanced the shared position)", got)
 	}
 }
 
@@ -301,10 +324,6 @@ func TestProjector_ResumesFromBackendState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
-	if p.GlobalCounter() != 5 {
-		t.Errorf("expected resume at counter 5, got %d", p.GlobalCounter())
-	}
-
 	n, _ := p.Update(ctx)
 	if n != 1 {
 		t.Errorf("expected 1 pending event past counter 5, got %d", n)
@@ -335,8 +354,8 @@ func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
 	if _, err := p.Update(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if p.GlobalCounter() != 3 {
-		t.Fatalf("expected counter 3 before reset, got %d", p.GlobalCounter())
+	if got := backend.counterOf("p1"); got != 3 {
+		t.Fatalf("expected counter 3 before reset, got %d", got)
 	}
 
 	if err := p.Reset(ctx); err != nil {
@@ -345,9 +364,6 @@ func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
 
 	if !resetFuncCalled {
 		t.Error("reset func was not invoked")
-	}
-	if p.GlobalCounter() != 0 {
-		t.Errorf("expected counter 0 after reset, got %d", p.GlobalCounter())
 	}
 	if got := backend.counterOf("p1"); got != 0 {
 		t.Errorf("expected backend state 0 after reset, got %d", got)
@@ -384,8 +400,8 @@ func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
 	if err := p.Reset(ctx); !errors.Is(err, wantErr) {
 		t.Fatalf("expected wrapped %v from Reset, got %v", wantErr, err)
 	}
-	if p.GlobalCounter() != 1 {
-		t.Errorf("counter must not change when reset func fails, got %d", p.GlobalCounter())
+	if got := backend.counterOf("p1"); got != 1 {
+		t.Errorf("counter must not change when reset func fails, got %d", got)
 	}
 }
 
@@ -421,8 +437,8 @@ func TestProjector_UpdateAdoptsResetCommittedByAnotherInstance(t *testing.T) {
 	if _, err := b.Update(ctx); err != nil {
 		t.Fatalf("b.Update: %v", err)
 	}
-	if b.GlobalCounter() != 3 {
-		t.Fatalf("b should be caught up at 3, got %d", b.GlobalCounter())
+	if got := backend.counterOf("shared"); got != 3 {
+		t.Fatalf("both instances should be caught up at 3, got %d", got)
 	}
 	for i := int64(4); i <= 5; i++ {
 		emitEvent(ctx, t, store, i)
@@ -443,6 +459,62 @@ func TestProjector_UpdateAdoptsResetCommittedByAnotherInstance(t *testing.T) {
 	}
 	if crB.n != 5 {
 		t.Errorf("b dispatched %d events after the reset, want 5", crB.n)
+	}
+}
+
+// TestProjector_UpdateAbandonsBatchWhenResetLandsMidBatch covers the narrower window the
+// top-of-batch state read cannot see: a reset committed by another instance after this one has
+// already loaded its batch and applied part of it. Only the position passed into RunEvent catches
+// that, and getting it wrong means applying the rest of the batch onto a freshly cleared
+// projection and stranding everything below it.
+func TestProjector_UpdateAbandonsBatchWhenResetLandsMidBatch(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 5; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	noReset := func(ctx context.Context, tx testModificationTx) error { return nil }
+	p, err := monotonic.NewProjector(ctx, "shared", store, countingDispatch(cr).OnReset(noReset), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+
+	// Another instance resets the projector just as this one reaches the second event of its batch.
+	backend.beforeRun = func(counter uint64) {
+		if counter != 2 {
+			return
+		}
+		backend.beforeRun = nil
+		if err := backend.RequestReset(ctx, "shared"); err != nil {
+			t.Errorf("RequestReset: %v", err)
+		}
+		if _, err := backend.ClaimReset(ctx, "shared", noReset); err != nil {
+			t.Errorf("ClaimReset: %v", err)
+		}
+	}
+
+	n, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("processed %d events, want 1 (only the event applied before the reset landed)", n)
+	}
+	if got := backend.counterOf("shared"); got != 0 {
+		t.Errorf("counter = %d, want 0: the rest of the batch must not have been applied over the reset", got)
+	}
+
+	// The next batch starts over from the beginning, as a reset projector should.
+	cr.n = 0
+	n, err = p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after reset: %v", err)
+	}
+	if n != 5 || cr.n != 5 {
+		t.Errorf("replay processed n=%d dispatched=%d, want 5 and 5", n, cr.n)
 	}
 }
 
@@ -558,9 +630,6 @@ func TestProjector_UpdateStopsBatchWhenAnotherInstanceRacesAhead(t *testing.T) {
 	if backend.runCalls != 2 {
 		t.Errorf("RunEvent called %d times, want 2 (batch abandoned at the first skip, not ground through)", backend.runCalls)
 	}
-	if p.GlobalCounter() != 5 {
-		t.Errorf("counter = %d, want 5 (adopted from the backend)", p.GlobalCounter())
-	}
 }
 
 func TestProjector_UpdatePropagatesHandlerError(t *testing.T) {
@@ -586,9 +655,6 @@ func TestProjector_CounterDoesNotAdvanceOnHandlerError(t *testing.T) {
 	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(errors.New("boom")), backend, 0)
 	p.Update(ctx)
 
-	if p.GlobalCounter() != 0 {
-		t.Errorf("GlobalCounter must not advance after handler error, got %d", p.GlobalCounter())
-	}
 	if got := backend.counterOf("p1"); got != 0 {
 		t.Errorf("backend state must not advance after handler error, got %d", got)
 	}
@@ -614,8 +680,8 @@ func TestProjector_BackendErrorStopsBatch(t *testing.T) {
 	if processed != 1 {
 		t.Errorf("expected 1 processed before failure, got %d", processed)
 	}
-	if p.GlobalCounter() != 1 {
-		t.Errorf("counter should sit at last successful event (1), got %d", p.GlobalCounter())
+	if got := backend.counterOf("p1"); got != 1 {
+		t.Errorf("counter should sit at last successful event (1), got %d", got)
 	}
 }
 
@@ -674,14 +740,14 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if p.GlobalCounter() == numEvents {
+		if backend.counterOf("p1") == numEvents {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if p.GlobalCounter() != uint64(numEvents) {
-		t.Errorf("processed counter=%d, want %d", p.GlobalCounter(), numEvents)
+	if got := backend.counterOf("p1"); got != uint64(numEvents) {
+		t.Errorf("processed counter=%d, want %d", got, numEvents)
 	}
 }
 
