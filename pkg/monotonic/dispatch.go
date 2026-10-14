@@ -15,8 +15,12 @@ type dispatchKey struct {
 // Dispatch routes events to handlers registered per (aggregateType, eventType)
 // and derives EventFilters from the registered set. Generic over ModificationTx so the same
 // dispatch core works for any backend that supplies a per-event environment.
+//
+// A Dispatch also carries the reset function registered with OnReset, since clearing a projection
+// means undoing exactly what this dispatch's handlers wrote, and the two belong together.
 type Dispatch[ModificationTx any] struct {
 	handlers map[dispatchKey]Handler[ModificationTx]
+	reset    func(ctx context.Context, tx ModificationTx) error
 }
 
 // NewDispatch creates an empty Dispatch parameterized over ModificationTx.
@@ -28,6 +32,25 @@ func NewDispatch[ModificationTx any]() *Dispatch[ModificationTx] {
 func (d *Dispatch[ModificationTx]) On(aggregateType, eventType string, handler Handler[ModificationTx]) *Dispatch[ModificationTx] {
 	d.handlers[dispatchKey{aggregateType, eventType}] = handler
 	return d
+}
+
+// OnReset registers the function that clears whatever state this dispatch's handlers have written
+// (e.g. truncating the implementer's own tables), which is what a projector replays onto when it is
+// reset. It runs with the same ModificationTx a handler would get, in the same transaction that
+// rewinds the resume counter to 0. Registering twice overwrites.
+//
+// A projector whose dispatch has no reset function cannot be reset: it fails loudly on a pending
+// reset request rather than rewinding onto un-cleared state and letting every handler re-apply on
+// top of rows that are already there. Register a no-op only if the handlers are genuinely
+// idempotent over a full replay.
+func (d *Dispatch[ModificationTx]) OnReset(reset func(ctx context.Context, tx ModificationTx) error) *Dispatch[ModificationTx] {
+	d.reset = reset
+	return d
+}
+
+// ResetFunc returns the function registered with OnReset, or nil if there is none.
+func (d *Dispatch[ModificationTx]) ResetFunc() func(ctx context.Context, tx ModificationTx) error {
+	return d.reset
 }
 
 // EventFilters returns one EventFilter per registered handler so the projector subscribes to exactly the events the dispatch can route.

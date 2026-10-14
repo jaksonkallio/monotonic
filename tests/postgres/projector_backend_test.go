@@ -309,16 +309,16 @@ func TestProjectorBackend_ResetClearsProjectionAndCounterAtomically(t *testing.T
 		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 			_, err := tx.Exec(ctx, `INSERT INTO proj_reset (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_reset.n + 1`, event.AggregateID)
 			return err
+		}).
+		OnReset(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_reset`)
+			return err
 		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p, err := monotonic.NewProjector(ctx, "reset", store, dispatch, backend, 0,
-		monotonic.WithReset(func(ctx context.Context, tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `TRUNCATE proj_reset`)
-			return err
-		}))
+	p, err := monotonic.NewProjector(ctx, "reset", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -552,16 +552,16 @@ func TestProjectorBackend_ResetRequestedOutOfBandIsPickedUpByProjector(t *testin
 		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 			_, err := tx.Exec(ctx, `INSERT INTO proj_oob (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_oob.n + 1`, event.AggregateID)
 			return err
+		}).
+		OnReset(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_oob`)
+			return err
 		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p, err := monotonic.NewProjector(ctx, "oob", store, dispatch, backend, 0,
-		monotonic.WithReset(func(ctx context.Context, tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, `TRUNCATE proj_oob`)
-			return err
-		}))
+	p, err := monotonic.NewProjector(ctx, "oob", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -615,23 +615,23 @@ func TestProjectorBackend_ResetWithConcurrentInstancesRebuildsExactlyOnce(t *tes
 			On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
 				_, err := tx.Exec(ctx, `INSERT INTO proj_two_inst (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_two_inst.n + 1`, event.AggregateID)
 				return err
+			}).
+			OnReset(func(ctx context.Context, tx pgx.Tx) error {
+				_, err := tx.Exec(ctx, `TRUNCATE proj_two_inst`)
+				return err
 			})
 	}
-	truncate := monotonic.WithReset(func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `TRUNCATE proj_two_inst`)
-		return err
-	})
 
 	const totalEvents = 5
 	for i := int64(1); i <= 3; i++ {
 		appendTestEvent(t, store, "x", i, "did")
 	}
 
-	a, err := monotonic.NewProjector(ctx, "two_inst", store, newDispatch(), backend, 0, truncate)
+	a, err := monotonic.NewProjector(ctx, "two_inst", store, newDispatch(), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector a: %v", err)
 	}
-	b, err := monotonic.NewProjector(ctx, "two_inst", store, newDispatch(), backend, 0, truncate)
+	b, err := monotonic.NewProjector(ctx, "two_inst", store, newDispatch(), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector b: %v", err)
 	}

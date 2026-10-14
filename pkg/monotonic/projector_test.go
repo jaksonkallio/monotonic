@@ -196,6 +196,33 @@ func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
 	}
 }
 
+func TestDispatch_ResetFuncIsNilUntilRegistered(t *testing.T) {
+	d := monotonic.NewDispatch[testModificationTx]()
+	if d.ResetFunc() != nil {
+		t.Error("a dispatch with no OnReset must report a nil reset func")
+	}
+
+	called := false
+	returned := d.OnReset(func(_ context.Context, _ testModificationTx) error {
+		called = true
+		return nil
+	})
+	if returned != d {
+		t.Error("OnReset should return the dispatch for chaining")
+	}
+
+	reset := d.ResetFunc()
+	if reset == nil {
+		t.Fatal("ResetFunc should return the registered func")
+	}
+	if err := reset(context.Background(), testModificationTx{}); err != nil {
+		t.Fatalf("reset func: %v", err)
+	}
+	if !called {
+		t.Error("ResetFunc returned something other than the registered func")
+	}
+}
+
 // --- Projector tests ---
 
 func TestProjector_UpdateReturnsZeroWhenNoPendingEvents(t *testing.T) {
@@ -297,11 +324,11 @@ func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
 	backend := newFakeBackend()
 	cr := &counterRef{}
 	resetFuncCalled := false
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0,
-		monotonic.WithReset(func(ctx context.Context, tx testModificationTx) error {
-			resetFuncCalled = true
-			return nil
-		}))
+	dispatch := countingDispatch(cr).OnReset(func(ctx context.Context, tx testModificationTx) error {
+		resetFuncCalled = true
+		return nil
+	})
+	p, err := monotonic.NewProjector(ctx, "p1", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -343,10 +370,10 @@ func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
 	backend := newFakeBackend()
 	cr := &counterRef{}
 	wantErr := errors.New("reset boom")
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0,
-		monotonic.WithReset(func(ctx context.Context, tx testModificationTx) error {
-			return wantErr
-		}))
+	dispatch := countingDispatch(cr).OnReset(func(ctx context.Context, tx testModificationTx) error {
+		return wantErr
+	})
+	p, err := monotonic.NewProjector(ctx, "p1", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -378,11 +405,11 @@ func TestProjector_UpdateAdoptsResetCommittedByAnotherInstance(t *testing.T) {
 	noReset := func(ctx context.Context, tx testModificationTx) error { return nil }
 
 	crA, crB := &counterRef{}, &counterRef{}
-	a, err := monotonic.NewProjector(ctx, "shared", store, countingDispatch(crA), backend, 0, monotonic.WithReset(noReset))
+	a, err := monotonic.NewProjector(ctx, "shared", store, countingDispatch(crA).OnReset(noReset), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector a: %v", err)
 	}
-	b, err := monotonic.NewProjector(ctx, "shared", store, countingDispatch(crB), backend, 0, monotonic.WithReset(noReset))
+	b, err := monotonic.NewProjector(ctx, "shared", store, countingDispatch(crB).OnReset(noReset), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector b: %v", err)
 	}
@@ -435,7 +462,7 @@ func TestProjector_ResetRequestIsClaimedExactlyOnce(t *testing.T) {
 
 	instances := make([]*monotonic.Projector[testModificationTx], 3)
 	for i := range instances {
-		p, err := monotonic.NewProjector(ctx, "shared", store, noopDispatch(), backend, 0, monotonic.WithReset(countReset))
+		p, err := monotonic.NewProjector(ctx, "shared", store, noopDispatch().OnReset(countReset), backend, 0)
 		if err != nil {
 			t.Fatalf("NewProjector %d: %v", i, err)
 		}
@@ -461,8 +488,8 @@ func TestProjector_ResetRequestIsClaimedExactlyOnce(t *testing.T) {
 	}
 }
 
-// TestProjector_RequestedResetWithoutResetFuncFailsLoudly pins that a projector which cannot
-// clear its own state refuses to rewind rather than replaying every event on top of rows that
+// TestProjector_RequestedResetWithoutResetFuncFailsLoudly pins that a projector whose dispatch
+// registered no reset func refuses to rewind rather than replaying every event on top of rows that
 // are still there. The request can arrive from outside the process (an operator writing the
 // backend's flag by hand), so Update has to defend against it too.
 func TestProjector_RequestedResetWithoutResetFuncFailsLoudly(t *testing.T) {
@@ -478,7 +505,7 @@ func TestProjector_RequestedResetWithoutResetFuncFailsLoudly(t *testing.T) {
 	}
 
 	if err := p.RequestReset(ctx); err == nil {
-		t.Error("RequestReset should fail when no reset func is registered")
+		t.Error("RequestReset should fail when the dispatch has no reset func")
 	}
 
 	// Simulate the request arriving out of band instead.
@@ -486,7 +513,7 @@ func TestProjector_RequestedResetWithoutResetFuncFailsLoudly(t *testing.T) {
 		t.Fatalf("backend.RequestReset: %v", err)
 	}
 	if _, err := p.Update(ctx); err == nil {
-		t.Error("Update should fail when a reset is pending and no reset func is registered")
+		t.Error("Update should fail when a reset is pending and the dispatch has no reset func")
 	}
 	if cr.n != 0 {
 		t.Errorf("no events should have been dispatched, got %d", cr.n)

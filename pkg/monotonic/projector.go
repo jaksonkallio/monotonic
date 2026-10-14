@@ -79,27 +79,6 @@ type Projector[ModificationTx any] struct {
 	counter uint64
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
-	// reset clears whatever state this projector's handlers have written, and is nil unless
-	// WithReset was supplied. Registered up front rather than passed to a reset call because a
-	// reset can be requested from outside the process, and whichever instance claims it needs
-	// the function already in hand.
-	reset func(ctx context.Context, tx ModificationTx) error
-}
-
-// ProjectorOption configures a Projector at construction.
-type ProjectorOption[ModificationTx any] func(*Projector[ModificationTx])
-
-// WithReset registers the function that clears whatever state this projector's handlers have
-// written (e.g. truncating the implementer's own tables). It runs with the same ModificationTx a
-// handler would get, in the same transaction that rewinds the resume counter to 0.
-//
-// A projector without a reset function cannot be reset: Update fails loudly when it finds a pending
-// request it cannot service, rather than rewinding the counter onto un-cleared projection state and
-// letting every handler re-apply on top of rows that are already there.
-func WithReset[ModificationTx any](reset func(ctx context.Context, tx ModificationTx) error) ProjectorOption[ModificationTx] {
-	return func(p *Projector[ModificationTx]) {
-		p.reset = reset
-	}
 }
 
 // NewProjector creates a Projector and derives its resume position from backend.GetState.
@@ -110,7 +89,6 @@ func NewProjector[ModificationTx any](
 	dispatch *Dispatch[ModificationTx],
 	backend ProjectorBackend[ModificationTx],
 	updateBatchSize int,
-	opts ...ProjectorOption[ModificationTx],
 ) (*Projector[ModificationTx], error) {
 	if name == "" {
 		return nil, fmt.Errorf("NewProjector: name must be non-empty")
@@ -122,18 +100,14 @@ func NewProjector[ModificationTx any](
 	if err != nil {
 		return nil, fmt.Errorf("init projector %q: %w", name, err)
 	}
-	p := &Projector[ModificationTx]{
+	return &Projector[ModificationTx]{
 		name:            name,
 		store:           store,
 		dispatch:        dispatch,
 		backend:         backend,
 		counter:         state.Counter,
 		updateBatchSize: updateBatchSize,
-	}
-	for _, opt := range opts {
-		opt(p)
-	}
-	return p, nil
+	}, nil
 }
 
 // Update services any pending reset, then processes a batch of pending events and returns the
@@ -192,9 +166,10 @@ func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 // serviceReset claims a pending reset and rewinds this projector to the beginning of the stream.
 // Callers must hold p.mu.
 func (p *Projector[ModificationTx]) serviceReset(ctx context.Context) error {
-	if p.reset == nil {
+	reset := p.dispatch.ResetFunc()
+	if reset == nil {
 		return fmt.Errorf(
-			"projector %q: reset requested but no reset function is registered; pass monotonic.WithReset to NewProjector so the projector can clear what its handlers wrote",
+			"projector %q: reset requested but its dispatch has no reset function; call Dispatch.OnReset so the projector can clear what its handlers wrote",
 			p.name,
 		)
 	}
@@ -202,7 +177,7 @@ func (p *Projector[ModificationTx]) serviceReset(ctx context.Context) error {
 	// claimed is false when another instance got there first. Either way the projector is now
 	// rewound, so our cached position is stale regardless of who did the work. Starting from 0 is
 	// safe even if the winner has already replayed past it, since RunEvent skips what is applied.
-	if _, err := p.backend.ClaimReset(ctx, p.name, p.reset); err != nil {
+	if _, err := p.backend.ClaimReset(ctx, p.name, reset); err != nil {
 		return fmt.Errorf("claim reset for projector %q: %w", p.name, err)
 	}
 	p.counter = 0
@@ -211,16 +186,16 @@ func (p *Projector[ModificationTx]) serviceReset(ctx context.Context) error {
 
 // RequestReset marks the projector for reset and returns without doing the work. The next instance
 // to poll (this one or another) claims the request and performs the reset exactly once, truncating
-// via the function registered with WithReset and rewinding the resume counter to 0. Every other
+// via the function registered with Dispatch.OnReset and rewinding the resume counter to 0. Every other
 // instance picks up the rewound position on its next batch, so it is safe to call while projectors
 // are running.
 //
 // Use this to trigger a rebuild across a fleet. Writing the backend's pending-reset flag directly
 // (e.g. by hand in SQL) has the same effect; this is the in-process spelling of it.
 func (p *Projector[ModificationTx]) RequestReset(ctx context.Context) error {
-	if p.reset == nil {
+	if p.dispatch.ResetFunc() == nil {
 		return fmt.Errorf(
-			"projector %q: cannot request reset, no reset function is registered; pass monotonic.WithReset to NewProjector",
+			"projector %q: cannot request reset, its dispatch has no reset function; call Dispatch.OnReset",
 			p.name,
 		)
 	}
