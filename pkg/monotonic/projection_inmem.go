@@ -15,19 +15,19 @@ import (
 // The rule that keeps this safe regardless of T is to treat anything InMemoryProjectionTx.Get returns as read-only: derive a new value from it and hand that to Set, rather than mutating what you were given.
 // Enforcing this in the type system would mean requiring every T to supply a deep-copy method, which is a lot of ceremony to impose on the common case of a flat struct, so it is a documented contract instead.
 type InMemoryProjection[T any] struct {
-	// mu guards rows and state across concurrent RunEvent, ResetState, and reads.
+	// mu guards rows and state across concurrent RunEvent, ClaimReset, and reads.
 	mu sync.RWMutex
 	// rows holds the committed projection, keyed by aggregate ID (or whatever key the handlers write).
 	rows map[string]T
-	// state holds each projector's resume counter; an InMemoryProjection is intended to back a single projector.
-	state map[string]uint64
+	// state holds each projector's resume counter and pending-reset flag; an InMemoryProjection is intended to back a single projector.
+	state map[string]ProjectorState
 }
 
 // NewInMemoryProjection creates an empty InMemoryProjection.
 func NewInMemoryProjection[T any]() *InMemoryProjection[T] {
 	return &InMemoryProjection[T]{
 		rows:  make(map[string]T),
-		state: make(map[string]uint64),
+		state: make(map[string]ProjectorState),
 	}
 }
 
@@ -58,8 +58,8 @@ func (tx *InMemoryProjectionTx[T]) Clear() {
 	clear(tx.rows)
 }
 
-// GetState returns the resume counter for projectorName, or 0 if none.
-func (p *InMemoryProjection[T]) GetState(_ context.Context, projectorName string) (uint64, error) {
+// GetState returns the stored state for projectorName, zero-valued if none.
+func (p *InMemoryProjection[T]) GetState(_ context.Context, projectorName string) (ProjectorState, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.state[projectorName], nil
@@ -74,33 +74,56 @@ func (p *InMemoryProjection[T]) GetState(_ context.Context, projectorName string
 //
 // The cost is that reads block for as long as a handler runs, and that a handler must never call back into the projection's own Get or All, since RWMutex is not reentrant and doing so deadlocks.
 // Handlers already have everything they need on the tx they are given, which reads the buffered rows and is the only correct way to see writes made earlier in the same call.
-func (p *InMemoryProjection[T]) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
+func (p *InMemoryProjection[T]) RunEvent(ctx context.Context, projectorName string, from, counter uint64, apply func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) (uint64, error) {
 	if counter == 0 {
-		return fmt.Errorf("projection counter must be > 0")
+		return 0, fmt.Errorf("projection counter must be > 0")
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	// Skip counters already applied, mirroring the exactly-once behavior of the Postgres backend.
-	if p.state[projectorName] >= counter {
-		return nil
+	// Skip counters already applied, positions rewound below what the caller believes is current,
+	// and events arriving while a reset is pending, mirroring the Postgres backend.
+	state := p.state[projectorName]
+	if state.Counter >= counter || state.Counter < from || state.ResetRequested {
+		return state.Counter, nil
 	}
 
 	tx := &InMemoryProjectionTx[T]{rows: maps.Clone(p.rows)}
 	if err := apply(ctx, tx); err != nil {
-		return err
+		return 0, err
 	}
 
 	p.rows = tx.rows
-	p.state[projectorName] = counter
+	state.Counter = counter
+	p.state[projectorName] = state
+	return counter, nil
+}
+
+// RequestReset marks projectorName for reset without doing any projection work.
+func (p *InMemoryProjection[T]) RequestReset(_ context.Context, projectorName string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := p.state[projectorName]
+	state.ResetRequested = true
+	p.state[projectorName] = state
 	return nil
 }
 
-// ResetState runs reset against a buffered copy and rewinds projectorName's counter to 0 only if reset succeeds.
-func (p *InMemoryProjection[T]) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
+// ClaimReset runs reset against a buffered copy and, only if reset succeeds, commits that copy
+// alongside rewinding projectorName's counter to 0 and clearing the pending flag. Holding the
+// write lock across the whole call is what makes the claim exactly-once: a second caller cannot
+// observe the flag until the first has committed or rolled back. Does nothing when no reset was
+// pending, meaning someone else already serviced it.
+func (p *InMemoryProjection[T]) ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	state := p.state[projectorName]
+	if !state.ResetRequested {
+		return nil
+	}
 
 	tx := &InMemoryProjectionTx[T]{rows: maps.Clone(p.rows)}
 	if err := reset(ctx, tx); err != nil {
@@ -108,7 +131,7 @@ func (p *InMemoryProjection[T]) ResetState(ctx context.Context, projectorName st
 	}
 
 	p.rows = tx.rows
-	p.state[projectorName] = 0
+	p.state[projectorName] = ProjectorState{}
 	return nil
 }
 

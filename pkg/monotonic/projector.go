@@ -12,21 +12,53 @@ import (
 // DefaultUpdateBatchSize is a sensible default maximum number of events loaded per Update call.
 const DefaultUpdateBatchSize = 100
 
+// ProjectorState is a projector's backend-held position: the resume counter plus whether a
+// reset has been requested for it and not yet serviced.
+type ProjectorState struct {
+	// Counter is the highest global counter committed for the projector; 0 means nothing has been processed.
+	Counter uint64
+	// ResetRequested reports that someone has asked for this projector to be rebuilt from scratch.
+	// It stays true until an instance claims the request and runs the reset, so every instance of
+	// the projector observes it even if only one of them does the work.
+	ResetRequested bool
+}
+
 // ProjectorBackend is the store-specific glue that runs each event atomically alongside
 // the projector's resume-counter advance. ModificationTx is the per-event handle the backend
 // hands to handlers (e.g. a Postgres pgx.Tx, a pipeline, a producer). Implementations open a transaction
 // (or equivalent), construct a ModificationTx bound to it, invoke apply, and commit only if apply succeeds.
+//
+// The backend's stored state is authoritative. A Projector's in-memory counter is only a cache of it,
+// because other instances of the same projector share the row and may move it in either direction.
 type ProjectorBackend[ModificationTx any] interface {
-	// GetState returns the resume counter for projectorName, or 0 if none.
-	GetState(ctx context.Context, projectorName string) (uint64, error)
+	// GetState returns the stored state for projectorName, zero-valued if none.
+	GetState(ctx context.Context, projectorName string) (ProjectorState, error)
 
-	// RunEvent runs apply and records (projectorName, counter) atomically.
+	// RunEvent runs apply and records (projectorName, counter) atomically, returning the stored
+	// counter as of the commit. from is the counter the caller believes is current, which lets the
+	// backend tell "this event is next" apart from "the stored position moved since you last looked".
 	// On apply error, neither the handler's writes nor the state advance are committed.
-	RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx ModificationTx) error) error
+	//
+	// Implementations must take the stored position under a lock and then:
+	//   - skip apply when the stored counter is already >= counter (another instance got there first);
+	//   - skip apply when the stored counter is < from (a reset rewound the projector underneath the caller);
+	//   - skip apply when a reset is pending, since anything applied now is about to be discarded;
+	//   - otherwise run apply, advance the stored counter to counter, and commit both together.
+	// Any skip returns the stored counter unchanged and no error, so a caller detects all three
+	// by comparing the returned counter against the one it asked for.
+	RunEvent(ctx context.Context, projectorName string, from, counter uint64, apply func(ctx context.Context, tx ModificationTx) error) (uint64, error)
 
-	// ResetState runs reset and sets projectorName's counter back to 0, atomically.
-	// On reset error, neither reset's writes nor the counter reset are committed.
-	ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx ModificationTx) error) error
+	// RequestReset marks projectorName for reset. It does no projection work itself: the next
+	// instance to observe the request claims and performs it. Requesting a reset that is already
+	// pending is a no-op rather than an error.
+	RequestReset(ctx context.Context, projectorName string) error
+
+	// ClaimReset services a pending reset exactly once across all instances of projectorName.
+	// Implementations re-check the pending flag under the same lock RunEvent takes: finding no
+	// reset pending means another instance claimed it first, so ClaimReset does nothing and
+	// succeeds. Otherwise it runs reset, sets the counter back to 0, clears the pending flag, and
+	// commits all three atomically. On reset error, none of it is committed.
+	ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx ModificationTx) error) error
 }
 
 // Projector reads events from a Store and dispatches each one through a Dispatch,
@@ -40,15 +72,15 @@ type Projector[ModificationTx any] struct {
 	dispatch *Dispatch[ModificationTx]
 	// backend runs each event atomically with the counter advance.
 	backend ProjectorBackend[ModificationTx]
-	// mu serializes Update calls and protects counter.
+	// mu serializes Update calls against each other, and against a Reset serviced in-process.
 	mu sync.Mutex
-	// counter is the resume position; events with global_counter > this are pending.
-	counter uint64
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
 }
 
-// NewProjector creates a Projector and derives its resume position from backend.GetState.
+// NewProjector creates a Projector. It reads the backend's state once as a startup check, so a
+// misconfigured backend (most often one whose Migrate was never called) fails here rather than on
+// the first Update. A Projector holds no position of its own: every batch reads the backend's.
 func NewProjector[ModificationTx any](
 	ctx context.Context,
 	name string,
@@ -63,8 +95,7 @@ func NewProjector[ModificationTx any](
 	if updateBatchSize <= 0 {
 		updateBatchSize = DefaultUpdateBatchSize
 	}
-	counter, err := backend.GetState(ctx, name)
-	if err != nil {
+	if _, err := backend.GetState(ctx, name); err != nil {
 		return nil, fmt.Errorf("init projector %q: %w", name, err)
 	}
 	return &Projector[ModificationTx]{
@@ -72,17 +103,33 @@ func NewProjector[ModificationTx any](
 		store:           store,
 		dispatch:        dispatch,
 		backend:         backend,
-		counter:         counter,
 		updateBatchSize: updateBatchSize,
 	}, nil
 }
 
-// Update processes a batch of pending events and returns the count, or 0 if caught up.
+// Update services any pending reset, then processes a batch of pending events and returns the
+// count, or 0 if caught up.
 func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	events, err := p.store.LoadGlobalEvents(ctx, p.dispatch.EventFilters(), int64(p.counter), p.updateBatchSize)
+	// The backend holds the only resume position there is. Every instance of this projector shares
+	// it and may have moved it since the last batch, forwards by processing events or backwards by
+	// servicing a reset, so a position cached between batches would be a guess. Read it instead.
+	state, err := p.backend.GetState(ctx, p.name)
+	if err != nil {
+		return 0, fmt.Errorf("load state for projector %q: %w", p.name, err)
+	}
+	position := state.Counter
+
+	if state.ResetRequested {
+		if err := p.claimReset(ctx); err != nil {
+			return 0, err
+		}
+		position = 0
+	}
+
+	events, err := p.store.LoadGlobalEvents(ctx, p.dispatch.EventFilters(), int64(position), p.updateBatchSize)
 	if err != nil {
 		return 0, fmt.Errorf("load events: %w", err)
 	}
@@ -90,32 +137,82 @@ func (p *Projector[ModificationTx]) Update(ctx context.Context) (int, error) {
 	processed := 0
 	for _, event := range events {
 		counter := uint64(event.Event.GlobalCounter)
-		err := p.backend.RunEvent(ctx, p.name, counter, func(ctx context.Context, tx ModificationTx) error {
+		current, err := p.backend.RunEvent(ctx, p.name, position, counter, func(ctx context.Context, tx ModificationTx) error {
 			return p.dispatch.Apply(ctx, tx, event)
 		})
 		if err != nil {
 			return processed, fmt.Errorf("apply event %d: %w", event.Event.GlobalCounter, err)
 		}
-		p.counter = counter
+		if current != counter {
+			// The stored position did not end up where this event would have left it, so the
+			// backend declined to apply: another instance raced ahead of us, reset the projector
+			// underneath us, or a reset is now pending. Either way the rest of this batch was
+			// loaded against a position that no longer holds, so drop it and let the next Update
+			// reload from wherever the backend is now.
+			return processed, nil
+		}
+		position = counter
 		processed++
 	}
 
 	return processed, nil
 }
 
-// Reset runs reset and rewinds the projector back to the beginning of the event stream, atomically.
-// reset is responsible for clearing whatever state the projector's handlers have written (e.g. truncating
-// the implementer's own tables); it runs with the same ModificationTx a handler would get. Callers must ensure no
-// concurrent Run/Update loop is driving this projector, since Reset does not stop one.
-func (p *Projector[ModificationTx]) Reset(ctx context.Context, reset func(ctx context.Context, tx ModificationTx) error) error {
+// claimReset services a pending reset, clearing the projection and rewinding the backend's counter
+// to the beginning of the stream. Callers must hold p.mu.
+func (p *Projector[ModificationTx]) claimReset(ctx context.Context) error {
+	reset := p.dispatch.ResetFunc()
+	if reset == nil {
+		return fmt.Errorf(
+			"projector %q: reset requested but its dispatch has no reset function; call Dispatch.OnReset so the projector can clear what its handlers wrote",
+			p.name,
+		)
+	}
+
+	// A no-op claim means another instance got there first, which is not an error: the reset
+	// happened exactly once either way, and the caller resumes from 0 regardless. Starting from 0
+	// is safe even if the winner has already replayed past it, since RunEvent skips what is applied.
+	if err := p.backend.ClaimReset(ctx, p.name, reset); err != nil {
+		return fmt.Errorf("claim reset for projector %q: %w", p.name, err)
+	}
+	return nil
+}
+
+// RequestReset marks the projector for reset and returns without doing the work. The next instance
+// to poll (this one or another) claims the request and performs the reset exactly once, truncating
+// via the function registered with Dispatch.OnReset and rewinding the resume counter to 0. Every other
+// instance picks up the rewound position on its next batch, so it is safe to call while projectors
+// are running.
+//
+// Use this to trigger a rebuild across a fleet. Writing the backend's pending-reset flag directly
+// (e.g. by hand in SQL) has the same effect; this is the in-process spelling of it.
+func (p *Projector[ModificationTx]) RequestReset(ctx context.Context) error {
+	if p.dispatch.ResetFunc() == nil {
+		return fmt.Errorf(
+			"projector %q: cannot request reset, its dispatch has no reset function; call Dispatch.OnReset",
+			p.name,
+		)
+	}
+	if err := p.backend.RequestReset(ctx, p.name); err != nil {
+		return fmt.Errorf("request reset for projector %q: %w", p.name, err)
+	}
+	return nil
+}
+
+// Reset requests a reset and services it before returning, so the projection is cleared and this
+// instance is rewound by the time Reset returns. Other instances pick up the rewind on their next
+// batch. Prefer RequestReset when the caller does not need to observe the reset synchronously.
+//
+// If another instance claims the request first, Reset still returns successfully: the reset
+// happened exactly once, just not here.
+func (p *Projector[ModificationTx]) Reset(ctx context.Context) error {
+	if err := p.RequestReset(ctx); err != nil {
+		return err
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	if err := p.backend.ResetState(ctx, p.name, reset); err != nil {
-		return fmt.Errorf("reset projector %q: %w", p.name, err)
-	}
-	p.counter = 0
-	return nil
+	return p.claimReset(ctx)
 }
 
 // Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.
@@ -146,11 +243,17 @@ func (p *Projector[ModificationTx]) Run(ctx context.Context, pollInterval time.D
 	}
 }
 
-// GlobalCounter returns the highest global counter the projector has processed.
-func (p *Projector[ModificationTx]) GlobalCounter() uint64 {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.counter
+// GlobalCounter reads the highest global counter committed for this projector from the backend.
+// That position is shared by every instance of the projector, so it reports how far the projector
+// has got overall rather than how much of it this particular instance did.
+//
+// It takes no lock, so polling it for metrics does not queue behind an in-flight Update batch.
+func (p *Projector[ModificationTx]) GlobalCounter(ctx context.Context) (uint64, error) {
+	state, err := p.backend.GetState(ctx, p.name)
+	if err != nil {
+		return 0, fmt.Errorf("read counter for projector %q: %w", p.name, err)
+	}
+	return state.Counter, nil
 }
 
 // Name returns the projector name used in the backend's state store.
