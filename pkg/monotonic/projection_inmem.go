@@ -114,25 +114,25 @@ func (p *InMemoryProjection[T]) RequestReset(_ context.Context, projectorName st
 // ClaimReset runs reset against a buffered copy and, only if reset succeeds, commits that copy
 // alongside rewinding projectorName's counter to 0 and clearing the pending flag. Holding the
 // write lock across the whole call is what makes the claim exactly-once: a second caller cannot
-// observe the flag until the first has committed or rolled back. Reports claimed=false when no
-// reset was pending, meaning someone else already serviced it.
-func (p *InMemoryProjection[T]) ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) (bool, error) {
+// observe the flag until the first has committed or rolled back. Does nothing when no reset was
+// pending, meaning someone else already serviced it.
+func (p *InMemoryProjection[T]) ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	state := p.state[projectorName]
 	if !state.ResetRequested {
-		return false, nil
+		return nil
 	}
 
 	tx := &InMemoryProjectionTx[T]{rows: maps.Clone(p.rows)}
 	if err := reset(ctx, tx); err != nil {
-		return false, err
+		return err
 	}
 
 	p.rows = tx.rows
 	p.state[projectorName] = ProjectorState{}
-	return true, nil
+	return nil
 }
 
 // Get returns the committed row for key and whether it exists.

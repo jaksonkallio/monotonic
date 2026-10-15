@@ -146,14 +146,21 @@ func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
 		t.Fatalf("RunEvent: %v", err)
 	}
 
+	// Counting invocations is how a caller tells a won claim from a lost one now that ClaimReset
+	// reports only errors: what matters is whether the clearing work happened, not who did it.
+	clears := 0
 	clearRows := func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+		clears++
 		tx.Clear()
 		return nil
 	}
 
 	// Nothing pending yet, so there is nothing to claim.
-	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || claimed {
-		t.Fatalf("ClaimReset with no pending request: claimed=%v err=%v, want false/nil", claimed, err)
+	if err := proj.ClaimReset(ctx, "p", clearRows); err != nil {
+		t.Fatalf("ClaimReset with no pending request: %v", err)
+	}
+	if clears != 0 {
+		t.Errorf("reset func ran %d times with no request pending, want 0", clears)
 	}
 
 	if err := proj.RequestReset(ctx, "p"); err != nil {
@@ -163,8 +170,11 @@ func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
 		t.Error("GetState should report the pending reset request")
 	}
 
-	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || !claimed {
-		t.Fatalf("ClaimReset: claimed=%v err=%v, want true/nil", claimed, err)
+	if err := proj.ClaimReset(ctx, "p", clearRows); err != nil {
+		t.Fatalf("ClaimReset: %v", err)
+	}
+	if clears != 1 {
+		t.Fatalf("reset func ran %d times servicing the request, want 1", clears)
 	}
 
 	if got := len(proj.All()); got != 0 {
@@ -175,12 +185,15 @@ func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
 		t.Errorf("counter = %d, want 0 after reset", state.Counter)
 	}
 	if state.ResetRequested {
-		t.Error("reset request should be cleared once claimed")
+		t.Error("reset request should be cleared once serviced")
 	}
 
-	// A second claimant finds the request already serviced.
-	if claimed, err := proj.ClaimReset(ctx, "p", clearRows); err != nil || claimed {
-		t.Errorf("second ClaimReset: claimed=%v err=%v, want false/nil", claimed, err)
+	// A second claimant finds the request already serviced and does nothing.
+	if err := proj.ClaimReset(ctx, "p", clearRows); err != nil {
+		t.Errorf("second ClaimReset: %v", err)
+	}
+	if clears != 1 {
+		t.Errorf("reset func ran %d times total, want 1: an already-serviced request must not run it again", clears)
 	}
 }
 

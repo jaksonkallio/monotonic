@@ -76,25 +76,25 @@ func (b *fakeBackend) RequestReset(_ context.Context, projectorName string) erro
 	return nil
 }
 
-func (b *fakeBackend) ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx testModificationTx) error) (bool, error) {
+func (b *fakeBackend) ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx testModificationTx) error) error {
 	b.mu.Lock()
 	b.resetCalls++
 	state := b.state[projectorName]
 	b.mu.Unlock()
 
 	if b.resetErr != nil {
-		return false, b.resetErr
+		return b.resetErr
 	}
 	if !state.ResetRequested {
-		return false, nil
+		return nil
 	}
 	if err := reset(ctx, testModificationTx{}); err != nil {
-		return false, err
+		return err
 	}
 	b.mu.Lock()
 	b.state[projectorName] = monotonic.ProjectorState{}
 	b.mu.Unlock()
-	return true, nil
+	return nil
 }
 
 func (b *fakeBackend) seed(projectorName string, counter uint64) {
@@ -491,7 +491,7 @@ func TestProjector_UpdateAbandonsBatchWhenResetLandsMidBatch(t *testing.T) {
 		if err := backend.RequestReset(ctx, "shared"); err != nil {
 			t.Errorf("RequestReset: %v", err)
 		}
-		if _, err := backend.ClaimReset(ctx, "shared", noReset); err != nil {
+		if err := backend.ClaimReset(ctx, "shared", noReset); err != nil {
 			t.Errorf("ClaimReset: %v", err)
 		}
 	}

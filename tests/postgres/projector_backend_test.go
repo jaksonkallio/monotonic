@@ -364,7 +364,7 @@ func TestProjectorBackend_ResetRollsBackOnResetFuncError(t *testing.T) {
 	}
 
 	wantErr := errors.New("simulated reset failure")
-	_, err := backend.ClaimReset(ctx, "reset_rb", func(ctx context.Context, tx pgx.Tx) error {
+	err := backend.ClaimReset(ctx, "reset_rb", func(ctx context.Context, tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO proj_reset_rb (k, n) VALUES ('x', 1)`); err != nil {
 			return err
 		}
@@ -426,8 +426,8 @@ func TestProjectorBackend_RunEventDeclinesWhenRewoundUnderneath(t *testing.T) {
 	if err := backend.RequestReset(ctx, "rewound"); err != nil {
 		t.Fatalf("RequestReset: %v", err)
 	}
-	if claimed, err := backend.ClaimReset(ctx, "rewound", func(_ context.Context, _ pgx.Tx) error { return nil }); err != nil || !claimed {
-		t.Fatalf("ClaimReset: claimed=%v err=%v", claimed, err)
+	if err := backend.ClaimReset(ctx, "rewound", func(_ context.Context, _ pgx.Tx) error { return nil }); err != nil {
+		t.Fatalf("ClaimReset: %v", err)
 	}
 
 	got, err := backend.RunEvent(ctx, "rewound", 7, 8, apply)
@@ -479,7 +479,7 @@ func TestProjectorBackend_RunEventDeclinesWhileResetPending(t *testing.T) {
 
 // TestProjectorBackend_ConcurrentClaimResetRunsExactlyOnce simulates every instance of a projector
 // noticing the same reset request at once. The projector_state row lock must let exactly one of
-// them run the reset func, with the rest reporting claimed=false.
+// them run the reset func, with the rest finding the request already serviced and doing nothing.
 func TestProjectorBackend_ConcurrentClaimResetRunsExactlyOnce(t *testing.T) {
 	ctx := context.Background()
 	backend := resetProjectorState(t)
@@ -501,28 +501,21 @@ func TestProjectorBackend_ConcurrentClaimResetRunsExactlyOnce(t *testing.T) {
 
 	const instances = 4
 	var wg sync.WaitGroup
-	claims := make([]bool, instances)
 	errs := make([]error, instances)
-	for i := range claims {
+	for i := range errs {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			claims[i], errs[i] = backend.ClaimReset(ctx, "claim_race", reset)
+			errs[i] = backend.ClaimReset(ctx, "claim_race", reset)
 		}(i)
 	}
 	wg.Wait()
 
-	claimed := 0
+	// Losing the race is not an error; it just means there was nothing left to do.
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("instance %d ClaimReset: %v", i, err)
 		}
-		if claims[i] {
-			claimed++
-		}
-	}
-	if claimed != 1 {
-		t.Errorf("%d instances claimed the reset, want exactly 1", claimed)
 	}
 	if got := resetCalls.Load(); got != 1 {
 		t.Errorf("reset func ran %d times across %d instances, want exactly 1", got, instances)
@@ -533,7 +526,7 @@ func TestProjectorBackend_ConcurrentClaimResetRunsExactlyOnce(t *testing.T) {
 		t.Errorf("counter = %d, want 0 after reset", state.Counter)
 	}
 	if state.ResetRequested {
-		t.Error("reset request must be cleared once claimed")
+		t.Error("reset request must be cleared once serviced")
 	}
 }
 

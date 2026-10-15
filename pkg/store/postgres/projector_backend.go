@@ -175,35 +175,35 @@ func (b *ProjectorBackend) RequestReset(ctx context.Context, projectorName strin
 
 // ClaimReset opens a tx and locks projector_state for projectorName, which is what makes the reset
 // happen exactly once: every instance that notices the request races here, and the losers find
-// reset_requested_at already cleared by the winner's commit and report claimed=false. The winner
-// hands the tx to reset, rewinds projector_state to 0, clears the request, and commits all three
+// reset_requested_at already cleared by the winner's commit, so they do nothing. The winner hands
+// the tx to reset, rewinds projector_state to 0, clears the request, and commits all three
 // together. The row lock also serializes against concurrent RunEvent calls for the same
 // projectorName, so reset cannot race with an in-flight apply.
 func (b *ProjectorBackend) ClaimReset(
 	ctx context.Context,
 	projectorName string,
 	reset func(ctx context.Context, tx pgx.Tx) error,
-) (bool, error) {
+) error {
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("begin tx: %w", err)
+		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	state, err := lockState(ctx, tx, projectorName)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if !state.ResetRequested {
 		// Another instance serviced the request while we were waiting for the lock.
 		if err := tx.Commit(ctx); err != nil {
-			return false, fmt.Errorf("commit projector_state for %q: %w", projectorName, err)
+			return fmt.Errorf("commit projector_state for %q: %w", projectorName, err)
 		}
-		return false, nil
+		return nil
 	}
 
 	if err := reset(ctx, tx); err != nil {
-		return false, err
+		return err
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -211,11 +211,11 @@ func (b *ProjectorBackend) ClaimReset(
 		SET global_counter = 0, reset_requested_at = NULL, updated_at = now()
 		WHERE projector_name = $1
 	`, projectorName); err != nil {
-		return false, fmt.Errorf("reset projector_state for %q: %w", projectorName, err)
+		return fmt.Errorf("reset projector_state for %q: %w", projectorName, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return false, fmt.Errorf("commit projector_state reset for %q: %w", projectorName, err)
+		return fmt.Errorf("commit projector_state reset for %q: %w", projectorName, err)
 	}
-	return true, nil
+	return nil
 }

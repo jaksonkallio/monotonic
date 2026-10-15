@@ -54,11 +54,11 @@ type ProjectorBackend[ModificationTx any] interface {
 	RequestReset(ctx context.Context, projectorName string) error
 
 	// ClaimReset services a pending reset exactly once across all instances of projectorName.
-	// Implementations re-check the pending flag under the same lock RunEvent takes: if no reset is
-	// pending (another instance claimed it first), ClaimReset reports claimed=false and does nothing.
-	// Otherwise it runs reset, sets the counter back to 0, clears the pending flag, and commits all
-	// three atomically. On reset error, none of it is committed.
-	ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx ModificationTx) error) (claimed bool, err error)
+	// Implementations re-check the pending flag under the same lock RunEvent takes: finding no
+	// reset pending means another instance claimed it first, so ClaimReset does nothing and
+	// succeeds. Otherwise it runs reset, sets the counter back to 0, clears the pending flag, and
+	// commits all three atomically. On reset error, none of it is committed.
+	ClaimReset(ctx context.Context, projectorName string, reset func(ctx context.Context, tx ModificationTx) error) error
 }
 
 // Projector reads events from a Store and dispatches each one through a Dispatch,
@@ -72,7 +72,7 @@ type Projector[ModificationTx any] struct {
 	dispatch *Dispatch[ModificationTx]
 	// backend runs each event atomically with the counter advance.
 	backend ProjectorBackend[ModificationTx]
-	// mu serializes Update calls against each other, and against a Reset claimed in-process.
+	// mu serializes Update calls against each other, and against a Reset serviced in-process.
 	mu sync.Mutex
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
@@ -169,10 +169,10 @@ func (p *Projector[ModificationTx]) claimReset(ctx context.Context) error {
 		)
 	}
 
-	// claimed is false when another instance got there first, which is not an error: the reset
+	// A no-op claim means another instance got there first, which is not an error: the reset
 	// happened exactly once either way, and the caller resumes from 0 regardless. Starting from 0
 	// is safe even if the winner has already replayed past it, since RunEvent skips what is applied.
-	if _, err := p.backend.ClaimReset(ctx, p.name, reset); err != nil {
+	if err := p.backend.ClaimReset(ctx, p.name, reset); err != nil {
 		return fmt.Errorf("claim reset for projector %q: %w", p.name, err)
 	}
 	return nil
