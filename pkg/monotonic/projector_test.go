@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +16,9 @@ import (
 // real per-event environment, so it only carries the bookkeeping the backend needs to verify that
 // the projector ends every transaction exactly once.
 type testTx struct {
-	backend  *fakeBackend
+	backend *fakeBackend
+	// name is the projector whose state this transaction holds the lock on.
+	name     string
 	finished bool
 }
 
@@ -26,7 +29,7 @@ func (tx *testTx) Rollback(context.Context) error {
 		return nil
 	}
 	tx.finished = true
-	tx.backend.unlock()
+	tx.backend.unlock(tx.name)
 	return nil
 }
 
@@ -35,9 +38,11 @@ func (tx *testTx) Rollback(context.Context) error {
 type fakeBackend struct {
 	mu    sync.Mutex
 	state map[string]monotonic.ProjectorStateSnapshot
-	// locked is held between LockStateForModification and the transaction ending, so the tests can
-	// assert the projector never leaks or double-ends a transaction.
-	locked bool
+	// locked tracks which projectors currently have an open transaction, so the tests can assert a
+	// projector never leaks or double-ends one. It is keyed by projector name because that is how
+	// the Postgres backend locks: a row per projector, so differently named projectors never
+	// contend and can be drained concurrently against one backend.
+	locked map[string]bool
 
 	lockErr   error // if non-nil, LockStateForModification fails with it
 	commitErr error // if non-nil, both Commit methods fail with it
@@ -46,13 +51,16 @@ type fakeBackend struct {
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{state: make(map[string]monotonic.ProjectorStateSnapshot)}
+	return &fakeBackend{
+		state:  make(map[string]monotonic.ProjectorStateSnapshot),
+		locked: make(map[string]bool),
+	}
 }
 
-func (b *fakeBackend) unlock() {
+func (b *fakeBackend) unlock(projectorName string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.locked = false
+	delete(b.locked, projectorName)
 }
 
 func (b *fakeBackend) LockStateForModification(_ context.Context, projectorName string) (*testTx, monotonic.ProjectorStateSnapshot, error) {
@@ -62,12 +70,12 @@ func (b *fakeBackend) LockStateForModification(_ context.Context, projectorName 
 	if b.lockErr != nil {
 		return nil, monotonic.ProjectorStateSnapshot{}, b.lockErr
 	}
-	if b.locked {
-		return nil, monotonic.ProjectorStateSnapshot{}, errors.New("fakeBackend: state already locked")
+	if b.locked[projectorName] {
+		return nil, monotonic.ProjectorStateSnapshot{}, fmt.Errorf("fakeBackend: state for %q already locked", projectorName)
 	}
-	b.locked = true
+	b.locked[projectorName] = true
 
-	return &testTx{backend: b}, b.state[projectorName], nil
+	return &testTx{backend: b, name: projectorName}, b.state[projectorName], nil
 }
 
 func (b *fakeBackend) CommitAdvancedStateFromModification(_ context.Context, tx *testTx, projectorName string, advancedToGlobalCounter uint64) error {
@@ -98,7 +106,7 @@ func (b *fakeBackend) commit(tx *testTx, projectorName string, update func(monot
 
 	b.state[projectorName] = update(b.state[projectorName])
 	tx.finished = true
-	b.locked = false
+	delete(b.locked, tx.name)
 	return nil
 }
 
@@ -124,12 +132,12 @@ func (b *fakeBackend) seed(projectorName string, counter uint64) {
 	b.state[projectorName] = monotonic.ProjectorStateSnapshot{GlobalCounter: counter}
 }
 
-// isLocked reports whether a modification transaction is still open, so tests can assert the
+// isLocked reports whether any modification transaction is still open, so tests can assert the
 // projector released the lock on every path.
 func (b *fakeBackend) isLocked() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.locked
+	return len(b.locked) > 0
 }
 
 // countingDispatch returns a Dispatch that counts handler invocations.
@@ -524,11 +532,10 @@ func TestProjector_TruncateWithoutHandlerWedgesProjector(t *testing.T) {
 	}
 }
 
-// TestProjector_RunSurfacesErrNoTruncateHandler covers the sentinel surviving the Run loop, which
-// is where a supervisor actually observes it and has to decide whether restarting could help.
-func TestProjector_RunSurfacesErrNoTruncateHandler(t *testing.T) {
-	// Bounded so a regression that stops erroring fails this test instead of spinning forever:
-	// Run only returns on an error or a dead context, and the lenient behavior produces neither.
+// TestProjector_DrainSurfacesErrNoTruncateHandler covers the sentinel surviving Drain, which is
+// where a caller priming a read model at startup finds out the wiring is wrong.
+func TestProjector_DrainSurfacesErrNoTruncateHandler(t *testing.T) {
+	// Bounded so a regression that stops erroring fails this test rather than draining forever.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -541,8 +548,8 @@ func TestProjector_RunSurfacesErrNoTruncateHandler(t *testing.T) {
 		t.Fatalf("EnqueueTruncate: %v", err)
 	}
 
-	if err := p.Run(ctx, time.Millisecond); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
-		t.Errorf("Run err = %v, want ErrNoTruncateHandler", err)
+	if err := p.Drain(ctx); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+		t.Errorf("Drain err = %v, want ErrNoTruncateHandler", err)
 	}
 }
 
@@ -717,42 +724,30 @@ func TestProjector_UpdatePropagatesCommitError(t *testing.T) {
 	}
 }
 
-func TestProjector_RunStopsOnContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestProjector_DrainReturnsNilWhenCaughtUp(t *testing.T) {
+	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	backend := newFakeBackend()
 	p, _ := monotonic.NewProjector("p1", store, noopDispatch(), backend, 0)
 
+	// An empty store means Drain has nothing to do and must return rather than wait for events.
 	done := make(chan error, 1)
-	go func() { done <- p.Run(ctx, time.Millisecond) }()
-
-	cancel()
+	go func() { done <- p.Drain(ctx) }()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Errorf("Run should return nil on context cancel, got %v", err)
+			t.Errorf("Drain = %v, want nil when already caught up", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Error("Run did not stop within 2s after cancellation")
+		t.Fatal("Drain blocked on an empty store; it must terminate, not poll")
 	}
 }
 
-func TestProjector_RunReturnsErrorFromUpdate(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-	emitEvent(ctx, t, store, 1)
-
-	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector("p1", store, failingDispatch(fmt.Errorf("run boom")), backend, 0)
-
-	err := p.Run(ctx, time.Millisecond)
-	if err == nil {
-		t.Error("expected Run to return error when Update fails")
-	}
-}
-
-func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
+// TestProjector_DrainAppliesEveryPendingEventAcrossBatches covers the loop: a batch size below the
+// number of pending events means one Update cannot finish the job, and Drain must keep going until
+// it has.
+func TestProjector_DrainAppliesEveryPendingEventAcrossBatches(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -763,23 +758,106 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 	}
 
 	backend := newFakeBackend()
-	// A batch size below numEvents forces Run to loop, which is the behavior under test.
-	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 50)
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 50)
 
-	go func() {
-		p.Run(ctx, 10*time.Second)
-	}()
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != uint64(numEvents) {
+		t.Errorf("counter = %d, want %d; Drain stopped before catching up", got, numEvents)
+	}
+	if cr.n != numEvents {
+		t.Errorf("handler ran %d times, want %d", cr.n, numEvents)
+	}
+	// 250 events at a batch size of 50 is five commits, not one and not 250.
+	if backend.commitCalls != 5 {
+		t.Errorf("commitCalls = %d, want 5", backend.commitCalls)
+	}
+}
 
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if backend.stateOf("p1").GlobalCounter == numEvents {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+// TestProjector_DrainServicesAPendingTruncate pins why the loop ends on Updated rather than on
+// AppliedEvents. A truncate reports zero applied events, so stopping there would hand back a
+// projector that had just emptied its projection and not yet rebuilt it.
+func TestProjector_DrainServicesAPendingTruncate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	truncated := 0
+	dispatch := countingDispatch(cr).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0)
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
 	}
 
-	if got := backend.stateOf("p1").GlobalCounter; got != uint64(numEvents) {
-		t.Errorf("counter = %d, want %d; Run slept instead of draining", got, numEvents)
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	cr.n = 0
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after EnqueueTruncate: %v", err)
+	}
+
+	if truncated != 1 {
+		t.Errorf("truncate handler ran %d times, want 1", truncated)
+	}
+	if cr.n != 2 {
+		t.Errorf("handler replayed %d events, want 2; Drain returned on the truncate instead of rebuilding", cr.n)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 2 {
+		t.Errorf("counter = %d, want 2", got)
+	}
+}
+
+func TestProjector_DrainReturnsErrorFromUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	wantErr := errors.New("drain boom")
+	p, _ := monotonic.NewProjector("p1", store, failingDispatch(wantErr), backend, 0)
+
+	err := p.Drain(ctx)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("Drain err = %v, want %v", err, wantErr)
+	}
+	if !strings.Contains(err.Error(), `"p1"`) {
+		t.Errorf("Drain err = %q, want it to name the projector", err)
+	}
+}
+
+func TestProjector_DrainStopsOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := monotonic.NewInMemoryStore()
+	// Enough events that Drain is still looping when the cancel lands.
+	for i := int64(1); i <= 5000; i++ {
+		emitEvent(context.Background(), t, store, i)
+	}
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 1)
+
+	done := make(chan error, 1)
+	go func() { done <- p.Drain(ctx) }()
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Drain = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("Drain did not stop within 2s after cancellation")
 	}
 }
 
@@ -792,46 +870,285 @@ func TestProjector_NameRequired(t *testing.T) {
 	}
 }
 
-// --- RunProjectors tests ---
+// --- DrainProjectors tests ---
 
-func TestRunProjectors_AllStopOnContextCancellation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
+func TestDrainProjectors_CatchesUpEveryProjector(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 20; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	counters := map[string]*counterRef{}
+	drainers := make([]monotonic.ProjectorDrainer, 0, 3)
+	for _, name := range []string{"a", "b", "c"} {
+		cr := &counterRef{}
+		counters[name] = cr
+		p, _ := monotonic.NewProjector(name, store, countingDispatch(cr), backend, 7)
+		drainers = append(drainers, p)
+	}
+
+	if err := monotonic.DrainProjectors(ctx, drainers...); err != nil {
+		t.Fatalf("DrainProjectors: %v", err)
+	}
+
+	for _, name := range []string{"a", "b", "c"} {
+		if got := backend.stateOf(name).GlobalCounter; got != 20 {
+			t.Errorf("projector %q counter = %d, want 20", name, got)
+		}
+		if got := counters[name].n; got != 20 {
+			t.Errorf("projector %q handler ran %d times, want 20", name, got)
+		}
+	}
+}
+
+func TestDrainProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	wantErr := errors.New("fail")
+	failP, _ := monotonic.NewProjector("fail", store, failingDispatch(wantErr), backend, 0)
+	okP, _ := monotonic.NewProjector("ok", store, noopDispatch(), backend, 0)
+
+	err := monotonic.DrainProjectors(ctx, failP, okP)
+	if !errors.Is(err, wantErr) {
+		t.Errorf("DrainProjectors err = %v, want %v", err, wantErr)
+	}
+}
+
+func TestDrainProjectors_EmptyIsNoOp(t *testing.T) {
+	if err := monotonic.DrainProjectors(context.Background()); err != nil {
+		t.Errorf("DrainProjectors with no projectors = %v, want nil", err)
+	}
+}
+
+// --- Drive tests ---
+
+// recordingBackoff returns a BackoffFn that records the attempt counter it was asked about, so the
+// Drive tests can assert the backoff schedule directly instead of timing wall-clock sleeps.
+func recordingBackoff(attempts *[]int, wait time.Duration) monotonic.BackoffFn {
+	return func(nextAttemptCounter int) time.Duration {
+		*attempts = append(*attempts, nextAttemptCounter)
+		return wait
+	}
+}
+
+// TestProjector_DriveBacksOffAndPlateausOnPersistentError pins both halves of the backoff: the wait
+// grows with consecutive failures, and it stops growing at MaxAttempts instead of running away.
+// Without the plateau an unbounded ExponentialBackoff would eventually overflow a time.Duration.
+func TestProjector_DriveBacksOffAndPlateausOnPersistentError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, failingDispatch(errors.New("always boom")), backend, 0)
+
+	// Backoff is asked for a duration once per failure; the duration itself is kept tiny so the
+	// test is fast, and the schedule is asserted from the recorded attempt counters.
+	var attempts []int
+	const maxAttempts = 3
+	retry := &monotonic.Retry{MaxAttempts: maxAttempts, Backoff: recordingBackoff(&attempts, time.Millisecond)}
+
+	if err := p.Drive(ctx, time.Millisecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded", err)
+	}
+
+	// Drive is asked twice per failure: once to log retry_in, once to wait.
+	if len(attempts) < 2*maxAttempts {
+		t.Fatalf("only %d backoff lookups, too few to show a schedule: %v", len(attempts), attempts)
+	}
+	for i, got := range attempts {
+		if got < 1 {
+			t.Fatalf("attempt[%d] = %d, must be at least 1 or the backoff degenerates to an immediate retry", i, got)
+		}
+		if got > maxAttempts {
+			t.Fatalf("attempt[%d] = %d exceeds MaxAttempts %d; the wait is growing without bound", i, got, maxAttempts)
+		}
+	}
+	// Early failures must escalate rather than sitting at the first step.
+	if attempts[0] != 1 {
+		t.Errorf("first backoff lookup = %d, want 1", attempts[0])
+	}
+	if attempts[len(attempts)-1] != maxAttempts {
+		t.Errorf("last backoff lookup = %d, want the plateau %d", attempts[len(attempts)-1], maxAttempts)
+	}
+}
+
+// TestProjector_DriveResetsBackoffAfterSuccess covers a transient failure. The run alternates
+// fail, succeed, fail, so the second failure's backoff step is what distinguishes a counter that
+// reset from one that kept climbing; a test that only fails before the success cannot tell them apart.
+func TestProjector_DriveResetsBackoffAfterSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
 	backend := newFakeBackend()
 
-	makeProjector := func(name string) monotonic.ProjectorRunner {
-		p, _ := monotonic.NewProjector(name, store, noopDispatch(), backend, 0)
+	// Odd calls fail, even calls succeed. With a batch size of one that makes each Update a single
+	// handler call, so the run is: fail, succeed, fail, succeed.
+	calls := 0
+	dispatch := monotonic.NewDispatch[*testTx]().On("test", "happened", func(context.Context, *testTx, monotonic.AggregateEvent) error {
+		calls++
+		if calls%2 == 1 {
+			return errors.New("transient boom")
+		}
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 1)
+
+	var attempts []int
+	retry := &monotonic.Retry{MaxAttempts: 5, Backoff: recordingBackoff(&attempts, time.Millisecond)}
+
+	if err := p.Drive(ctx, 50*time.Millisecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded", err)
+	}
+
+	// Two failures, each looked up twice (once to log retry_in, once to wait). Both must sit at
+	// step 1: if the counter did not reset, the second failure would report step 2.
+	want := []int{1, 1, 1, 1}
+	if len(attempts) != len(want) {
+		t.Fatalf("backoff lookups = %v, want %v", attempts, want)
+	}
+	for i := range want {
+		if attempts[i] != want[i] {
+			t.Fatalf("backoff lookups = %v, want %v; the failure counter did not reset after the success", attempts, want)
+		}
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 2 {
+		t.Errorf("counter = %d, want 2; Drive did not recover and commit both events", got)
+	}
+}
+
+// TestProjector_DriveReturnsContextErrorOnContextEnd covers both ways a context can end and every
+// place Drive can notice one: at the loop top, out of an Update, out of the backoff wait, and out
+// of the poll sleep. All four must report the same cause, or a caller cannot tell a cancellation
+// from a deadline based on where the loop happened to be.
+func TestProjector_DriveReturnsContextErrorOnContextEnd(t *testing.T) {
+	newProjector := func(dispatch *monotonic.Dispatch[*testTx]) *monotonic.Projector[*testTx] {
+		store := monotonic.NewInMemoryStore()
+		emitEvent(context.Background(), t, store, 1)
+		p, _ := monotonic.NewProjector("p1", store, dispatch, newFakeBackend(), 0)
+		return p
+	}
+
+	t.Run("cancelled while polling", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- newProjector(noopDispatch()).Drive(ctx, time.Millisecond, nil) }()
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Drive = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("Drive did not stop within 2s of cancellation")
+		}
+	})
+
+	t.Run("deadline expires while sleeping", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if err := newProjector(noopDispatch()).Drive(ctx, time.Hour, nil); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("deadline already expired on entry", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		defer cancel()
+		time.Sleep(5 * time.Millisecond)
+		if err := newProjector(noopDispatch()).Drive(ctx, time.Hour, nil); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("deadline expires during the error backoff", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		// A failing dispatch plus a long backoff parks Drive inside the wait, which is a distinct
+		// return path from the poll sleep.
+		retry := monotonic.NewRetry(1, monotonic.ConstantBackoff(time.Hour))
+		err := newProjector(failingDispatch(errors.New("boom"))).Drive(ctx, time.Hour, retry)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+}
+
+// TestProjector_DriveSurvivesAPermanentlyWedgedProjector is the case Drive exists for: an error
+// that retrying can never clear must not stop the loop, and must not spin at the poll interval.
+func TestProjector_DriveSurvivesAPermanentlyWedgedProjector(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+
+	var attempts []int
+	// A 100ms wait against a 1µs poll interval: without backoff this would retry thousands of times.
+	retry := &monotonic.Retry{MaxAttempts: 2, Backoff: recordingBackoff(&attempts, 100*time.Millisecond)}
+
+	if err := p.Drive(ctx, time.Microsecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded; a wedged projector must not stop the loop early", err)
+	}
+	if len(attempts) == 0 {
+		t.Fatal("no backoff lookups; the wedge error did not go through the backoff path")
+	}
+	// Two lookups per failure, so roughly 600ms/100ms = 6 failures means about 12 lookups.
+	if len(attempts) > 40 {
+		t.Errorf("%d backoff lookups in 1s; Drive is retrying at the poll interval instead of backing off", len(attempts))
+	}
+}
+
+func TestDriveProjectors_AllStopOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+
+	makeDriver := func(name string) monotonic.ProjectorDriver {
+		// Every projector fails forever, which is exactly what DriveProjectors must tolerate.
+		p, _ := monotonic.NewProjector(name, store, failingDispatch(errors.New("boom")), backend, 0)
 		return p
 	}
 
 	done := make(chan error, 1)
 	go func() {
-		done <- monotonic.RunProjectors(ctx, time.Millisecond, makeProjector("a"), makeProjector("b"), makeProjector("c"))
+		done <- monotonic.DriveProjectors(ctx, time.Millisecond, nil, makeDriver("a"), makeDriver("b"), makeDriver("c"))
 	}()
 
-	cancel()
-
+	// Give the drivers a moment to fail and back off, proving failures alone do not stop them.
+	time.Sleep(50 * time.Millisecond)
 	select {
 	case err := <-done:
-		if err != nil {
-			t.Errorf("RunProjectors should return nil on context cancel, got %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Error("RunProjectors did not stop within 2s")
+		t.Fatalf("DriveProjectors returned %v while the context was live; failing projectors must not stop it", err)
+	default:
 	}
-}
 
-func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-	emitEvent(ctx, t, store, 1)
-
-	backend := newFakeBackend()
-	failP, _ := monotonic.NewProjector("fail", store, failingDispatch(errors.New("fail")), backend, 0)
-	okP, _ := monotonic.NewProjector("ok", store, noopDispatch(), backend, 0)
-
-	err := monotonic.RunProjectors(ctx, time.Millisecond, failP, okP)
-	if err == nil {
-		t.Error("expected error when one projector fails")
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("DriveProjectors = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("DriveProjectors did not stop within 5s of cancellation")
 	}
 }

@@ -283,3 +283,109 @@ func TestErrMaxAttemptsExceeded(t *testing.T) {
 		t.Errorf("expected %q, got %q", expected, err.Error())
 	}
 }
+
+func TestRetryPlateauedBackoff_ClampsAtMaxAttempts(t *testing.T) {
+	r := NewRetry(3, LinearBackoff(10*time.Millisecond))
+
+	cases := []struct {
+		attempt  int
+		expected time.Duration
+	}{
+		{1, 10 * time.Millisecond},
+		{2, 20 * time.Millisecond},
+		{3, 30 * time.Millisecond},
+		// Past MaxAttempts the wait stops growing rather than climbing forever.
+		{4, 30 * time.Millisecond},
+		{100, 30 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		if got := r.PlateauedBackoff(tc.attempt); got != tc.expected {
+			t.Errorf("PlateauedBackoff(%d) = %v, want %v", tc.attempt, got, tc.expected)
+		}
+	}
+}
+
+// TestRetryPlateauedBackoff_KeepsExponentialInRange is the reason the plateau exists: an unclamped
+// exponential overflows the int64 behind a time.Duration and comes back negative, which a waiting
+// caller would read as "do not wait" and turn into a busy loop.
+func TestRetryPlateauedBackoff_KeepsExponentialInRange(t *testing.T) {
+	backoff := ExponentialBackoff(100 * time.Millisecond)
+	if raw := backoff(80); raw > 0 {
+		t.Fatalf("expected an unclamped exponential at attempt 80 to overflow, got %v", raw)
+	}
+
+	r := NewRetry(10, backoff)
+	got := r.PlateauedBackoff(80)
+	if got <= 0 {
+		t.Errorf("PlateauedBackoff(80) = %v, want a positive plateaued wait", got)
+	}
+	if want := r.PlateauedBackoff(10); got != want {
+		t.Errorf("PlateauedBackoff(80) = %v, want the MaxAttempts wait %v", got, want)
+	}
+}
+
+func TestRetryPlateauedBackoff_FloorsAtFirstAttempt(t *testing.T) {
+	r := NewRetry(5, ExponentialBackoff(10*time.Millisecond))
+
+	// ExponentialBackoff returns 0 for attempt <= 0 so a first try can run immediately. Inside a
+	// retry loop that would mean no wait at all, so the counter floors at 1.
+	for _, attempt := range []int{0, -1, -100} {
+		if got := r.PlateauedBackoff(attempt); got != 10*time.Millisecond {
+			t.Errorf("PlateauedBackoff(%d) = %v, want the first-step wait 10ms", attempt, got)
+		}
+	}
+}
+
+func TestRetryPlateauedBackoff_ZeroMaxAttemptsStillWaits(t *testing.T) {
+	// A Retry built without MaxAttempts must not degenerate into a zero wait.
+	r := &Retry{Backoff: ExponentialBackoff(10 * time.Millisecond)}
+	if got := r.PlateauedBackoff(7); got != 10*time.Millisecond {
+		t.Errorf("PlateauedBackoff(7) with MaxAttempts 0 = %v, want 10ms", got)
+	}
+}
+
+func TestRetryWaitForNextAttemptIndefinitely_NeverExceedsMaxAttempts(t *testing.T) {
+	r := NewRetry(2, ConstantBackoff(time.Millisecond))
+
+	// WaitForNextAttempt gives up here; the indefinite variant must not.
+	if err := r.WaitForNextAttempt(context.Background(), 5); !errors.Is(err, ErrMaxAttemptsExceeded) {
+		t.Fatalf("WaitForNextAttempt(5) = %v, want ErrMaxAttemptsExceeded", err)
+	}
+	for _, attempt := range []int{1, 2, 5, 1000} {
+		if err := r.WaitForNextAttemptIndefinitely(context.Background(), attempt); err != nil {
+			t.Errorf("WaitForNextAttemptIndefinitely(%d) = %v, want nil", attempt, err)
+		}
+	}
+}
+
+func TestRetryWaitForNextAttemptIndefinitely_ContextCancelledDuringWait(t *testing.T) {
+	r := NewRetry(3, ConstantBackoff(time.Hour))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	if err := r.WaitForNextAttemptIndefinitely(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Errorf("WaitForNextAttemptIndefinitely = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("waited %v after cancellation, should have returned promptly", elapsed)
+	}
+}
+
+func TestRetryWaitForNextAttemptIndefinitely_ZeroDelayChecksContext(t *testing.T) {
+	r := NewRetry(3, ConstantBackoff(0))
+
+	if err := r.WaitForNextAttemptIndefinitely(context.Background(), 1); err != nil {
+		t.Errorf("zero delay on a live context = %v, want nil", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.WaitForNextAttemptIndefinitely(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Errorf("zero delay on a cancelled context = %v, want context.Canceled", err)
+	}
+}

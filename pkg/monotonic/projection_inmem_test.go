@@ -262,8 +262,8 @@ func TestInMemoryProjection_TruncateClearsRowsAndCounter(t *testing.T) {
 // writes a distinct key, so any lost commit shows up as a missing key.
 //
 // One InMemoryProjection backing several projectors is the case that makes this reachable:
-// Projector.Update serializes a single projector against itself, but RunProjectors drives multiple
-// projectors concurrently.
+// Projector.Update serializes a single projector against itself, but DrainProjectors and
+// DriveProjectors both run multiple projectors concurrently.
 func TestInMemoryProjection_ConcurrentTransactionsDoNotLoseWrites(t *testing.T) {
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
@@ -422,7 +422,7 @@ func TestInMemoryProjection_CommitWithoutWritesKeepsRows(t *testing.T) {
 }
 
 // TestInMemoryProjection_IdlePollCostIsIndependentOfSize pins the reason buffering is deferred.
-// Projector.Run opens a transaction on every poll just to read the resume counter, so cloning at
+// Projector.Drive opens a transaction on every poll just to read the resume counter, so cloning at
 // lock time would charge every idle tick O(projected rows) forever. Comparing two sizes rather than
 // asserting an absolute count keeps this robust to allocation overhead from -race and the like.
 func TestInMemoryProjection_IdlePollCostIsIndependentOfSize(t *testing.T) {

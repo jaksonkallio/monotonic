@@ -658,8 +658,8 @@ func TestProjectorBackend_RequestTruncateRoundTrip(t *testing.T) {
 // TestProjectorBackend_SlowBatchDoesNotFailAConcurrentInstance pins the absence of a lock_timeout
 // in LockStateForModification. A second instance of the same projector must block until the holder
 // finishes and then proceed, because waiting is the whole point of the lock. Erroring instead would
-// be escalated by Projector.Run into a fatal error and by RunProjectors into a fleet shutdown, so a
-// batch that merely ran long would take down every other projector in the process.
+// be escalated by Projector.Drain into a returned error and by DrainProjectors into cancelling every
+// sibling, so a batch that merely ran long would abort the rest of a startup catch-up.
 //
 // The hold deliberately exceeds the 5s timeout this code used to set, which is what makes the test
 // able to detect a regression at all.
