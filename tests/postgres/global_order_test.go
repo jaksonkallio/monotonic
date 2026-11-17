@@ -147,11 +147,11 @@ func TestProjectorLosesNoEventsUnderConcurrentAppends(t *testing.T) {
 		t.Fatalf("new projector: %v", err)
 	}
 
-	// Run the projector concurrently with the writers so its polls land inside the
+	// Drive the projector concurrently with the writers so its polls land inside the
 	// insert-to-commit windows that make the skip possible. The poll interval is deliberately tiny:
 	// every extra poll is another chance to observe the inconsistent window.
 	projectorDone := make(chan error, 1)
-	go func() { projectorDone <- projector.Run(ctx, 100*time.Microsecond) }()
+	go func() { projectorDone <- projector.Drive(ctx, 100*time.Microsecond, nil) }()
 
 	var wg sync.WaitGroup
 	for i := 0; i < numWriters; i++ {
@@ -177,19 +177,14 @@ func TestProjectorLosesNoEventsUnderConcurrentAppends(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Drain whatever the background loop has not yet reached, then stop it.
-	for {
-		n, err := projector.Update(ctx)
-		if err != nil {
-			t.Fatalf("drain: %v", err)
-		}
-		if !n.Updated() {
-			break
-		}
+	// Catch up whatever the background loop has not yet reached, then stop it.
+	if err := projector.Drain(ctx); err != nil {
+		t.Fatalf("drain: %v", err)
 	}
 	cancel()
-	if err := <-projectorDone; err != nil {
-		t.Fatalf("projector run: %v", err)
+	// Drive only stops when its context ends, and reports that as the reason.
+	if err := <-projectorDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("projector drive: %v, want context.Canceled", err)
 	}
 
 	var projected int64

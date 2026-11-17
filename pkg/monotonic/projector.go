@@ -171,31 +171,21 @@ func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateRes
 	}, nil
 }
 
-// Run does Update in a loop, sleeping pollInterval between catch-up polls.
-// Returns on any error or context cancellation.
-// Use Drive if you want to log and continue on update errors.
-func (p *Projector[Tx]) Run(ctx context.Context, pollInterval time.Duration) error {
+// Drain calls Update until the projector is caught up, then returns nil.
+// It never sleeps and never waits for new events, so it terminates: it is for tests, backfills, CLI tools, and priming a read model before serving traffic.
+// Use Drive for a long-running process that should keep polling.
+func (p *Projector[Tx]) Drain(ctx context.Context) error {
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return ctx.Err()
 		}
 
-		n, err := p.Update(ctx)
+		result, err := p.Update(ctx)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
+			return fmt.Errorf("drain projector %q: %w", p.name, err)
 		}
 
-		if n.Updated() {
-			// Some meaningful work was performed, continue without sleeping because there's likely more work to do imminently.
-			continue
-		}
-
-		select {
-		case <-time.After(pollInterval):
-		case <-ctx.Done():
+		if !result.Updated() {
 			return nil
 		}
 	}
@@ -208,7 +198,7 @@ func DefaultDriveErrorBackoff() *Retry {
 }
 
 // Drive drives Update in a loop, sleeping pollInterval between catch-up polls, and keeps going until ctx ends.
-// Unlike Run it logs update errors rather than returning them, so one failing projector does not stop a long-running process; the only thing that stops it is ctx ending, whose error it returns.
+// Unlike Drain it logs update errors rather than returning them, so one failing projector does not stop a long-running process; the only thing that stops it is ctx ending, whose error it returns.
 //
 // Consecutive failures back off using errorBackoff, and a single success resets that.
 // Pass nil for DefaultDriveErrorBackoff.
@@ -283,10 +273,10 @@ func (p *Projector[Tx]) Name() string {
 	return p.name
 }
 
-// ProjectorRunner is implemented by any projector that can be driven by RunProjectors.
-// *Projector[Tx] satisfies this interface for any Tx, so RunProjectors can drive projectors with different transaction types together.
-type ProjectorRunner interface {
-	Run(ctx context.Context, pollInterval time.Duration) error
+// ProjectorDrainer is implemented by any projector that can be caught up by DrainProjectors.
+// *Projector[Tx] satisfies this interface for any Tx, so DrainProjectors can catch up projectors with different transaction types together.
+type ProjectorDrainer interface {
+	Drain(ctx context.Context) error
 }
 
 // ProjectorDriver is implemented by any projector that can be driven by DriveProjectors.
@@ -294,22 +284,21 @@ type ProjectorDriver interface {
 	Drive(ctx context.Context, pollInterval time.Duration, errorBackoff *Retry) error
 }
 
-// RunProjectors runs each projector concurrently in its own goroutine and returns when any stop due to error or context cancellation.
-// If any projector returns an error, the shared context is cancelled and RunProjectors returns that error.
-// On clean context cancellation all projectors stop and RunProjectors returns nil.
-func RunProjectors(ctx context.Context, pollInterval time.Duration, projectors ...ProjectorRunner) error {
+// DrainProjectors catches up each projector concurrently in its own goroutine and returns nil once every one is caught up.
+// The first projector to fail cancels the shared context, so the others stop early rather than finishing work that is about to be discarded, and DrainProjectors returns that first error.
+// Pair it with DriveProjectors rather than choosing between them: drain once at startup to prime the read models, then drive for the life of the process.
+func DrainProjectors(ctx context.Context, projectors ...ProjectorDrainer) error {
 	g, ctx := errgroup.WithContext(ctx)
 	for _, p := range projectors {
-		p := p
 		g.Go(func() error {
-			return p.Run(ctx, pollInterval)
+			return p.Drain(ctx)
 		})
 	}
 	return g.Wait()
 }
 
 // DriveProjectors drives each projector concurrently in its own goroutine and returns once every one has stopped, which only happens when ctx ends.
-// Update errors are logged and retried by each projector rather than propagated, so unlike RunProjectors one failing projector never stops the others.
+// Update errors are logged and retried by each projector rather than propagated, so unlike DrainProjectors one failing projector never stops the others.
 // Pass nil for errorBackoff to use DefaultDriveErrorBackoff.
 // Returns ctx.Err(), which is what stopped every projector.
 func DriveProjectors(ctx context.Context, pollInterval time.Duration, errorBackoff *Retry, projectors ...ProjectorDriver) error {
