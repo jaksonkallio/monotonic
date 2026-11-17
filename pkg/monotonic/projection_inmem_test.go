@@ -333,3 +333,128 @@ func TestInMemoryProjection_ReadsDoNotBlockBehindAHandler(t *testing.T) {
 		t.Fatal("All() blocked behind an open modification transaction")
 	}
 }
+
+// TestInMemoryProjection_ClearDoesNotMutateCommittedRows pins the sharpest edge of copy-on-write
+// buffering. An untouched transaction reads the committed map directly, so a Clear that emptied it
+// in place would wipe committed state outright, and would do it even on a transaction that then
+// rolls back.
+func TestInMemoryProjection_ClearDoesNotMutateCommittedRows(t *testing.T) {
+	ctx := context.Background()
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
+
+	if err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+		tx.Set("alice", summaryRow{Balance: 10})
+		return nil
+	}, advance(proj, "p", 1)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	tx, _, err := proj.LockStateForModification(ctx, "p")
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	tx.Clear()
+	if _, ok := tx.Get("alice"); ok {
+		t.Error("Clear did not empty the transaction's own view")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	if row, ok := proj.Get("alice"); !ok || row.Balance != 10 {
+		t.Errorf("alice = %+v ok=%v after a rolled-back Clear, want balance 10; Clear reached committed state", row, ok)
+	}
+}
+
+// TestInMemoryProjection_DeleteDoesNotMutateCommittedRows is the same hazard as Clear, via the
+// other removal path.
+func TestInMemoryProjection_DeleteDoesNotMutateCommittedRows(t *testing.T) {
+	ctx := context.Background()
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
+
+	if err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+		tx.Set("alice", summaryRow{Balance: 10})
+		return nil
+	}, advance(proj, "p", 1)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	tx, _, err := proj.LockStateForModification(ctx, "p")
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	tx.Delete("alice")
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	if row, ok := proj.Get("alice"); !ok || row.Balance != 10 {
+		t.Errorf("alice = %+v ok=%v after a rolled-back Delete, want balance 10", row, ok)
+	}
+}
+
+// TestInMemoryProjection_CommitWithoutWritesKeepsRows covers a batch that applies events but writes
+// no rows, which is ordinary when a handler filters. Such a transaction never clones, so a commit
+// that blindly installed its buffer would replace the whole projection with nothing.
+func TestInMemoryProjection_CommitWithoutWritesKeepsRows(t *testing.T) {
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
+
+	if err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+		tx.Set("alice", summaryRow{Balance: 10})
+		return nil
+	}, advance(proj, "p", 1)); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	// Applies and commits, but touches no rows.
+	if err := runTx(t, proj, "p", func(*monotonic.InMemoryProjectionTx[summaryRow]) error {
+		return nil
+	}, advance(proj, "p", 2)); err != nil {
+		t.Fatalf("write-free batch: %v", err)
+	}
+
+	if row, ok := proj.Get("alice"); !ok || row.Balance != 10 {
+		t.Errorf("alice = %+v ok=%v after a write-free commit, want balance 10", row, ok)
+	}
+	if got := proj.State("p").GlobalCounter; got != 2 {
+		t.Errorf("counter = %d, want 2; the write-free batch still has to advance state", got)
+	}
+}
+
+// TestInMemoryProjection_IdlePollCostIsIndependentOfSize pins the reason buffering is deferred.
+// Projector.Run opens a transaction on every poll just to read the resume counter, so cloning at
+// lock time would charge every idle tick O(projected rows) forever. Comparing two sizes rather than
+// asserting an absolute count keeps this robust to allocation overhead from -race and the like.
+func TestInMemoryProjection_IdlePollCostIsIndependentOfSize(t *testing.T) {
+	ctx := context.Background()
+
+	idleAllocs := func(rows int) float64 {
+		proj := monotonic.NewInMemoryProjection[summaryRow]()
+		if err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+			for i := 0; i < rows; i++ {
+				tx.Set(fmt.Sprintf("account-%d", i), summaryRow{Balance: int64(i)})
+			}
+			return nil
+		}, advance(proj, "p", 1)); err != nil {
+			t.Fatalf("seed %d rows: %v", rows, err)
+		}
+
+		// An empty store means every Update is a caught-up, write-free poll.
+		p, err := monotonic.NewProjector("p", monotonic.NewInMemoryStore(), balanceDispatch(), proj, 0)
+		if err != nil {
+			t.Fatalf("NewProjector: %v", err)
+		}
+		return testing.AllocsPerRun(50, func() {
+			if _, err := p.Update(ctx); err != nil {
+				t.Fatalf("Update: %v", err)
+			}
+		})
+	}
+
+	small := idleAllocs(10)
+	large := idleAllocs(10_000)
+
+	if large > small*3+10 {
+		t.Errorf("idle poll allocated %.0f with 10k rows vs %.0f with 10 rows; cost scales with the projection, so it is being copied every tick", large, small)
+	}
+}

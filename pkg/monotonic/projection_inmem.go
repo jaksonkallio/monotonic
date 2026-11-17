@@ -45,39 +45,64 @@ func NewInMemoryProjection[T any]() *InMemoryProjection[T] {
 }
 
 // InMemoryProjectionTx is the ModificationTx handlers receive; edits buffer here and commit only if the whole batch succeeds.
+//
+// Buffering is copy-on-write: the transaction starts out reading the committed rows directly and only clones them when a handler first writes.
+// A read-only transaction therefore costs nothing, which matters because an idle projector opens one on every poll just to read its resume counter, and cloning there would burn O(rows) on every tick forever.
+//
+// Reading the committed map without a lock is safe because a map that has been published as InMemoryProjection.rows is never mutated again: a commit swaps in a whole new map rather than editing the old one, and only the transaction holding txMu can commit.
 type InMemoryProjectionTx[T any] struct {
 	// projection is the projection this transaction will commit into, used to reject a tx handed to the wrong backend.
 	projection *InMemoryProjection[T]
-	// rows is the buffered clone handlers read and write.
+	// base is the committed rows as of the moment the lock was taken, read-only for the life of the transaction.
+	base map[string]T
+	// rows is the writable clone, nil until a handler first mutates something. Non-nil is exactly what "this transaction has writes to commit" means.
 	rows map[string]T
 	// finished records that the transaction has already committed or rolled back, so the
 	// projector's deferred Rollback after a successful commit is a no-op rather than a double unlock.
 	finished bool
 }
 
+// writable returns the transaction's own copy of the rows, cloning the committed map the first time it is needed.
+// Every mutating method must go through this; writing to base would edit committed state in place.
+func (tx *InMemoryProjectionTx[T]) writable() map[string]T {
+	if tx.rows == nil {
+		tx.rows = maps.Clone(tx.base)
+		if tx.rows == nil {
+			// maps.Clone returns nil for a nil map, which would make the clone unwritable.
+			tx.rows = make(map[string]T)
+		}
+	}
+	return tx.rows
+}
+
 // Get returns the row for key and whether it exists.
 // Treat the result as read-only and pass any modification back through Set; see InMemoryProjection for why that matters when T holds a pointer, slice, or map.
 func (tx *InMemoryProjectionTx[T]) Get(key string) (T, bool) {
-	v, ok := tx.rows[key]
+	if tx.rows != nil {
+		v, ok := tx.rows[key]
+		return v, ok
+	}
+	v, ok := tx.base[key]
 	return v, ok
 }
 
 // Set inserts or replaces the row for key.
 func (tx *InMemoryProjectionTx[T]) Set(key string, row T) {
-	tx.rows[key] = row
+	tx.writable()[key] = row
 }
 
 // Delete removes the row for key if present.
 func (tx *InMemoryProjectionTx[T]) Delete(key string) {
-	delete(tx.rows, key)
+	delete(tx.writable(), key)
 }
 
 // Clear removes every row, which is what a truncate handler registered via Dispatch.OnTruncate wants.
+// It installs a fresh empty map rather than clearing in place, since in place would empty the committed rows that an untouched transaction is still reading through.
 func (tx *InMemoryProjectionTx[T]) Clear() {
-	clear(tx.rows)
+	tx.rows = make(map[string]T)
 }
 
-// Rollback discards the buffered rows and releases the modification lock. It is safe to call on a
+// Rollback discards any buffered writes and releases the modification lock. It is safe to call on a
 // transaction that already committed, which is what lets the projector defer it unconditionally.
 func (tx *InMemoryProjectionTx[T]) Rollback(context.Context) error {
 	if tx.finished {
@@ -97,7 +122,8 @@ func (p *InMemoryProjection[T]) LockStateForModification(_ context.Context, proj
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
-	return &InMemoryProjectionTx[T]{projection: p, rows: maps.Clone(p.rows)}, p.state[projectorName], nil
+	// Only the map reference is captured here. Cloning is deferred until a handler actually writes, so an idle poll costs nothing.
+	return &InMemoryProjectionTx[T]{projection: p, base: p.rows}, p.state[projectorName], nil
 }
 
 // CommitAdvancedStateFromModification commits the buffered rows and advances projectorName's
@@ -130,7 +156,10 @@ func (p *InMemoryProjection[T]) commit(tx *InMemoryProjectionTx[T], projectorNam
 	}
 
 	p.mu.Lock()
-	p.rows = tx.rows
+	// A nil rows means the transaction never wrote, so the committed map stays as it is rather than being replaced by nothing.
+	if tx.rows != nil {
+		p.rows = tx.rows
+	}
 	p.state[projectorName] = update(p.state[projectorName])
 	p.mu.Unlock()
 
