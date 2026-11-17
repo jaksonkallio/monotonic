@@ -66,10 +66,6 @@ func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name st
 // lockState does the work of LockStateForModification inside an already-open transaction, so the
 // error paths have a single place to roll back from.
 func lockState(ctx context.Context, tx pgx.Tx, name string) (monotonic.ProjectorStateSnapshot, error) {
-	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '5s'`); err != nil {
-		return monotonic.ProjectorStateSnapshot{}, fmt.Errorf("set lock timeout: %w", err)
-	}
-
 	// A projector that has never run has no row yet, and the SELECT below would find nothing.
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO projector_state (projector_name, global_counter)

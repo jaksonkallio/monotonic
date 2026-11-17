@@ -654,3 +654,83 @@ func TestProjectorBackend_RequestTruncateRoundTrip(t *testing.T) {
 		t.Errorf("proj_request total = %d after truncate, want 0", got)
 	}
 }
+
+// TestProjectorBackend_SlowBatchDoesNotFailAConcurrentInstance pins the absence of a lock_timeout
+// in LockStateForModification. A second instance of the same projector must block until the holder
+// finishes and then proceed, because waiting is the whole point of the lock. Erroring instead would
+// be escalated by Projector.Run into a fatal error and by RunProjectors into a fleet shutdown, so a
+// batch that merely ran long would take down every other projector in the process.
+//
+// The hold deliberately exceeds the 5s timeout this code used to set, which is what makes the test
+// able to detect a regression at all.
+func TestProjectorBackend_SlowBatchDoesNotFailAConcurrentInstance(t *testing.T) {
+	if testing.Short() {
+		t.Skip("holds a lock for longer than the removed 5s timeout")
+	}
+
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_slow")
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	// Commit the projector_state row first, so the waiter below blocks on SELECT ... FOR UPDATE
+	// rather than on an uncommitted insert of the same primary key.
+	warmup, err := monotonic.NewProjector("slow", store, countingDispatch("proj_slow", nil), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := warmup.Update(ctx); err != nil {
+		t.Fatalf("warmup Update: %v", err)
+	}
+
+	appendTestEvent(t, store, "x", 2, "did")
+
+	// Stand in for a long-running batch holding the state lock.
+	holder, _, err := backend.LockStateForModification(ctx, "slow")
+	if err != nil {
+		t.Fatalf("holder LockStateForModification: %v", err)
+	}
+
+	const hold = 6 * time.Second
+	waiterDone := make(chan error, 1)
+	var waiterResult monotonic.ProjectorUpdateResult
+	go func() {
+		p, err := monotonic.NewProjector("slow", store, countingDispatch("proj_slow", nil), backend, 0)
+		if err != nil {
+			waiterDone <- err
+			return
+		}
+		waiterResult, err = p.Update(ctx)
+		waiterDone <- err
+	}()
+
+	// The waiter must still be blocked while the holder holds the lock.
+	select {
+	case err := <-waiterDone:
+		holder.Rollback(ctx)
+		t.Fatalf("concurrent instance returned while the lock was held (err=%v); it must block", err)
+	case <-time.After(hold):
+	}
+
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatalf("holder Rollback: %v", err)
+	}
+
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Fatalf("concurrent instance failed after waiting %v for the lock: %v", hold, err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("concurrent instance never completed after the lock was released")
+	}
+
+	if waiterResult.AppliedEvents != 1 {
+		t.Errorf("waiter applied %d events, want 1", waiterResult.AppliedEvents)
+	}
+	if got := projectedTotal(t, "proj_slow"); got != 2 {
+		t.Errorf("proj_slow total = %d, want 2", got)
+	}
+}
