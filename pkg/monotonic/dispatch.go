@@ -1,10 +1,16 @@
 package monotonic
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-// Handler processes a single event with a store-specific environment ModificationTx
-// (typically a transaction handle) supplied by the ProjectorBackend running the event.
-type Handler[ModificationTx any] func(ctx context.Context, tx ModificationTx, event AggregateEvent) error
+// Handler processes a single event within a store-specific environment Tx (typically a transaction handle) supplied by the ProjectorBackend running the event.
+type Handler[Tx ModificationTx] func(ctx context.Context, tx Tx, event AggregateEvent) error
+
+// TruncateHandler clears whatever state the projector's handlers have written (e.g. truncating the implementer's own tables), so the projector can rebuild from the start of the event stream.
+// It runs with the same Tx a Handler would get, inside the same modification transaction.
+type TruncateHandler[Tx ModificationTx] func(ctx context.Context, tx Tx) error
 
 // dispatchKey identifies a registered handler by aggregate type and event type.
 type dispatchKey struct {
@@ -12,38 +18,63 @@ type dispatchKey struct {
 	eventType     string
 }
 
-// Dispatch routes events to handlers registered per (aggregateType, eventType)
-// and derives EventFilters from the registered set. Generic over ModificationTx so the same
-// dispatch core works for any backend that supplies a per-event environment.
-type Dispatch[ModificationTx any] struct {
-	handlers map[dispatchKey]Handler[ModificationTx]
+// Dispatch routes events to handlers registered per (aggregateType, eventType) tuple.
+type Dispatch[Tx ModificationTx] struct {
+	applyHandlers   map[dispatchKey]Handler[Tx]
+	truncateHandler TruncateHandler[Tx]
 }
 
-// NewDispatch creates an empty Dispatch parameterized over ModificationTx.
-func NewDispatch[ModificationTx any]() *Dispatch[ModificationTx] {
-	return &Dispatch[ModificationTx]{handlers: make(map[dispatchKey]Handler[ModificationTx])}
+// NewDispatch creates an empty Dispatch parameterized over Tx.
+func NewDispatch[Tx ModificationTx]() *Dispatch[Tx] {
+	return &Dispatch[Tx]{applyHandlers: make(map[dispatchKey]Handler[Tx])}
 }
 
 // On registers handler for the given (aggregateType, eventType); registering the same key twice overwrites.
-func (d *Dispatch[ModificationTx]) On(aggregateType, eventType string, handler Handler[ModificationTx]) *Dispatch[ModificationTx] {
-	d.handlers[dispatchKey{aggregateType, eventType}] = handler
+func (d *Dispatch[Tx]) On(aggregateType, eventType string, handler Handler[Tx]) *Dispatch[Tx] {
+	d.applyHandlers[dispatchKey{aggregateType, eventType}] = handler
 	return d
 }
 
+// ErrNoTruncateHandler reports that a truncate was requested for a Dispatch that registered no truncate handler.
+var ErrNoTruncateHandler = errors.New("no truncate handler registered")
+
+// OnTruncate registers the handler that clears the projection.
+// Registering twice overwrites.
+// Registering one is what makes a projector truncatable at all: without it a rewind would replay the stream over a projection that was never cleared, which silently double-counts every accumulating handler.
+func (d *Dispatch[Tx]) OnTruncate(handler TruncateHandler[Tx]) *Dispatch[Tx] {
+	d.truncateHandler = handler
+	return d
+}
+
+// HasTruncateHandler reports whether a truncate handler is registered, so a caller can reject a truncate request before enqueuing it rather than discovering the gap mid-rebuild.
+func (d *Dispatch[Tx]) HasTruncateHandler() bool {
+	return d.truncateHandler != nil
+}
+
 // EventFilters returns one EventFilter per registered handler so the projector subscribes to exactly the events the dispatch can route.
-func (d *Dispatch[ModificationTx]) EventFilters() []EventFilter {
-	filters := make([]EventFilter, 0, len(d.handlers))
-	for k := range d.handlers {
+func (d *Dispatch[Tx]) EventFilters() []EventFilter {
+	filters := make([]EventFilter, 0, len(d.applyHandlers))
+	for k := range d.applyHandlers {
 		filters = append(filters, EventFilter{AggregateType: k.aggregateType, EventType: k.eventType})
 	}
 	return filters
 }
 
-// Apply routes the event to its registered handler; events with no matching handler are a no-op.
-func (d *Dispatch[ModificationTx]) Apply(ctx context.Context, tx ModificationTx, event AggregateEvent) error {
-	h, ok := d.handlers[dispatchKey{event.AggregateType, event.Event.Type}]
+// Apply routes the event to its registered handler.
+// Events with no matching handler are a no-op.
+func (d *Dispatch[Tx]) Apply(ctx context.Context, tx Tx, event AggregateEvent) error {
+	applyHandler, ok := d.applyHandlers[dispatchKey{event.AggregateType, event.Event.Type}]
 	if !ok {
 		return nil
 	}
-	return h(ctx, tx, event)
+	return applyHandler(ctx, tx, event)
+}
+
+// Truncate runs the registered truncate handler, or returns ErrNoTruncateHandler if there is none.
+// Erroring rather than succeeding silently matters because the caller's next move is to rewind the resume counter, and rewinding over a projection that was never cleared corrupts it.
+func (d *Dispatch[Tx]) Truncate(ctx context.Context, tx Tx) error {
+	if d.truncateHandler == nil {
+		return ErrNoTruncateHandler
+	}
+	return d.truncateHandler(ctx, tx)
 }

@@ -34,12 +34,16 @@ func TestHarnessSmoke(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 
-	got, err := c.Backend.GetState(ctx, "never-ran")
+	// Locking a projector that has never run proves projector_state exists and is queryable, and
+	// must report the zero state. The transaction is abandoned so the smoke test leaves no row behind.
+	tx, state, err := c.Backend.LockStateForModification(ctx, "never-ran")
 	if err != nil {
-		t.Fatalf("GetState: %v", err)
+		t.Fatalf("LockStateForModification: %v", err)
 	}
-	if got != 0 {
-		t.Errorf("fresh projector state must be 0, got %d", got)
+	defer tx.Rollback(ctx)
+
+	if state.GlobalCounter != 0 || state.TruncateRequested {
+		t.Errorf("fresh projector state must be zero, got %+v", state)
 	}
 }
 

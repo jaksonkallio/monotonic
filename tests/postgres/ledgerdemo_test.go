@@ -64,11 +64,11 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	}
 
 	// Run both projectors.
-	balanceProj, err := monotonic.NewProjector(ctx, ledgerdemo.ProjectorBalance, store, ledgerdemo.NewBalanceDispatch(), backend, 0)
+	balanceProj, err := monotonic.NewProjector(ledgerdemo.ProjectorBalance, store, ledgerdemo.NewBalanceDispatch(), backend, 0)
 	if err != nil {
 		t.Fatalf("balance projector: %v", err)
 	}
-	statsProj, err := monotonic.NewProjector(ctx, ledgerdemo.ProjectorStats, store, ledgerdemo.NewStatsDispatch(), backend, 0)
+	statsProj, err := monotonic.NewProjector(ledgerdemo.ProjectorStats, store, ledgerdemo.NewStatsDispatch(), backend, 0)
 	if err != nil {
 		t.Fatalf("stats projector: %v", err)
 	}
@@ -122,12 +122,12 @@ func TestLedgerDemo_EndToEnd(t *testing.T) {
 	if err := alice.AcceptThenApply(ctx, monotonic.NewEvent(ledgerdemo.EventFundsDeposited, ledgerdemo.FundsMovedPayload{Amount: 5})); err != nil {
 		t.Fatalf("second deposit: %v", err)
 	}
-	resumed, err := monotonic.NewProjector(ctx, ledgerdemo.ProjectorBalance, store, ledgerdemo.NewBalanceDispatch(), backend, 0)
+	resumed, err := monotonic.NewProjector(ledgerdemo.ProjectorBalance, store, ledgerdemo.NewBalanceDispatch(), backend, 0)
 	if err != nil {
 		t.Fatalf("resume balance: %v", err)
 	}
-	if n, err := resumed.Update(ctx); err != nil || n != 1 {
-		t.Errorf("resumed Update n=%d err=%v, want n=1", n, err)
+	if n, err := resumed.Update(ctx); err != nil || n.AppliedEvents != 1 {
+		t.Errorf("resumed Update applied=%d err=%v, want 1", n.AppliedEvents, err)
 	}
 	if err := sharedPool.QueryRow(ctx, `SELECT balance FROM account_balances WHERE account_id = 'alice'`).Scan(&aliceBal); err != nil {
 		t.Fatalf("query alice balance after resume: %v", err)
