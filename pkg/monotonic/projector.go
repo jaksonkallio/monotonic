@@ -13,7 +13,7 @@ const DefaultUpdateBatchSize = 100
 
 type ProjectorStateSnapshot interface {
 	GlobalCounter() uint64
-	Truncate() bool
+	TruncateRequested() bool
 }
 
 type ModificationTx interface {
@@ -85,7 +85,7 @@ func (p *Projector[Tx]) Update(ctx context.Context) (ProjectorUpdateResult, erro
 	}
 	defer tx.Rollback()
 
-	if snapshot.Truncate() {
+	if snapshot.TruncateRequested() {
 		return p.truncate(ctx, tx)
 	} else {
 		return p.advance(ctx, tx, snapshot)

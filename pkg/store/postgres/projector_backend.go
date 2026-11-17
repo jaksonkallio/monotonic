@@ -25,12 +25,12 @@ func NewProjectorBackend(pool *pgxpool.Pool) *ProjectorBackend {
 func (b *ProjectorBackend) Migrate(ctx context.Context) error {
 	_, err := b.pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS projector_state (
-			projector_name TEXT NOT NULL PRIMARY KEY,
-			global_counter BIGINT NOT NULL,
-			truncate       BOOLEAN NOT NULL DEFAULT FALSE,
-			updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+			projector_name     TEXT NOT NULL PRIMARY KEY,
+			global_counter     BIGINT NOT NULL,
+			truncate_requested BOOLEAN NOT NULL DEFAULT FALSE,
+			updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
-		ALTER TABLE projector_state ADD COLUMN IF NOT EXISTS "truncate" BOOLEAN NOT NULL DEFAULT FALSE;
+		ALTER TABLE projector_state ADD COLUMN IF NOT EXISTS queued_truncate BOOLEAN NOT NULL DEFAULT FALSE;
 	`)
 	if err != nil {
 		return fmt.Errorf("migrate projector_state: %w", err)
@@ -39,16 +39,16 @@ func (b *ProjectorBackend) Migrate(ctx context.Context) error {
 }
 
 type ProjectorStateSnapshot struct {
-	globalCounter int64
-	truncate      bool
+	globalCounter     int64
+	truncateRequested bool
 }
 
 func (s ProjectorStateSnapshot) GlobalCounter() uint64 {
 	return uint64(s.globalCounter)
 }
 
-func (s ProjectorStateSnapshot) Truncate() bool {
-	return s.truncate
+func (s ProjectorStateSnapshot) TruncateRequested() bool {
+	return s.truncateRequested
 }
 
 // LockStateForModification starts a transaction and locks the projector state row for the given projector name for update modification.
@@ -64,20 +64,20 @@ func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name st
 	}
 
 	var globalCounter int64
-	var truncate bool
+	var truncateRequested bool
 	if err := tx.QueryRow(ctx,
-		`SELECT global_counter, "truncate"
+		`SELECT global_counter, truncate_requested
 		FROM projector_state
 		WHERE projector_name = $1
 		FOR UPDATE;`,
 		name,
-	).Scan(&globalCounter, &truncate); err != nil {
+	).Scan(&globalCounter, &truncateRequested); err != nil {
 		return nil, ProjectorStateSnapshot{}, fmt.Errorf("query projector state: %w", err)
 	}
 
 	return tx, ProjectorStateSnapshot{
-		globalCounter: globalCounter,
-		truncate:      truncate,
+		globalCounter:     globalCounter,
+		truncateRequested: truncateRequested,
 	}, nil
 }
 
@@ -85,7 +85,7 @@ func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name st
 func (b *ProjectorBackend) CommitTruncatedStateFromModification(ctx context.Context, tx pgx.Tx, name string) error {
 	if _, err := tx.Exec(ctx,
 		`UPDATE projector_state
-		SET "truncate" = false, global_counter = 0
+		SET truncate_requested = false, global_counter = 0
 		WHERE projector_name = $1`,
 		name,
 	); err != nil {
@@ -121,7 +121,7 @@ func (b *ProjectorBackend) CommitAdvancedStateFromModification(ctx context.Conte
 func (b *ProjectorBackend) EnqueueTruncate(ctx context.Context, name string) error {
 	if _, err := b.pool.Exec(ctx,
 		`UPDATE projector_state
-		SET "truncate" = true
+		SET truncate_requested = true
 		WHERE projector_name = $1`,
 		name,
 	); err != nil {
