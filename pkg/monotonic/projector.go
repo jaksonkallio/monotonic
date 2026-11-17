@@ -3,6 +3,8 @@ package monotonic
 import (
 	"context"
 	"fmt"
+	"log/slog"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -169,7 +171,9 @@ func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateRes
 	}, nil
 }
 
-// Run drives Update in a loop, sleeping pollInterval between catch-up polls; returns nil on context cancellation.
+// Run does Update in a loop, sleeping pollInterval between catch-up polls.
+// Returns on any error or context cancellation.
+// Use Drive if you want to log and continue on update errors.
 func (p *Projector[Tx]) Run(ctx context.Context, pollInterval time.Duration) error {
 	for {
 		if ctx.Err() != nil {
@@ -193,6 +197,70 @@ func (p *Projector[Tx]) Run(ctx context.Context, pollInterval time.Duration) err
 		case <-time.After(pollInterval):
 		case <-ctx.Done():
 			return nil
+		}
+	}
+}
+
+// DefaultDriveErrorBackoff is the error backoff Drive uses when the caller supplies none.
+// It plateaus at roughly a minute between retries, which keeps a projector that is broken for a long time from dominating the logs while still recovering promptly once the cause clears.
+func DefaultDriveErrorBackoff() *Retry {
+	return NewRetry(10, ExponentialBackoff(100*time.Millisecond))
+}
+
+// Drive drives Update in a loop, sleeping pollInterval between catch-up polls, and keeps going until ctx ends.
+// Unlike Run it logs update errors rather than returning them, so one failing projector does not stop a long-running process; the only thing that stops it is ctx ending, whose error it returns.
+//
+// Consecutive failures back off using errorBackoff, and a single success resets that.
+// Pass nil for DefaultDriveErrorBackoff.
+// Waiting goes through Retry.WaitForNextAttemptIndefinitely, so the backoff's MaxAttempts bounds how far the wait grows rather than how many attempts are allowed; see Retry.PlateauedBackoff.
+// A BackoffFn returning zero means retry immediately, matching the BackoffFn contract, so pairing one with Drive gives a busy loop on a persistent error.
+func (p *Projector[Tx]) Drive(ctx context.Context, pollInterval time.Duration, errorBackoff *Retry) error {
+	if errorBackoff == nil || errorBackoff.Backoff == nil {
+		errorBackoff = DefaultDriveErrorBackoff()
+	}
+	consecutiveFailures := 0
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		result, err := p.Update(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			consecutiveFailures++
+			slog.Error(
+				"projector update failed",
+				"projector", p.name,
+				"consecutive_failures", consecutiveFailures,
+				"retry_in", errorBackoff.PlateauedBackoff(consecutiveFailures),
+				"err", err,
+			)
+
+			// Indefinitely, so the only thing this reports is the context ending.
+			if waitErr := errorBackoff.WaitForNextAttemptIndefinitely(ctx, consecutiveFailures); waitErr != nil {
+				return fmt.Errorf("wait for next attempt: %w", waitErr)
+			}
+
+			continue
+		}
+
+		if consecutiveFailures > 0 {
+			slog.Info("projector recovered", "projector", p.name, "after_failures", consecutiveFailures)
+			consecutiveFailures = 0
+		}
+
+		if result.Updated() {
+			// Some meaningful work was performed, continue without sleeping because there's likely more work to do imminently.
+			continue
+		}
+
+		select {
+		case <-time.After(pollInterval):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
@@ -221,7 +289,12 @@ type ProjectorRunner interface {
 	Run(ctx context.Context, pollInterval time.Duration) error
 }
 
-// RunProjectors runs each projector concurrently in its own goroutine and returns when all have stopped.
+// ProjectorDriver is implemented by any projector that can be driven by DriveProjectors.
+type ProjectorDriver interface {
+	Drive(ctx context.Context, pollInterval time.Duration, errorBackoff *Retry) error
+}
+
+// RunProjectors runs each projector concurrently in its own goroutine and returns when any stop due to error or context cancellation.
 // If any projector returns an error, the shared context is cancelled and RunProjectors returns that error.
 // On clean context cancellation all projectors stop and RunProjectors returns nil.
 func RunProjectors(ctx context.Context, pollInterval time.Duration, projectors ...ProjectorRunner) error {
@@ -233,4 +306,26 @@ func RunProjectors(ctx context.Context, pollInterval time.Duration, projectors .
 		})
 	}
 	return g.Wait()
+}
+
+// DriveProjectors drives each projector concurrently in its own goroutine and returns once every one has stopped, which only happens when ctx ends.
+// Update errors are logged and retried by each projector rather than propagated, so unlike RunProjectors one failing projector never stops the others.
+// Pass nil for errorBackoff to use DefaultDriveErrorBackoff.
+// Returns ctx.Err(), which is what stopped every projector.
+func DriveProjectors(ctx context.Context, pollInterval time.Duration, errorBackoff *Retry, projectors ...ProjectorDriver) error {
+	var projectorsDone sync.WaitGroup
+	for _, p := range projectors {
+		projectorsDone.Add(1)
+
+		go func() {
+			defer projectorsDone.Done()
+			if err := p.Drive(ctx, pollInterval, errorBackoff); err != nil && ctx.Err() == nil {
+				slog.Error("projector drive stopped", "err", err)
+			}
+		}()
+	}
+
+	projectorsDone.Wait()
+
+	return ctx.Err()
 }

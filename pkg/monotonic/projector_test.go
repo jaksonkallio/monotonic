@@ -835,3 +835,227 @@ func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
 		t.Error("expected error when one projector fails")
 	}
 }
+
+// --- Drive tests ---
+
+// recordingBackoff returns a BackoffFn that records the attempt counter it was asked about, so the
+// Drive tests can assert the backoff schedule directly instead of timing wall-clock sleeps.
+func recordingBackoff(attempts *[]int, wait time.Duration) monotonic.BackoffFn {
+	return func(nextAttemptCounter int) time.Duration {
+		*attempts = append(*attempts, nextAttemptCounter)
+		return wait
+	}
+}
+
+// TestProjector_DriveBacksOffAndPlateausOnPersistentError pins both halves of the backoff: the wait
+// grows with consecutive failures, and it stops growing at MaxAttempts instead of running away.
+// Without the plateau an unbounded ExponentialBackoff would eventually overflow a time.Duration.
+func TestProjector_DriveBacksOffAndPlateausOnPersistentError(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, failingDispatch(errors.New("always boom")), backend, 0)
+
+	// Backoff is asked for a duration once per failure; the duration itself is kept tiny so the
+	// test is fast, and the schedule is asserted from the recorded attempt counters.
+	var attempts []int
+	const maxAttempts = 3
+	retry := &monotonic.Retry{MaxAttempts: maxAttempts, Backoff: recordingBackoff(&attempts, time.Millisecond)}
+
+	if err := p.Drive(ctx, time.Millisecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded", err)
+	}
+
+	// Drive is asked twice per failure: once to log retry_in, once to wait.
+	if len(attempts) < 2*maxAttempts {
+		t.Fatalf("only %d backoff lookups, too few to show a schedule: %v", len(attempts), attempts)
+	}
+	for i, got := range attempts {
+		if got < 1 {
+			t.Fatalf("attempt[%d] = %d, must be at least 1 or the backoff degenerates to an immediate retry", i, got)
+		}
+		if got > maxAttempts {
+			t.Fatalf("attempt[%d] = %d exceeds MaxAttempts %d; the wait is growing without bound", i, got, maxAttempts)
+		}
+	}
+	// Early failures must escalate rather than sitting at the first step.
+	if attempts[0] != 1 {
+		t.Errorf("first backoff lookup = %d, want 1", attempts[0])
+	}
+	if attempts[len(attempts)-1] != maxAttempts {
+		t.Errorf("last backoff lookup = %d, want the plateau %d", attempts[len(attempts)-1], maxAttempts)
+	}
+}
+
+// TestProjector_DriveResetsBackoffAfterSuccess covers a transient failure. The run alternates
+// fail, succeed, fail, so the second failure's backoff step is what distinguishes a counter that
+// reset from one that kept climbing; a test that only fails before the success cannot tell them apart.
+func TestProjector_DriveResetsBackoffAfterSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
+	backend := newFakeBackend()
+
+	// Odd calls fail, even calls succeed. With a batch size of one that makes each Update a single
+	// handler call, so the run is: fail, succeed, fail, succeed.
+	calls := 0
+	dispatch := monotonic.NewDispatch[*testTx]().On("test", "happened", func(context.Context, *testTx, monotonic.AggregateEvent) error {
+		calls++
+		if calls%2 == 1 {
+			return errors.New("transient boom")
+		}
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 1)
+
+	var attempts []int
+	retry := &monotonic.Retry{MaxAttempts: 5, Backoff: recordingBackoff(&attempts, time.Millisecond)}
+
+	if err := p.Drive(ctx, 50*time.Millisecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded", err)
+	}
+
+	// Two failures, each looked up twice (once to log retry_in, once to wait). Both must sit at
+	// step 1: if the counter did not reset, the second failure would report step 2.
+	want := []int{1, 1, 1, 1}
+	if len(attempts) != len(want) {
+		t.Fatalf("backoff lookups = %v, want %v", attempts, want)
+	}
+	for i := range want {
+		if attempts[i] != want[i] {
+			t.Fatalf("backoff lookups = %v, want %v; the failure counter did not reset after the success", attempts, want)
+		}
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 2 {
+		t.Errorf("counter = %d, want 2; Drive did not recover and commit both events", got)
+	}
+}
+
+// TestProjector_DriveReturnsContextErrorOnContextEnd covers both ways a context can end and every
+// place Drive can notice one: at the loop top, out of an Update, out of the backoff wait, and out
+// of the poll sleep. All four must report the same cause, or a caller cannot tell a cancellation
+// from a deadline based on where the loop happened to be.
+func TestProjector_DriveReturnsContextErrorOnContextEnd(t *testing.T) {
+	newProjector := func(dispatch *monotonic.Dispatch[*testTx]) *monotonic.Projector[*testTx] {
+		store := monotonic.NewInMemoryStore()
+		emitEvent(context.Background(), t, store, 1)
+		p, _ := monotonic.NewProjector("p1", store, dispatch, newFakeBackend(), 0)
+		return p
+	}
+
+	t.Run("cancelled while polling", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { done <- newProjector(noopDispatch()).Drive(ctx, time.Millisecond, nil) }()
+		cancel()
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("Drive = %v, want context.Canceled", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("Drive did not stop within 2s of cancellation")
+		}
+	})
+
+	t.Run("deadline expires while sleeping", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		if err := newProjector(noopDispatch()).Drive(ctx, time.Hour, nil); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("deadline already expired on entry", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		defer cancel()
+		time.Sleep(5 * time.Millisecond)
+		if err := newProjector(noopDispatch()).Drive(ctx, time.Hour, nil); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+
+	t.Run("deadline expires during the error backoff", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		// A failing dispatch plus a long backoff parks Drive inside the wait, which is a distinct
+		// return path from the poll sleep.
+		retry := monotonic.NewRetry(1, monotonic.ConstantBackoff(time.Hour))
+		err := newProjector(failingDispatch(errors.New("boom"))).Drive(ctx, time.Hour, retry)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Drive = %v, want context.DeadlineExceeded", err)
+		}
+	})
+}
+
+// TestProjector_DriveSurvivesAPermanentlyWedgedProjector is the case Drive exists for: an error
+// that retrying can never clear must not stop the loop, and must not spin at the poll interval.
+func TestProjector_DriveSurvivesAPermanentlyWedgedProjector(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+
+	var attempts []int
+	// A 100ms wait against a 1µs poll interval: without backoff this would retry thousands of times.
+	retry := &monotonic.Retry{MaxAttempts: 2, Backoff: recordingBackoff(&attempts, 100*time.Millisecond)}
+
+	if err := p.Drive(ctx, time.Microsecond, retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drive returned %v, want context.DeadlineExceeded; a wedged projector must not stop the loop early", err)
+	}
+	if len(attempts) == 0 {
+		t.Fatal("no backoff lookups; the wedge error did not go through the backoff path")
+	}
+	// Two lookups per failure, so roughly 600ms/100ms = 6 failures means about 12 lookups.
+	if len(attempts) > 40 {
+		t.Errorf("%d backoff lookups in 1s; Drive is retrying at the poll interval instead of backing off", len(attempts))
+	}
+}
+
+func TestDriveProjectors_AllStopOnContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
+
+	makeDriver := func(name string) monotonic.ProjectorDriver {
+		// Every projector fails forever, which is exactly what DriveProjectors must tolerate.
+		p, _ := monotonic.NewProjector(name, store, failingDispatch(errors.New("boom")), backend, 0)
+		return p
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- monotonic.DriveProjectors(ctx, time.Millisecond, nil, makeDriver("a"), makeDriver("b"), makeDriver("c"))
+	}()
+
+	// Give the drivers a moment to fail and back off, proving failures alone do not stop them.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("DriveProjectors returned %v while the context was live; failing projectors must not stop it", err)
+	default:
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("DriveProjectors = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("DriveProjectors did not stop within 5s of cancellation")
+	}
+}
