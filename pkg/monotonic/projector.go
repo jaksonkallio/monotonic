@@ -17,7 +17,7 @@ type ProjectorStateSnapshot interface {
 }
 
 type ModificationTx interface {
-	Rollback() error
+	Rollback(ctx context.Context) error
 }
 
 // ProjectorBackend is the store-specific backend for handling projector state and projection modifications.
