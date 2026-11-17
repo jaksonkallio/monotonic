@@ -539,3 +539,118 @@ func TestProjectorBackend_CaughtUpUpdateWritesNothing(t *testing.T) {
 		t.Errorf("updated_at moved from %v to %v; a caught-up Update wrote to projector_state", before, after)
 	}
 }
+
+// TestProjectorBackend_TruncateWithoutHandlerWedgesProjector verifies the wedge is durable in the
+// database rather than just in process memory: the request stays on the row, the counter does not
+// move, and no further events are applied until a handler exists.
+func TestProjectorBackend_TruncateWithoutHandlerWedgesProjector(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_wedge")
+
+	appendTestEvent(t, store, "x", 1, "did")
+	appendTestEvent(t, store, "x", 2, "did")
+
+	// No OnTruncate registered.
+	p, err := monotonic.NewProjector("wedge", store, countingDispatch("proj_wedge", nil), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if result, err := p.Update(ctx); err != nil || result.AppliedEvents != 2 {
+		t.Fatalf("Update: applied=%d err=%v, want 2", result.AppliedEvents, err)
+	}
+	before := readProjectorState(t, "wedge")
+
+	if err := backend.EnqueueTruncate(ctx, "wedge"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+
+	// Events appended after the request must not be applied while the truncate is pending.
+	appendTestEvent(t, store, "x", 3, "did")
+
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := p.Update(ctx)
+		if !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+			t.Fatalf("attempt %d: Update err = %v, want ErrNoTruncateHandler", attempt, err)
+		}
+	}
+
+	if got := projectedTotal(t, "proj_wedge"); got != 2 {
+		t.Errorf("proj_wedge total = %d while wedged, want 2 (unchanged)", got)
+	}
+	after := readProjectorState(t, "wedge")
+	if after.GlobalCounter != before.GlobalCounter {
+		t.Errorf("projector_state = %d while wedged, want %d (unchanged)", after.GlobalCounter, before.GlobalCounter)
+	}
+	if !after.TruncateRequested {
+		t.Error("truncate_requested cleared by a wedged Update; the request would be lost across a restart")
+	}
+
+	// Registering a handler is the way out, and the rebuild then covers all three events.
+	fixed, err := monotonic.NewProjector("wedge", store, countingDispatch("proj_wedge", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_wedge`)
+			return err
+		}), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if result, err := fixed.Update(ctx); err != nil || !result.Truncated {
+		t.Fatalf("Update after registering a handler: truncated=%v err=%v", result.Truncated, err)
+	}
+	if result, err := fixed.Update(ctx); err != nil || result.AppliedEvents != 3 {
+		t.Fatalf("replay: applied=%d err=%v, want 3", result.AppliedEvents, err)
+	}
+	if got := projectedTotal(t, "proj_wedge"); got != 3 {
+		t.Errorf("proj_wedge total = %d after rebuild, want 3", got)
+	}
+}
+
+// TestProjectorBackend_RequestTruncateRoundTrip verifies the front door: RequestTruncate flags the
+// projector's own row, and rejects the request without writing anything when no handler exists.
+func TestProjectorBackend_RequestTruncateRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_request")
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	unTruncatable, err := monotonic.NewProjector("request", store, countingDispatch("proj_request", nil), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := unTruncatable.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+		t.Fatalf("RequestTruncate err = %v, want ErrNoTruncateHandler", err)
+	}
+	if readProjectorState(t, "request").TruncateRequested {
+		t.Fatal("a rejected RequestTruncate still wrote truncate_requested")
+	}
+
+	truncatable, err := monotonic.NewProjector("request", store, countingDispatch("proj_request", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_request`)
+			return err
+		}), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := truncatable.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if err := truncatable.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate: %v", err)
+	}
+	if !readProjectorState(t, "request").TruncateRequested {
+		t.Fatal("RequestTruncate did not flag the projector's own row")
+	}
+
+	result, err := truncatable.Update(ctx)
+	if err != nil || !result.Truncated {
+		t.Fatalf("Update after RequestTruncate: truncated=%v err=%v", result.Truncated, err)
+	}
+	if got := projectedTotal(t, "proj_request"); got != 0 {
+		t.Errorf("proj_request total = %d after truncate, want 0", got)
+	}
+}

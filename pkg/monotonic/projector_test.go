@@ -218,6 +218,24 @@ func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 	}
 }
 
+func TestDispatch_TruncateWithoutHandlerReturnsSentinel(t *testing.T) {
+	d := monotonic.NewDispatch[*testTx]()
+	if err := d.Truncate(context.Background(), &testTx{}); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+		t.Errorf("Truncate err = %v, want ErrNoTruncateHandler", err)
+	}
+	if d.HasTruncateHandler() {
+		t.Error("HasTruncateHandler() = true on an empty Dispatch")
+	}
+
+	d.OnTruncate(func(context.Context, *testTx) error { return nil })
+	if !d.HasTruncateHandler() {
+		t.Error("HasTruncateHandler() = false after OnTruncate")
+	}
+	if err := d.Truncate(context.Background(), &testTx{}); err != nil {
+		t.Errorf("Truncate after OnTruncate: %v", err)
+	}
+}
+
 func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
 	d := monotonic.NewDispatch[*testTx]()
 	err := d.Apply(context.Background(), &testTx{}, monotonic.AggregateEvent{
@@ -442,15 +460,17 @@ func TestProjector_TruncateRunsHandlerAndRewindsState(t *testing.T) {
 	}
 }
 
-// TestProjector_TruncateWithoutHandlerRewindsState covers a Dispatch that registered no truncate
-// handler: there is nothing to clear, but the state rewind still happens.
-func TestProjector_TruncateWithoutHandlerRewindsState(t *testing.T) {
+// TestProjector_TruncateWithoutHandlerWedgesProjector covers the strict reading of a missing
+// truncate handler. Rewinding without clearing would replay the stream over a projection that was
+// never emptied, so the projector refuses to make any progress at all until the gap is fixed.
+func TestProjector_TruncateWithoutHandlerWedgesProjector(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
 	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0)
 	if _, err := p.Update(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
@@ -458,15 +478,126 @@ func TestProjector_TruncateWithoutHandlerRewindsState(t *testing.T) {
 		t.Fatalf("EnqueueTruncate: %v", err)
 	}
 
-	result, err := p.Update(ctx)
+	emitEvent(ctx, t, store, 2)
+	appliedBefore := cr.n
+
+	// The wedge is permanent: nothing about retrying clears it, so every later Update fails the
+	// same way rather than quietly resuming.
+	for attempt := 0; attempt < 3; attempt++ {
+		_, err := p.Update(ctx)
+		if !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+			t.Fatalf("attempt %d: Update err = %v, want ErrNoTruncateHandler", attempt, err)
+		}
+	}
+
+	if cr.n != appliedBefore {
+		t.Errorf("handler ran %d more times while wedged, want 0; a pending truncate must block event application", cr.n-appliedBefore)
+	}
+
+	state := backend.stateOf("p1")
+	if !state.TruncateRequested {
+		t.Error("TruncateRequested cleared by a failed truncate; the request would be silently dropped")
+	}
+	if state.GlobalCounter != 1 {
+		t.Errorf("counter = %d while wedged, want 1 (unchanged)", state.GlobalCounter)
+	}
+	if backend.commitCalls != 1 {
+		t.Errorf("commitCalls = %d, want 1 (only the pre-truncate batch)", backend.commitCalls)
+	}
+	if backend.isLocked() {
+		t.Error("modification lock still held after a wedged Update")
+	}
+
+	// Registering the handler is the way out, and the rebuild then proceeds normally.
+	fixed, _ := monotonic.NewProjector("p1", store, countingDispatch(cr).OnTruncate(func(context.Context, *testTx) error {
+		return nil
+	}), backend, 0)
+	result, err := fixed.Update(ctx)
 	if err != nil {
-		t.Fatalf("Update after EnqueueTruncate: %v", err)
+		t.Fatalf("Update after registering a handler: %v", err)
 	}
 	if !result.Truncated {
-		t.Error("Truncated = false, want true")
+		t.Error("Truncated = false after the handler was registered, want true")
 	}
 	if got := backend.stateOf("p1").GlobalCounter; got != 0 {
 		t.Errorf("counter = %d after truncate, want 0", got)
+	}
+}
+
+// TestProjector_RunSurfacesErrNoTruncateHandler covers the sentinel surviving the Run loop, which
+// is where a supervisor actually observes it and has to decide whether restarting could help.
+func TestProjector_RunSurfacesErrNoTruncateHandler(t *testing.T) {
+	// Bounded so a regression that stops erroring fails this test instead of spinning forever:
+	// Run only returns on an error or a dead context, and the lenient behavior produces neither.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+
+	if err := p.Run(ctx, time.Millisecond); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+		t.Errorf("Run err = %v, want ErrNoTruncateHandler", err)
+	}
+}
+
+func TestProjector_RequestTruncateEnqueuesForItsOwnName(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	truncated := 0
+	dispatch := countingDispatch(&counterRef{}).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0)
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	if err := p.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate: %v", err)
+	}
+	if !backend.stateOf("p1").TruncateRequested {
+		t.Fatal("RequestTruncate did not flag the projector's own name")
+	}
+
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after RequestTruncate: %v", err)
+	}
+	if !result.Truncated || truncated != 1 {
+		t.Errorf("Truncated=%v handler ran %d times, want true and 1", result.Truncated, truncated)
+	}
+}
+
+// TestProjector_RequestTruncateRejectsMissingHandler is the front door the wedge exists to make
+// unnecessary: the gap is reported to whoever asked, and nothing is enqueued.
+func TestProjector_RequestTruncateRejectsMissingHandler(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+
+	if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrNoTruncateHandler) {
+		t.Fatalf("RequestTruncate err = %v, want ErrNoTruncateHandler", err)
+	}
+	if backend.stateOf("p1").TruncateRequested {
+		t.Error("a rejected RequestTruncate still enqueued the truncate")
+	}
+
+	// Nothing was enqueued, so the projector keeps working rather than wedging.
+	emitEvent(ctx, t, store, 1)
+	if _, err := p.Update(ctx); err != nil {
+		t.Errorf("Update after a rejected RequestTruncate: %v", err)
 	}
 }
 

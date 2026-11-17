@@ -1,6 +1,9 @@
 package monotonic
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Handler processes a single event within a store-specific environment Tx (typically a transaction handle) supplied by the ProjectorBackend running the event.
 type Handler[Tx ModificationTx] func(ctx context.Context, tx Tx, event AggregateEvent) error
@@ -32,11 +35,20 @@ func (d *Dispatch[Tx]) On(aggregateType, eventType string, handler Handler[Tx]) 
 	return d
 }
 
+// ErrNoTruncateHandler reports that a truncate was requested for a Dispatch that registered no truncate handler.
+var ErrNoTruncateHandler = errors.New("no truncate handler registered")
+
 // OnTruncate registers the handler that clears the projection.
 // Registering twice overwrites.
+// Registering one is what makes a projector truncatable at all: without it a rewind would replay the stream over a projection that was never cleared, which silently double-counts every accumulating handler.
 func (d *Dispatch[Tx]) OnTruncate(handler TruncateHandler[Tx]) *Dispatch[Tx] {
 	d.truncateHandler = handler
 	return d
+}
+
+// HasTruncateHandler reports whether a truncate handler is registered, so a caller can reject a truncate request before enqueuing it rather than discovering the gap mid-rebuild.
+func (d *Dispatch[Tx]) HasTruncateHandler() bool {
+	return d.truncateHandler != nil
 }
 
 // EventFilters returns one EventFilter per registered handler so the projector subscribes to exactly the events the dispatch can route.
@@ -58,10 +70,11 @@ func (d *Dispatch[Tx]) Apply(ctx context.Context, tx Tx, event AggregateEvent) e
 	return applyHandler(ctx, tx, event)
 }
 
-// Truncate runs the registered truncate handler, or nothing if none was registered.
+// Truncate runs the registered truncate handler, or returns ErrNoTruncateHandler if there is none.
+// Erroring rather than succeeding silently matters because the caller's next move is to rewind the resume counter, and rewinding over a projection that was never cleared corrupts it.
 func (d *Dispatch[Tx]) Truncate(ctx context.Context, tx Tx) error {
 	if d.truncateHandler == nil {
-		return nil
+		return ErrNoTruncateHandler
 	}
 	return d.truncateHandler(ctx, tx)
 }

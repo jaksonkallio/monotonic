@@ -143,7 +143,17 @@ func (p *Projector[Tx]) advance(ctx context.Context, tx Tx, snapshot ProjectorSt
 	}, nil
 }
 
+// truncate services a pending truncate request: it clears the projection and rewinds the resume counter to the start of the stream, in one transaction.
+//
+// A projector with no truncate handler wedges here rather than rewinding, and that is deliberate.
+// Rewinding without clearing would replay the whole stream over the existing projection, which is silent corruption for any handler that accumulates.
+// The request is left set so the wedge survives a restart: the only ways out are to register a handler or to clear the flag by hand, both of which are deliberate acts.
 func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateResult, error) {
+	// Checked before dispatching so the error can name the projector and the fix; Dispatch.Truncate reports the same sentinel for anyone calling it directly.
+	if !p.dispatch.HasTruncateHandler() {
+		return ProjectorUpdateResult{}, fmt.Errorf("truncate requested but %w", ErrNoTruncateHandler)
+	}
+
 	// Call dispatch handler for executing the actual projection truncation.
 	if err := p.dispatch.Truncate(ctx, tx); err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("truncate: %w", err)
@@ -185,6 +195,22 @@ func (p *Projector[Tx]) Run(ctx context.Context, pollInterval time.Duration) err
 			return nil
 		}
 	}
+}
+
+// RequestTruncate asks this projector to clear its projection and rebuild from the start of the event stream on its next Update.
+// It rejects the request outright when no truncate handler is registered, so a wiring gap surfaces synchronously here instead of wedging a background Run loop later.
+//
+// Prefer this over calling ProjectorBackend.EnqueueTruncate directly: the backend takes a projector name as a string, and a name that does not match any running projector enqueues a truncate nothing will ever service.
+func (p *Projector[Tx]) RequestTruncate(ctx context.Context) error {
+	if !p.dispatch.HasTruncateHandler() {
+		return fmt.Errorf("projector %q: cannot request truncate because %w; register one with Dispatch.OnTruncate", p.name, ErrNoTruncateHandler)
+	}
+
+	if err := p.backend.EnqueueTruncate(ctx, p.name); err != nil {
+		return fmt.Errorf("request truncate for projector %q: %w", p.name, err)
+	}
+
+	return nil
 }
 
 // Name returns the projector name used in the backend's state store.
