@@ -142,7 +142,7 @@ func TestProjectorLosesNoEventsUnderConcurrentAppends(t *testing.T) {
 			return err
 		})
 
-	projector, err := monotonic.NewProjector(ctx, "global_order", sharedStore, dispatch, backend, 0)
+	projector, err := monotonic.NewProjector("global_order", sharedStore, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("new projector: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestProjectorLosesNoEventsUnderConcurrentAppends(t *testing.T) {
 		if err != nil {
 			t.Fatalf("drain: %v", err)
 		}
-		if n == 0 {
+		if !n.Updated() {
 			break
 		}
 	}
@@ -253,7 +253,7 @@ func TestProjectorToleratesSequenceGap(t *testing.T) {
 			return err
 		})
 
-	projector, err := monotonic.NewProjector(ctx, "gap", sharedStore, dispatch, backend, 0)
+	projector, err := monotonic.NewProjector("gap", sharedStore, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("new projector: %v", err)
 	}
@@ -264,8 +264,8 @@ func TestProjectorToleratesSequenceGap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("update: %v", err)
 	}
-	if n != 1 {
-		t.Fatalf("projector processed %d events across a permanent sequence gap, want 1", n)
+	if n.AppliedEvents != 1 {
+		t.Fatalf("projector processed %d events across a permanent sequence gap, want 1", n.AppliedEvents)
 	}
 
 	var got int64

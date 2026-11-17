@@ -47,6 +47,26 @@ func resetProjectionTable(tb testing.TB, tableName string) {
 	})
 }
 
+// readProjectorState reads a projector's persisted state straight from the table, so assertions
+// about what actually committed don't go through the code under test.
+func readProjectorState(tb testing.TB, name string) monotonic.ProjectorStateSnapshot {
+	tb.Helper()
+
+	var counter int64
+	var truncateRequested bool
+	err := sharedPool.QueryRow(context.Background(),
+		`SELECT global_counter, truncate_requested FROM projector_state WHERE projector_name = $1`,
+		name,
+	).Scan(&counter, &truncateRequested)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return monotonic.ProjectorStateSnapshot{}
+	}
+	if err != nil {
+		tb.Fatalf("read projector_state for %q: %v", name, err)
+	}
+	return monotonic.ProjectorStateSnapshot{GlobalCounter: uint64(counter), TruncateRequested: truncateRequested}
+}
+
 func appendTestEvent(tb testing.TB, store monotonic.Store, aggID string, counter int64, eventType string) {
 	tb.Helper()
 	err := store.Append(context.Background(), monotonic.AggregateEvent{
@@ -61,6 +81,30 @@ func appendTestEvent(tb testing.TB, store monotonic.Store, aggID string, counter
 	if err != nil {
 		tb.Fatalf("append: %v", err)
 	}
+}
+
+// countingDispatch builds a dispatch that bumps a row in tableName per event.
+func countingDispatch(tableName string, onApply func()) *monotonic.Dispatch[pgx.Tx] {
+	return monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+			if onApply != nil {
+				onApply()
+			}
+			_, err := tx.Exec(ctx,
+				`INSERT INTO `+tableName+` (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = `+tableName+`.n + 1`,
+				event.AggregateID,
+			)
+			return err
+		})
+}
+
+func projectedTotal(tb testing.TB, tableName string) int64 {
+	tb.Helper()
+	var total int64
+	if err := sharedPool.QueryRow(context.Background(), `SELECT COALESCE(SUM(n), 0) FROM `+tableName).Scan(&total); err != nil {
+		tb.Fatalf("read %s: %v", tableName, err)
+	}
+	return total
 }
 
 // TestProjectorBackend_AtomicCommitAcrossTables verifies that two implementer-owned
@@ -86,12 +130,13 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p, err := monotonic.NewProjector(ctx, "two_tables", store, dispatch, backend, 0)
+	p, err := monotonic.NewProjector("two_tables", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
-	if n, err := p.Update(ctx); err != nil || n != 2 {
-		t.Fatalf("Update: n=%d err=%v", n, err)
+	result, err := p.Update(ctx)
+	if err != nil || result.AppliedEvents != 2 {
+		t.Fatalf("Update: applied=%d err=%v, want 2", result.AppliedEvents, err)
 	}
 
 	var a, b int64
@@ -105,12 +150,8 @@ func TestProjectorBackend_AtomicCommitAcrossTables(t *testing.T) {
 		t.Errorf("expected both tables to show 2 events, got a=%d b=%d", a, b)
 	}
 
-	got, err := backend.GetState(ctx, "two_tables")
-	if err != nil {
-		t.Fatalf("GetState: %v", err)
-	}
-	if got != p.GlobalCounter() {
-		t.Errorf("backend state %d != projector counter %d", got, p.GlobalCounter())
+	if got := readProjectorState(t, "two_tables").GlobalCounter; got != result.AdvancedToGlobalCounter {
+		t.Errorf("committed state %d != reported counter %d", got, result.AdvancedToGlobalCounter)
 	}
 }
 
@@ -133,7 +174,7 @@ func TestProjectorBackend_RollsBackOnHandlerError(t *testing.T) {
 
 	appendTestEvent(t, store, "x", 1, "did")
 
-	p, err := monotonic.NewProjector(ctx, "rb", store, dispatch, backend, 0)
+	p, err := monotonic.NewProjector("rb", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -142,15 +183,67 @@ func TestProjectorBackend_RollsBackOnHandlerError(t *testing.T) {
 		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
 	}
 
-	var count int
-	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_rb`).Scan(&count)
-	if count != 0 {
-		t.Errorf("proj_rb row count: want 0 (rolled back), got %d", count)
+	if got := projectedTotal(t, "proj_rb"); got != 0 {
+		t.Errorf("proj_rb total: want 0 (rolled back), got %d", got)
+	}
+	if got := readProjectorState(t, "rb").GlobalCounter; got != 0 {
+		t.Errorf("projector_state must not advance on handler error, got %d", got)
+	}
+}
+
+// TestProjectorBackend_BatchRollsBackEntirelyOnMidBatchError pins the behavior that locking the
+// whole update buys: a batch is one transaction, so a handler failing on the third of four events
+// discards the first two as well rather than leaving the projection partially advanced.
+func TestProjectorBackend_BatchRollsBackEntirelyOnMidBatchError(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_partial")
+
+	for i := int64(1); i <= 4; i++ {
+		appendTestEvent(t, store, "x", i, "did")
 	}
 
-	got, _ := backend.GetState(ctx, "rb")
-	if got != 0 {
-		t.Errorf("projector_state must not advance on handler error, got %d", got)
+	wantErr := errors.New("simulated mid-batch failure")
+	calls := 0
+	dispatch := monotonic.NewDispatch[pgx.Tx]().
+		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
+			calls++
+			if calls == 3 {
+				return wantErr
+			}
+			_, err := tx.Exec(ctx, `INSERT INTO proj_partial (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_partial.n + 1`, event.AggregateID)
+			return err
+		})
+
+	p, err := monotonic.NewProjector("partial", store, dispatch, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("Update err = %v, want %v", err, wantErr)
+	}
+
+	if got := projectedTotal(t, "proj_partial"); got != 0 {
+		t.Errorf("proj_partial total = %d after a failed batch, want 0; the first two events leaked", got)
+	}
+	if got := readProjectorState(t, "partial").GlobalCounter; got != 0 {
+		t.Errorf("projector_state = %d after a failed batch, want 0", got)
+	}
+
+	// The batch is retried whole on the next Update.
+	calls = 0
+	dispatch2 := countingDispatch("proj_partial", nil)
+	p2, err := monotonic.NewProjector("partial", store, dispatch2, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	result, err := p2.Update(ctx)
+	if err != nil || result.AppliedEvents != 4 {
+		t.Fatalf("retry Update: applied=%d err=%v, want 4", result.AppliedEvents, err)
+	}
+	if got := projectedTotal(t, "proj_partial"); got != 4 {
+		t.Errorf("proj_partial total = %d after retry, want 4", got)
 	}
 }
 
@@ -162,114 +255,57 @@ func TestProjectorBackend_ResumeFromStoredCounter(t *testing.T) {
 	backend := resetProjectorState(t)
 	resetProjectionTable(t, "proj_resume")
 
-	cr := 0
-	dispatch := monotonic.NewDispatch[pgx.Tx]().
-		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
-			cr++
-			_, err := tx.Exec(ctx, `INSERT INTO proj_resume (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_resume.n + 1`, event.AggregateID)
-			return err
-		})
+	calls := 0
+	dispatch := countingDispatch("proj_resume", func() { calls++ })
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p1, err := monotonic.NewProjector(ctx, "resume", store, dispatch, backend, 0)
+	p1, err := monotonic.NewProjector("resume", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
-	if n, err := p1.Update(ctx); err != nil || n != 2 {
-		t.Fatalf("first Update n=%d, want 2", n)
+	first, err := p1.Update(ctx)
+	if err != nil || first.AppliedEvents != 2 {
+		t.Fatalf("first Update: applied=%d err=%v, want 2", first.AppliedEvents, err)
 	}
 
 	appendTestEvent(t, store, "x", 3, "did")
 
-	p2, err := monotonic.NewProjector(ctx, "resume", store, dispatch, backend, 0)
+	p2, err := monotonic.NewProjector("resume", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("resume NewProjector: %v", err)
 	}
-	if p2.GlobalCounter() != p1.GlobalCounter() {
-		t.Errorf("resumed counter %d, want %d", p2.GlobalCounter(), p1.GlobalCounter())
+	second, err := p2.Update(ctx)
+	if err != nil || second.AppliedEvents != 1 {
+		t.Errorf("resumed Update: applied=%d err=%v, want exactly 1", second.AppliedEvents, err)
 	}
-	if n, err := p2.Update(ctx); err != nil || n != 1 {
-		t.Errorf("resumed Update should process exactly 1 event, got n=%d err=%v", n, err)
+	if second.AdvancedToGlobalCounter <= first.AdvancedToGlobalCounter {
+		t.Errorf("resumed counter %d did not advance past %d", second.AdvancedToGlobalCounter, first.AdvancedToGlobalCounter)
 	}
-	if cr != 3 {
-		t.Errorf("handler invoked %d times across both projectors, want 3", cr)
-	}
-}
-
-// TestProjectorBackend_ReplayingSeenCounterIsIdempotent verifies that a backend
-// asked to record a counter <= already-stored does not error and does not regress state.
-func TestProjectorBackend_ReplayingSeenCounterIsIdempotent(t *testing.T) {
-	ctx := context.Background()
-	_ = testStore(t)
-	backend := resetProjectorState(t)
-
-	apply := func(_ context.Context, _ pgx.Tx) error { return nil }
-
-	if err := backend.RunEvent(ctx, "idem", 5, apply); err != nil {
-		t.Fatalf("first RunEvent: %v", err)
-	}
-	// Replay an older counter — should not error and must not regress stored counter.
-	if err := backend.RunEvent(ctx, "idem", 3, apply); err != nil {
-		t.Fatalf("replay older RunEvent: %v", err)
-	}
-	got, _ := backend.GetState(ctx, "idem")
-	if got != 5 {
-		t.Errorf("counter regressed: got %d, want 5", got)
-	}
-	// Same counter again — idempotent rewrite.
-	if err := backend.RunEvent(ctx, "idem", 5, apply); err != nil {
-		t.Fatalf("replay equal RunEvent: %v", err)
-	}
-	got, _ = backend.GetState(ctx, "idem")
-	if got != 5 {
-		t.Errorf("equal-counter replay regressed: got %d, want 5", got)
+	if calls != 3 {
+		t.Errorf("handler invoked %d times across both projectors, want 3", calls)
 	}
 }
 
-// TestProjectorBackend_RunEventSkipsAlreadyProcessedCounter verifies that apply is not
-// re-invoked when RunEvent is called again for a counter already recorded.
-func TestProjectorBackend_RunEventSkipsAlreadyProcessedCounter(t *testing.T) {
+// TestProjectorBackend_ConcurrentInstancesApplyEachEventExactlyOnce simulates two instances of the
+// same projector (two processes, say) racing to drain the same stream. The projector_state row lock
+// taken for the whole update must serialize them: each instance reads the resume counter only after
+// winning the lock, so an event can never be applied twice or skipped.
+func TestProjectorBackend_ConcurrentInstancesApplyEachEventExactlyOnce(t *testing.T) {
 	ctx := context.Background()
+	store := testStore(t)
 	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_race")
 
-	applyCalls := 0
-	apply := func(_ context.Context, _ pgx.Tx) error {
-		applyCalls++
-		return nil
+	const numEvents = 40
+	for i := int64(1); i <= numEvents; i++ {
+		appendTestEvent(t, store, "x", i, "did")
 	}
-
-	if err := backend.RunEvent(ctx, "skip", 5, apply); err != nil {
-		t.Fatalf("first RunEvent: %v", err)
-	}
-	if applyCalls != 1 {
-		t.Fatalf("expected apply called once, got %d", applyCalls)
-	}
-
-	// Replaying the same counter must not re-run apply.
-	if err := backend.RunEvent(ctx, "skip", 5, apply); err != nil {
-		t.Fatalf("replay RunEvent: %v", err)
-	}
-	if applyCalls != 1 {
-		t.Errorf("apply must not run again for an already-processed counter, calls=%d", applyCalls)
-	}
-}
-
-// TestProjectorBackend_RunEventConcurrentInstancesApplyExactlyOnce simulates two instances of
-// the same projector racing to process the same event concurrently. The row lock taken inside
-// RunEvent must serialize them so apply runs exactly once, regardless of which instance wins.
-func TestProjectorBackend_RunEventConcurrentInstancesApplyExactlyOnce(t *testing.T) {
-	ctx := context.Background()
-	backend := resetProjectorState(t)
 
 	var applyCalls atomic.Int32
-	apply := func(_ context.Context, _ pgx.Tx) error {
-		applyCalls.Add(1)
-		// Hold the lock briefly so both goroutines are guaranteed to overlap.
-		time.Sleep(50 * time.Millisecond)
-		return nil
-	}
+	// A small batch size forces many lock acquisitions, so the two instances interleave.
+	const batchSize = 3
 
 	var wg sync.WaitGroup
 	errs := make([]error, 2)
@@ -277,119 +313,229 @@ func TestProjectorBackend_RunEventConcurrentInstancesApplyExactlyOnce(t *testing
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			errs[i] = backend.RunEvent(ctx, "race", 9, apply)
+
+			dispatch := countingDispatch("proj_race", func() { applyCalls.Add(1) })
+			p, err := monotonic.NewProjector("race", store, dispatch, backend, batchSize)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			for {
+				result, err := p.Update(ctx)
+				if err != nil {
+					errs[i] = err
+					return
+				}
+				if !result.Updated() {
+					return
+				}
+			}
 		}(i)
 	}
 	wg.Wait()
 
 	for i, err := range errs {
 		if err != nil {
-			t.Fatalf("instance %d RunEvent: %v", i, err)
+			t.Fatalf("instance %d: %v", i, err)
 		}
 	}
-	if got := applyCalls.Load(); got != 1 {
-		t.Errorf("expected exactly 1 apply across both racing instances, got %d", got)
+
+	if got := projectedTotal(t, "proj_race"); got != numEvents {
+		t.Errorf("projection total = %d, want %d; events were duplicated or skipped", got, numEvents)
 	}
-	got, _ := backend.GetState(ctx, "race")
-	if got != 9 {
-		t.Errorf("expected counter 9 after race, got %d", got)
+	if got := applyCalls.Load(); got != numEvents {
+		t.Errorf("handler ran %d times across both instances, want exactly %d", got, numEvents)
+	}
+	if got := readProjectorState(t, "race").GlobalCounter; got != numEvents {
+		t.Errorf("projector_state = %d, want %d", got, numEvents)
 	}
 }
 
-// TestProjectorBackend_ResetClearsProjectionAndCounterAtomically verifies that Projector.Reset
-// truncates the implementer's table and rewinds projector_state in the same commit, and that a
-// subsequent Update replays the full event stream from the beginning.
-func TestProjectorBackend_ResetClearsProjectionAndCounterAtomically(t *testing.T) {
+// TestProjectorBackend_TruncateClearsProjectionAndCounterAtomically verifies that a requested
+// truncate clears the implementer's table and rewinds projector_state in one commit, and that the
+// next Update replays the full event stream.
+func TestProjectorBackend_TruncateClearsProjectionAndCounterAtomically(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	backend := resetProjectorState(t)
-	resetProjectionTable(t, "proj_reset")
+	resetProjectionTable(t, "proj_truncate")
 
-	dispatch := monotonic.NewDispatch[pgx.Tx]().
-		On("thing", "did", func(ctx context.Context, tx pgx.Tx, event monotonic.AggregateEvent) error {
-			_, err := tx.Exec(ctx, `INSERT INTO proj_reset (k, n) VALUES ($1, 1) ON CONFLICT (k) DO UPDATE SET n = proj_reset.n + 1`, event.AggregateID)
+	dispatch := countingDispatch("proj_truncate", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_truncate`)
 			return err
 		})
 
 	appendTestEvent(t, store, "x", 1, "did")
 	appendTestEvent(t, store, "x", 2, "did")
 
-	p, err := monotonic.NewProjector(ctx, "reset", store, dispatch, backend, 0)
+	p, err := monotonic.NewProjector("truncate", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
-	if n, err := p.Update(ctx); err != nil || n != 2 {
-		t.Fatalf("Update: n=%d err=%v", n, err)
+	if result, err := p.Update(ctx); err != nil || result.AppliedEvents != 2 {
+		t.Fatalf("Update: applied=%d err=%v, want 2", result.AppliedEvents, err)
 	}
 
-	if err := p.Reset(ctx, func(ctx context.Context, tx pgx.Tx) error {
-		_, err := tx.Exec(ctx, `TRUNCATE proj_reset`)
-		return err
-	}); err != nil {
-		t.Fatalf("Reset: %v", err)
+	if err := backend.EnqueueTruncate(ctx, "truncate"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	if !readProjectorState(t, "truncate").TruncateRequested {
+		t.Fatal("EnqueueTruncate did not set truncate_requested")
 	}
 
-	if p.GlobalCounter() != 0 {
-		t.Errorf("projector counter must be 0 after Reset, got %d", p.GlobalCounter())
-	}
-	got, _ := backend.GetState(ctx, "reset")
-	if got != 0 {
-		t.Errorf("projector_state must be 0 after Reset, got %d", got)
-	}
-	var count int
-	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_reset`).Scan(&count)
-	if count != 0 {
-		t.Errorf("proj_reset row count: want 0 after Reset, got %d", count)
-	}
-
-	if n, err := p.Update(ctx); err != nil || n != 2 {
-		t.Fatalf("Update after Reset: n=%d err=%v, want 2 (full replay)", n, err)
-	}
-}
-
-// TestProjectorBackend_ResetRollsBackOnResetFuncError verifies that if the reset func errors,
-// neither its writes nor the projector_state rewind are committed.
-func TestProjectorBackend_ResetRollsBackOnResetFuncError(t *testing.T) {
-	ctx := context.Background()
-	backend := resetProjectorState(t)
-	resetProjectionTable(t, "proj_reset_rb")
-
-	if err := backend.RunEvent(ctx, "reset_rb", 7, func(_ context.Context, _ pgx.Tx) error { return nil }); err != nil {
-		t.Fatalf("seed RunEvent: %v", err)
-	}
-
-	wantErr := errors.New("simulated reset failure")
-	err := backend.ResetState(ctx, "reset_rb", func(ctx context.Context, tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `INSERT INTO proj_reset_rb (k, n) VALUES ('x', 1)`); err != nil {
-			return err
-		}
-		return wantErr
-	})
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
-	}
-
-	var count int
-	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_reset_rb`).Scan(&count)
-	if count != 0 {
-		t.Errorf("proj_reset_rb row count: want 0 (rolled back), got %d", count)
-	}
-	got, _ := backend.GetState(ctx, "reset_rb")
-	if got != 7 {
-		t.Errorf("projector_state must not be rewound on reset func error, got %d", got)
-	}
-}
-
-// TestProjectorBackend_GetStateMissingProjectorReturnsZero verifies the empty-state default.
-func TestProjectorBackend_GetStateMissingProjectorReturnsZero(t *testing.T) {
-	ctx := context.Background()
-	backend := resetProjectorState(t)
-
-	got, err := backend.GetState(ctx, "never_ran")
+	result, err := p.Update(ctx)
 	if err != nil {
-		t.Fatalf("GetState: %v", err)
+		t.Fatalf("Update after EnqueueTruncate: %v", err)
 	}
-	if got != 0 {
-		t.Errorf("missing projector should return 0, got %d", got)
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+	if result.AppliedEvents != 0 {
+		t.Errorf("AppliedEvents = %d on a truncate, want 0", result.AppliedEvents)
+	}
+
+	state := readProjectorState(t, "truncate")
+	if state.GlobalCounter != 0 {
+		t.Errorf("projector_state = %d after truncate, want 0", state.GlobalCounter)
+	}
+	if state.TruncateRequested {
+		t.Error("truncate_requested still set after the truncate was serviced")
+	}
+	if got := projectedTotal(t, "proj_truncate"); got != 0 {
+		t.Errorf("proj_truncate total = %d after truncate, want 0", got)
+	}
+
+	// The rewound projector replays the whole stream.
+	replay, err := p.Update(ctx)
+	if err != nil || replay.AppliedEvents != 2 {
+		t.Fatalf("Update after truncate: applied=%d err=%v, want 2 (full replay)", replay.AppliedEvents, err)
+	}
+	if got := projectedTotal(t, "proj_truncate"); got != 2 {
+		t.Errorf("proj_truncate total = %d after replay, want 2", got)
+	}
+}
+
+// TestProjectorBackend_TruncateRollsBackOnHandlerError verifies that if the truncate handler errors,
+// neither its writes nor the projector_state rewind are committed, and the request survives so the
+// next Update tries again.
+func TestProjectorBackend_TruncateRollsBackOnHandlerError(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_truncate_rb")
+
+	wantErr := errors.New("simulated truncate failure")
+	dispatch := countingDispatch("proj_truncate_rb", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			if _, err := tx.Exec(ctx, `INSERT INTO proj_truncate_rb (k, n) VALUES ('leaked', 1)`); err != nil {
+				return err
+			}
+			return wantErr
+		})
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	p, err := monotonic.NewProjector("truncate_rb", store, dispatch, backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	before := readProjectorState(t, "truncate_rb")
+
+	if err := backend.EnqueueTruncate(ctx, "truncate_rb"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("Update err = %v, want %v", err, wantErr)
+	}
+
+	var leaked int
+	sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM proj_truncate_rb WHERE k = 'leaked'`).Scan(&leaked)
+	if leaked != 0 {
+		t.Errorf("truncate handler's write committed despite the error, got %d rows", leaked)
+	}
+
+	after := readProjectorState(t, "truncate_rb")
+	if after.GlobalCounter != before.GlobalCounter {
+		t.Errorf("projector_state = %d after a failed truncate, want %d (unchanged)", after.GlobalCounter, before.GlobalCounter)
+	}
+	if !after.TruncateRequested {
+		t.Error("truncate_requested cleared by a failed truncate; the request would be lost")
+	}
+}
+
+// TestProjectorBackend_LockStateCreatesMissingRow verifies a projector that has never run gets its
+// projector_state row created rather than failing on a missing row.
+func TestProjectorBackend_LockStateCreatesMissingRow(t *testing.T) {
+	ctx := context.Background()
+	backend := resetProjectorState(t)
+
+	tx, state, err := backend.LockStateForModification(ctx, "never_ran")
+	if err != nil {
+		t.Fatalf("LockStateForModification on an unknown projector: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if state.GlobalCounter != 0 || state.TruncateRequested {
+		t.Errorf("state = %+v for a projector that never ran, want zero", state)
+	}
+}
+
+// TestProjectorBackend_EnqueueTruncateCreatesMissingRow verifies a truncate can be requested for a
+// projector that has not run yet, rather than being silently dropped by an UPDATE matching no rows.
+func TestProjectorBackend_EnqueueTruncateCreatesMissingRow(t *testing.T) {
+	ctx := context.Background()
+	backend := resetProjectorState(t)
+
+	if err := backend.EnqueueTruncate(ctx, "never_ran"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	if state := readProjectorState(t, "never_ran"); !state.TruncateRequested {
+		t.Errorf("state = %+v, want TruncateRequested", state)
+	}
+}
+
+// TestProjectorBackend_CaughtUpUpdateWritesNothing pins the short-circuit for an idle projector:
+// polling must not rewrite projector_state to the counter it already holds, or a fleet of idle
+// projectors would write once per poll interval forever.
+func TestProjectorBackend_CaughtUpUpdateWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_idle")
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	p, err := monotonic.NewProjector("idle", store, countingDispatch("proj_idle", nil), backend, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+
+	var before, after time.Time
+	if err := sharedPool.QueryRow(ctx, `SELECT updated_at FROM projector_state WHERE projector_name = 'idle'`).Scan(&before); err != nil {
+		t.Fatalf("read updated_at: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		result, err := p.Update(ctx)
+		if err != nil {
+			t.Fatalf("idle Update: %v", err)
+		}
+		if result.Updated() {
+			t.Fatalf("idle Update reported work: %+v", result)
+		}
+	}
+
+	if err := sharedPool.QueryRow(ctx, `SELECT updated_at FROM projector_state WHERE projector_name = 'idle'`).Scan(&after); err != nil {
+		t.Fatalf("read updated_at: %v", err)
+	}
+	if !after.Equal(before) {
+		t.Errorf("updated_at moved from %v to %v; a caught-up Update wrote to projector_state", before, after)
 	}
 }

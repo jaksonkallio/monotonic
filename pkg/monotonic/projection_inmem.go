@@ -15,25 +15,44 @@ import (
 // The rule that keeps this safe regardless of T is to treat anything InMemoryProjectionTx.Get returns as read-only: derive a new value from it and hand that to Set, rather than mutating what you were given.
 // Enforcing this in the type system would mean requiring every T to supply a deep-copy method, which is a lot of ceremony to impose on the common case of a flat struct, so it is a documented contract instead.
 type InMemoryProjection[T any] struct {
-	// mu guards rows and state across concurrent RunEvent, ResetState, and reads.
+	// txMu is the in-memory stand-in for the Postgres backend's projector_state row lock. It is
+	// taken by LockStateForModification and released only when that transaction commits or rolls
+	// back, so a whole Update is serialized against any other Update on this projection.
+	//
+	// It is one lock for the projection rather than one per projector name, which is stricter than
+	// Postgres: rows is a single map shared by every projector writing here, and buffering replaces
+	// it wholesale, so two concurrent transactions would clone the same starting rows and the later
+	// commit would discard the earlier one's writes.
+	txMu sync.Mutex
+	// mu guards rows and state. It is held only for the snapshot read and the commit swap, never
+	// across a handler, so reads never block behind projector work and a handler calling back into
+	// Get or All cannot deadlock.
 	mu sync.RWMutex
 	// rows holds the committed projection, keyed by aggregate ID (or whatever key the handlers write).
 	rows map[string]T
-	// state holds each projector's resume counter; an InMemoryProjection is intended to back a single projector.
-	state map[string]uint64
+	// state holds each projector's persisted state, keyed by projector name.
+	state map[string]ProjectorStateSnapshot
 }
+
+var _ ProjectorBackend[*InMemoryProjectionTx[struct{}]] = (*InMemoryProjection[struct{}])(nil)
 
 // NewInMemoryProjection creates an empty InMemoryProjection.
 func NewInMemoryProjection[T any]() *InMemoryProjection[T] {
 	return &InMemoryProjection[T]{
 		rows:  make(map[string]T),
-		state: make(map[string]uint64),
+		state: make(map[string]ProjectorStateSnapshot),
 	}
 }
 
-// InMemoryProjectionTx is the ModificationTx handlers receive; edits buffer here and commit only if the handler returns nil.
+// InMemoryProjectionTx is the ModificationTx handlers receive; edits buffer here and commit only if the whole batch succeeds.
 type InMemoryProjectionTx[T any] struct {
+	// projection is the projection this transaction will commit into, used to reject a tx handed to the wrong backend.
+	projection *InMemoryProjection[T]
+	// rows is the buffered clone handlers read and write.
 	rows map[string]T
+	// finished records that the transaction has already committed or rolled back, so the
+	// projector's deferred Rollback after a successful commit is a no-op rather than a double unlock.
+	finished bool
 }
 
 // Get returns the row for key and whether it exists.
@@ -53,63 +72,89 @@ func (tx *InMemoryProjectionTx[T]) Delete(key string) {
 	delete(tx.rows, key)
 }
 
-// Clear removes every row, useful when a reset handler rebuilds the projection from scratch.
+// Clear removes every row, which is what a truncate handler registered via Dispatch.OnTruncate wants.
 func (tx *InMemoryProjectionTx[T]) Clear() {
 	clear(tx.rows)
 }
 
-// GetState returns the resume counter for projectorName, or 0 if none.
-func (p *InMemoryProjection[T]) GetState(_ context.Context, projectorName string) (uint64, error) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.state[projectorName], nil
-}
-
-// RunEvent runs apply against a buffered copy of the rows and commits that copy plus the counter advance only if apply succeeds.
-//
-// The lock is held for the whole call, apply included, and that is deliberate rather than an oversight.
-// Buffering clones the current rows and then replaces them wholesale on success, so the clone and the commit have to be one indivisible step.
-// Release the lock around apply and two concurrent calls both clone the same starting rows, then the second commit discards everything the first one wrote.
-// This mirrors the Postgres backend, which likewise holds its projector_state row lock across apply, so both backends serialize event application the same way.
-//
-// The cost is that reads block for as long as a handler runs, and that a handler must never call back into the projection's own Get or All, since RWMutex is not reentrant and doing so deadlocks.
-// Handlers already have everything they need on the tx they are given, which reads the buffered rows and is the only correct way to see writes made earlier in the same call.
-func (p *InMemoryProjection[T]) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
-	if counter == 0 {
-		return fmt.Errorf("projection counter must be > 0")
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// Skip counters already applied, mirroring the exactly-once behavior of the Postgres backend.
-	if p.state[projectorName] >= counter {
+// Rollback discards the buffered rows and releases the modification lock. It is safe to call on a
+// transaction that already committed, which is what lets the projector defer it unconditionally.
+func (tx *InMemoryProjectionTx[T]) Rollback(context.Context) error {
+	if tx.finished {
 		return nil
 	}
-
-	tx := &InMemoryProjectionTx[T]{rows: maps.Clone(p.rows)}
-	if err := apply(ctx, tx); err != nil {
-		return err
-	}
-
-	p.rows = tx.rows
-	p.state[projectorName] = counter
+	tx.finished = true
+	tx.projection.txMu.Unlock()
 	return nil
 }
 
-// ResetState runs reset against a buffered copy and rewinds projectorName's counter to 0 only if reset succeeds.
-func (p *InMemoryProjection[T]) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx *InMemoryProjectionTx[T]) error) error {
+// LockStateForModification takes the projection's modification lock and returns a transaction
+// buffering a clone of the committed rows, along with projectorName's state as of that moment.
+// The lock is held until the returned transaction commits or rolls back.
+func (p *InMemoryProjection[T]) LockStateForModification(_ context.Context, projectorName string) (*InMemoryProjectionTx[T], ProjectorStateSnapshot, error) {
+	p.txMu.Lock()
+
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return &InMemoryProjectionTx[T]{projection: p, rows: maps.Clone(p.rows)}, p.state[projectorName], nil
+}
+
+// CommitAdvancedStateFromModification commits the buffered rows and advances projectorName's
+// resume counter, then releases the modification lock.
+func (p *InMemoryProjection[T]) CommitAdvancedStateFromModification(_ context.Context, tx *InMemoryProjectionTx[T], projectorName string, advancedToGlobalCounter uint64) error {
+	// TruncateRequested is deliberately carried through rather than cleared: a request that
+	// arrived while this batch was applying must still be serviced by the next Update.
+	return p.commit(tx, projectorName, func(state ProjectorStateSnapshot) ProjectorStateSnapshot {
+		state.GlobalCounter = advancedToGlobalCounter
+		return state
+	})
+}
+
+// CommitTruncatedStateFromModification commits the truncated rows, rewinds projectorName to the
+// start of the stream and clears its truncate request, then releases the modification lock.
+func (p *InMemoryProjection[T]) CommitTruncatedStateFromModification(_ context.Context, tx *InMemoryProjectionTx[T], projectorName string) error {
+	return p.commit(tx, projectorName, func(ProjectorStateSnapshot) ProjectorStateSnapshot {
+		return ProjectorStateSnapshot{}
+	})
+}
+
+// commit swaps the buffered rows in as the committed projection, applies update to projectorName's
+// state, and ends the transaction.
+func (p *InMemoryProjection[T]) commit(tx *InMemoryProjectionTx[T], projectorName string, update func(ProjectorStateSnapshot) ProjectorStateSnapshot) error {
+	if tx == nil || tx.projection != p {
+		return fmt.Errorf("commit projection %q: transaction belongs to a different projection", projectorName)
+	}
+	if tx.finished {
+		return fmt.Errorf("commit projection %q: transaction already finished", projectorName)
+	}
+
+	p.mu.Lock()
+	p.rows = tx.rows
+	p.state[projectorName] = update(p.state[projectorName])
+	p.mu.Unlock()
+
+	tx.finished = true
+	p.txMu.Unlock()
+	return nil
+}
+
+// EnqueueTruncate asks projectorName to rebuild from the start of the event stream on its next Update.
+func (p *InMemoryProjection[T]) EnqueueTruncate(_ context.Context, projectorName string) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	tx := &InMemoryProjectionTx[T]{rows: maps.Clone(p.rows)}
-	if err := reset(ctx, tx); err != nil {
-		return err
-	}
-
-	p.rows = tx.rows
-	p.state[projectorName] = 0
+	state := p.state[projectorName]
+	state.TruncateRequested = true
+	p.state[projectorName] = state
 	return nil
+}
+
+// State returns projectorName's committed state, or the zero snapshot if it has never run.
+func (p *InMemoryProjection[T]) State(projectorName string) ProjectorStateSnapshot {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.state[projectorName]
 }
 
 // Get returns the committed row for key and whether it exists.

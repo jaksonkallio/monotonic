@@ -11,25 +11,26 @@ import (
 // DefaultUpdateBatchSize is a sensible default maximum number of events loaded per Update call.
 const DefaultUpdateBatchSize = 100
 
-type ProjectorStateSnapshot interface {
-	GlobalCounter() uint64
-	TruncateRequested() bool
+// ProjectorStateSnapshot is a projector's persisted state as of the moment its modification lock was taken.
+type ProjectorStateSnapshot struct {
+	GlobalCounter     uint64
+	TruncateRequested bool
 }
 
+// ModificationTx constrains the store-specific handle a ProjectorBackend hands to handlers (e.g. a Postgres pgx.Tx, a pipeline, a producer).
 type ModificationTx interface {
 	Rollback(ctx context.Context) error
 }
 
 // ProjectorBackend is the store-specific backend for handling projector state and projection modifications.
-type ProjectorBackend interface {
-	LockStateForModification(ctx context.Context, projectorName string) (ModificationTx, ProjectorStateSnapshot, error)
-	CommitTruncatedStateFromModification(ctx context.Context, tx ModificationTx, name string) error
-	CommitAdvancedStateFromModification(ctx context.Context, tx ModificationTx, name string, advancedToGlobalCounter uint64) error
+type ProjectorBackend[Tx ModificationTx] interface {
+	LockStateForModification(ctx context.Context, projectorName string) (Tx, ProjectorStateSnapshot, error)
+	CommitTruncatedStateFromModification(ctx context.Context, tx Tx, name string) error
+	CommitAdvancedStateFromModification(ctx context.Context, tx Tx, name string, advancedToGlobalCounter uint64) error
 	EnqueueTruncate(ctx context.Context, name string) error
 }
 
-// Projector reads events from a Store and dispatches each one through a Dispatch,
-// using a ProjectorBackend to commit the handler's work atomically with the counter advance.
+// Projector reads events from a store and applies them to the projected state via dispatch.
 type Projector[Tx ModificationTx] struct {
 	// name identifies this projector in the backend's state store.
 	name string
@@ -37,19 +38,17 @@ type Projector[Tx ModificationTx] struct {
 	store Store
 	// dispatch routes events to handlers and supplies EventFilters.
 	dispatch *Dispatch[Tx]
-	// backend runs each event atomically with the counter advance.
-	backend ProjectorBackend
+	// backend runs each batch atomically with the counter advance.
+	backend ProjectorBackend[Tx]
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
 }
 
-// NewProjector creates a Projector and derives its resume position from backend.GetState.
 func NewProjector[Tx ModificationTx](
-	ctx context.Context,
 	name string,
 	store Store,
 	dispatch *Dispatch[Tx],
-	backend ProjectorBackend,
+	backend ProjectorBackend[Tx],
 	updateBatchSize int,
 ) (*Projector[Tx], error) {
 	if name == "" {
@@ -67,44 +66,50 @@ func NewProjector[Tx ModificationTx](
 	}, nil
 }
 
+// ProjectorUpdateResult reports what a single Update call did.
 type ProjectorUpdateResult struct {
-	AppliedEvents           uint64
-	Truncated               bool
+	// AppliedEvents is how many events this call dispatched to handlers.
+	AppliedEvents uint64
+
+	// Truncated reports whether this call serviced a truncate request instead of applying events.
+	Truncated bool
+
+	// AdvancedToGlobalCounter is the resume position after this call, 0 after a truncate.
 	AdvancedToGlobalCounter uint64
 }
 
+// Updated reports whether this call did any meaningful work.
 func (p ProjectorUpdateResult) Updated() bool {
 	return p.AppliedEvents > 0 || p.Truncated
 }
 
-// Update processes a batch of pending events and returns the count, or 0 if caught up.
+// Update runs one unit of projector work under a single modification transaction.
 func (p *Projector[Tx]) Update(ctx context.Context) (ProjectorUpdateResult, error) {
 	tx, snapshot, err := p.backend.LockStateForModification(ctx, p.name)
 	if err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("lock state for modification: %w", err)
 	}
-	defer tx.Rollback()
+	defer tx.Rollback(ctx)
 
-	if snapshot.TruncateRequested() {
+	if snapshot.TruncateRequested {
 		return p.truncate(ctx, tx)
-	} else {
-		return p.advance(ctx, tx, snapshot)
 	}
+	return p.advance(ctx, tx, snapshot)
 }
 
-func (p *Projector[Tx]) advance(ctx context.Context, tx ModificationTx, snapshot ProjectorStateSnapshot) (ProjectorUpdateResult, error) {
+func (p *Projector[Tx]) advance(ctx context.Context, tx Tx, snapshot ProjectorStateSnapshot) (ProjectorUpdateResult, error) {
 	// Get all events since lock snapshot global counter.
 	events, err := p.store.LoadGlobalEvents(
 		ctx,
 		p.dispatch.EventFilters(),
-		int64(snapshot.GlobalCounter()),
+		int64(snapshot.GlobalCounter),
 		p.updateBatchSize,
 	)
 	if err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("load events: %w", err)
 	}
 
-	advancedToGlobalCounter := snapshot.GlobalCounter()
+	advancedToGlobalCounter := snapshot.GlobalCounter
 	appliedEvents := 0
 	for _, event := range events {
 		if uint64(event.Event.GlobalCounter) <= advancedToGlobalCounter {
@@ -123,6 +128,11 @@ func (p *Projector[Tx]) advance(ctx context.Context, tx ModificationTx, snapshot
 		advancedToGlobalCounter = uint64(event.Event.GlobalCounter)
 	}
 
+	if appliedEvents == 0 {
+		// Nothing to commit.
+		return ProjectorUpdateResult{AdvancedToGlobalCounter: advancedToGlobalCounter}, nil
+	}
+
 	if err := p.backend.CommitAdvancedStateFromModification(ctx, tx, p.name, advancedToGlobalCounter); err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("commit advanced state: %w", err)
 	}
@@ -133,7 +143,7 @@ func (p *Projector[Tx]) advance(ctx context.Context, tx ModificationTx, snapshot
 	}, nil
 }
 
-func (p *Projector[Tx]) truncate(ctx context.Context, tx ModificationTx) (ProjectorUpdateResult, error) {
+func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateResult, error) {
 	// Call dispatch handler for executing the actual projection truncation.
 	if err := p.dispatch.Truncate(ctx, tx); err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("truncate: %w", err)
@@ -141,7 +151,7 @@ func (p *Projector[Tx]) truncate(ctx context.Context, tx ModificationTx) (Projec
 
 	// Commit the truncated projector state.
 	if err := p.backend.CommitTruncatedStateFromModification(ctx, tx, p.name); err != nil {
-		return ProjectorUpdateResult{}, fmt.Errorf("commit advanced state: %w", err)
+		return ProjectorUpdateResult{}, fmt.Errorf("commit truncated state: %w", err)
 	}
 
 	return ProjectorUpdateResult{
@@ -183,8 +193,7 @@ func (p *Projector[Tx]) Name() string {
 }
 
 // ProjectorRunner is implemented by any projector that can be driven by RunProjectors.
-// *Projector[ModificationTx] satisfies this interface for any ModificationTx, so RunProjectors can drive
-// projectors with different ModificationTx types together.
+// *Projector[Tx] satisfies this interface for any Tx, so RunProjectors can drive projectors with different transaction types together.
 type ProjectorRunner interface {
 	Run(ctx context.Context, pollInterval time.Duration) error
 }

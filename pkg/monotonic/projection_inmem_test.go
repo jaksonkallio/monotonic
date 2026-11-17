@@ -60,7 +60,7 @@ func TestInMemoryProjection_ProjectsThroughProjector(t *testing.T) {
 	appendEvent(ctx, t, store, "account", "bob", "deposited", 2, int64(40))
 
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
-	p, err := monotonic.NewProjector(ctx, "balances", store, balanceDispatch(), proj, 0)
+	p, err := monotonic.NewProjector("balances", store, balanceDispatch(), proj, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -79,27 +79,57 @@ func TestInMemoryProjection_ProjectsThroughProjector(t *testing.T) {
 	}
 }
 
-func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
+// runTx drives one modification transaction by hand, the way Projector.Update does, so the tests
+// below can exercise the backend without going through a Projector.
+func runTx(
+	t *testing.T,
+	proj *monotonic.InMemoryProjection[summaryRow],
+	projectorName string,
+	apply func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error,
+	commit func(ctx context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error,
+) error {
+	t.Helper()
 	ctx := context.Background()
+
+	tx, _, err := proj.LockStateForModification(ctx, projectorName)
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := apply(tx); err != nil {
+		return err
+	}
+	return commit(ctx, tx)
+}
+
+// advance commits a transaction as an event batch would.
+func advance(proj *monotonic.InMemoryProjection[summaryRow], projectorName string, counter uint64) func(context.Context, *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	return func(ctx context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+		return proj.CommitAdvancedStateFromModification(ctx, tx, projectorName, counter)
+	}
+}
+
+func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
-	// A successful event establishes committed state.
-	if err := proj.RunEvent(ctx, "p", 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	// A successful batch establishes committed state.
+	if err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Set("alice", summaryRow{Balance: 10})
 		return nil
-	}); err != nil {
-		t.Fatalf("RunEvent 1: %v", err)
+	}, advance(proj, "p", 1)); err != nil {
+		t.Fatalf("first batch: %v", err)
 	}
 
-	// A failing event mutates the buffer then errors; neither the write nor the counter should commit.
+	// A failing batch mutates the buffer then errors; neither the writes nor the counter commit.
 	wantErr := errors.New("boom")
-	err := proj.RunEvent(ctx, "p", 2, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	err := runTx(t, proj, "p", func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Set("alice", summaryRow{Balance: 999})
 		tx.Set("mallory", summaryRow{Balance: 1})
 		return wantErr
-	})
+	}, advance(proj, "p", 2))
 	if !errors.Is(err, wantErr) {
-		t.Fatalf("RunEvent 2 err = %v, want %v", err, wantErr)
+		t.Fatalf("second batch err = %v, want %v", err, wantErr)
 	}
 
 	if row, _ := proj.Get("alice"); row.Balance != 10 {
@@ -108,70 +138,134 @@ func TestInMemoryProjection_RollsBackOnHandlerError(t *testing.T) {
 	if _, ok := proj.Get("mallory"); ok {
 		t.Error("mallory row should not have been committed")
 	}
-	if c, _ := proj.GetState(ctx, "p"); c != 1 {
-		t.Errorf("counter = %d, want 1 (not advanced)", c)
+	if got := proj.State("p").GlobalCounter; got != 1 {
+		t.Errorf("counter = %d, want 1 (not advanced)", got)
 	}
 }
 
-func TestInMemoryProjection_SkipsAlreadyAppliedCounter(t *testing.T) {
+// TestInMemoryProjection_RollbackReleasesTheLock pins that an abandoned transaction frees the
+// modification lock; if it did not, the next LockStateForModification would block forever.
+func TestInMemoryProjection_RollbackReleasesTheLock(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
-	apply := func(bal int64) func(context.Context, *monotonic.InMemoryProjectionTx[summaryRow]) error {
-		return func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
-			tx.Set("alice", summaryRow{Balance: bal})
-			return nil
+	tx, _, err := proj.LockStateForModification(ctx, "p")
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	tx.Set("alice", summaryRow{Balance: 10})
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+
+	locked := make(chan struct{})
+	go func() {
+		next, _, err := proj.LockStateForModification(ctx, "p")
+		if err == nil {
+			next.Rollback(ctx)
 		}
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("LockStateForModification blocked after a rollback; the lock was not released")
 	}
 
-	if err := proj.RunEvent(ctx, "p", 5, apply(10)); err != nil {
-		t.Fatalf("RunEvent 5: %v", err)
-	}
-	// Replaying counter 5 (or lower) must be a no-op, leaving the committed row untouched.
-	if err := proj.RunEvent(ctx, "p", 5, apply(999)); err != nil {
-		t.Fatalf("RunEvent replay: %v", err)
-	}
-	if row, _ := proj.Get("alice"); row.Balance != 10 {
-		t.Errorf("alice balance = %d, want 10 (replay skipped)", row.Balance)
+	if _, ok := proj.Get("alice"); ok {
+		t.Error("rolled-back write was committed")
 	}
 }
 
-func TestInMemoryProjection_ResetClearsRowsAndCounter(t *testing.T) {
+// TestInMemoryProjection_RollbackAfterCommitIsNoop covers the projector deferring Rollback even on
+// the committed path: the second end-of-transaction must not unlock the mutex a second time.
+func TestInMemoryProjection_RollbackAfterCommitIsNoop(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
-	if err := proj.RunEvent(ctx, "p", 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
-		tx.Set("alice", summaryRow{Balance: 10})
-		return nil
-	}); err != nil {
-		t.Fatalf("RunEvent: %v", err)
+
+	tx, _, err := proj.LockStateForModification(ctx, "p")
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	tx.Set("alice", summaryRow{Balance: 10})
+	if err := proj.CommitAdvancedStateFromModification(ctx, tx, "p", 1); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("Rollback after commit: %v", err)
 	}
 
-	if err := proj.ResetState(ctx, "p", func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+	if row, _ := proj.Get("alice"); row.Balance != 10 {
+		t.Errorf("alice balance = %d, want 10; the deferred Rollback undid a commit", row.Balance)
+	}
+	// A second commit on a finished transaction is a caller bug, not a silent no-op.
+	if err := proj.CommitAdvancedStateFromModification(ctx, tx, "p", 2); err == nil {
+		t.Error("committing a finished transaction should fail")
+	}
+}
+
+func TestInMemoryProjection_TruncateClearsRowsAndCounter(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	appendEvent(ctx, t, store, "account", "alice", "opened", 1, nil)
+	appendEvent(ctx, t, store, "account", "alice", "deposited", 2, int64(100))
+
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
+	dispatch := balanceDispatch().OnTruncate(func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
 		tx.Clear()
 		return nil
-	}); err != nil {
-		t.Fatalf("ResetState: %v", err)
+	})
+
+	p, err := monotonic.NewProjector("balances", store, dispatch, proj, 0)
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if row, _ := proj.Get("alice"); row.Balance != 100 {
+		t.Fatalf("alice balance = %d before truncate, want 100", row.Balance)
 	}
 
-	if got := len(proj.All()); got != 0 {
-		t.Errorf("All() len = %d, want 0 after reset", got)
+	if err := proj.EnqueueTruncate(ctx, "balances"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
 	}
-	if c, _ := proj.GetState(ctx, "p"); c != 0 {
-		t.Errorf("counter = %d, want 0 after reset", c)
+
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after EnqueueTruncate: %v", err)
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+	if got := len(proj.All()); got != 0 {
+		t.Errorf("All() len = %d, want 0 after truncate", got)
+	}
+	if state := proj.State("balances"); state.GlobalCounter != 0 || state.TruncateRequested {
+		t.Errorf("state = %+v after truncate, want zero", state)
+	}
+
+	// The rewound projector rebuilds from the start of the stream.
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update after truncate: %v", err)
+	}
+	if row, _ := proj.Get("alice"); row.Balance != 100 {
+		t.Errorf("alice balance = %d after rebuild, want 100", row.Balance)
 	}
 }
 
-// TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites pins the reason RunEvent holds its lock
-// across apply. Buffering clones the rows and then swaps them in wholesale, so clone-and-commit has to
-// be indivisible; if the lock were released while a handler ran, concurrent calls would clone the same
-// starting rows and the last commit would discard the others. Each call below writes a distinct key, so
-// any lost commit shows up as a missing key.
+// TestInMemoryProjection_ConcurrentTransactionsDoNotLoseWrites pins the reason the modification
+// lock spans the whole transaction. Buffering clones the rows and then swaps them in wholesale, so
+// clone-and-commit has to be indivisible; if two transactions overlapped they would clone the same
+// starting rows and the later commit would discard the earlier one's writes. Each goroutine below
+// writes a distinct key, so any lost commit shows up as a missing key.
 //
-// One InMemoryProjection backing several projectors is the case that makes this reachable: Projector.Update
-// serializes calls from a single projector, but RunProjectors drives multiple projectors concurrently.
-func TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites(t *testing.T) {
-	ctx := context.Background()
-	projection := monotonic.NewInMemoryProjection[summaryRow]()
+// One InMemoryProjection backing several projectors is the case that makes this reachable:
+// Projector.Update serializes a single projector against itself, but RunProjectors drives multiple
+// projectors concurrently.
+func TestInMemoryProjection_ConcurrentTransactionsDoNotLoseWrites(t *testing.T) {
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
 	const writers = 8
 	var wg sync.WaitGroup
@@ -180,22 +274,21 @@ func TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			key := fmt.Sprintf("account-%d", i)
-			// Distinct projector names so the already-applied skip in RunEvent never suppresses a call.
-			err := projection.RunEvent(ctx, key, 1, func(_ context.Context, tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
-				// Widen the window a concurrent commit could slip into, so an unlocked apply loses writes
-				// reliably rather than occasionally.
+			err := runTx(t, proj, key, func(tx *monotonic.InMemoryProjectionTx[summaryRow]) error {
+				// Widen the window a concurrent commit could slip into, so an unlocked apply loses
+				// writes reliably rather than occasionally.
 				time.Sleep(2 * time.Millisecond)
 				tx.Set(key, summaryRow{Balance: int64(i)})
 				return nil
-			})
+			}, advance(proj, key, 1))
 			if err != nil {
-				t.Errorf("run event for %s: %v", key, err)
+				t.Errorf("transaction for %s: %v", key, err)
 			}
 		}(i)
 	}
 	wg.Wait()
 
-	rows := projection.All()
+	rows := proj.All()
 	if len(rows) != writers {
 		t.Fatalf("projection has %d rows, want %d; concurrent commits clobbered each other", len(rows), writers)
 	}
@@ -209,5 +302,34 @@ func TestInMemoryProjection_ConcurrentRunEventDoesNotLoseWrites(t *testing.T) {
 		if row.Balance != int64(i) {
 			t.Errorf("row %s has balance %d, want %d", key, row.Balance, i)
 		}
+	}
+}
+
+// TestInMemoryProjection_ReadsDoNotBlockBehindAHandler covers mu being separate from the
+// modification lock: an open transaction must not stop readers, and a handler calling back into
+// Get must not deadlock.
+func TestInMemoryProjection_ReadsDoNotBlockBehindAHandler(t *testing.T) {
+	ctx := context.Background()
+	proj := monotonic.NewInMemoryProjection[summaryRow]()
+
+	tx, _, err := proj.LockStateForModification(ctx, "p")
+	if err != nil {
+		t.Fatalf("LockStateForModification: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	tx.Set("alice", summaryRow{Balance: 10})
+
+	read := make(chan int, 1)
+	go func() {
+		read <- len(proj.All())
+	}()
+
+	select {
+	case n := <-read:
+		if n != 0 {
+			t.Errorf("All() saw %d rows mid-transaction, want 0 uncommitted", n)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("All() blocked behind an open modification transaction")
 	}
 }

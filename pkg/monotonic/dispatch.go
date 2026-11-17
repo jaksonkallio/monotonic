@@ -2,10 +2,11 @@ package monotonic
 
 import "context"
 
-// Handler processes a single event with a store-specific environment ModificationTx
-// (typically a transaction handle) supplied by the ProjectorBackend running the event.
-type Handler[Tx ModificationTx] func(ctx context.Context, tx ModificationTx, event AggregateEvent) error
+// Handler processes a single event within a store-specific environment Tx (typically a transaction handle) supplied by the ProjectorBackend running the event.
+type Handler[Tx ModificationTx] func(ctx context.Context, tx Tx, event AggregateEvent) error
 
+// TruncateHandler clears whatever state the projector's handlers have written (e.g. truncating the implementer's own tables), so the projector can rebuild from the start of the event stream.
+// It runs with the same Tx a Handler would get, inside the same modification transaction.
 type TruncateHandler[Tx ModificationTx] func(ctx context.Context, tx Tx) error
 
 // dispatchKey identifies a registered handler by aggregate type and event type.
@@ -14,26 +15,26 @@ type dispatchKey struct {
 	eventType     string
 }
 
-// Dispatch routes events to handlers registered per (aggregateType, eventType)
-// and derives EventFilters from the registered set. Generic over ModificationTx so the same
-// dispatch core works for any backend that supplies a per-event environment.
+// Dispatch routes events to handlers registered per (aggregateType, eventType) tuple.
 type Dispatch[Tx ModificationTx] struct {
-	applyHandlers   map[dispatchKey]Handler[ModificationTx]
-	truncateHandler TruncateHandler[ModificationTx]
+	applyHandlers   map[dispatchKey]Handler[Tx]
+	truncateHandler TruncateHandler[Tx]
 }
 
-// NewDispatch creates an empty Dispatch parameterized over ModificationTx.
+// NewDispatch creates an empty Dispatch parameterized over Tx.
 func NewDispatch[Tx ModificationTx]() *Dispatch[Tx] {
-	return &Dispatch[Tx]{applyHandlers: make(map[dispatchKey]Handler[ModificationTx])}
+	return &Dispatch[Tx]{applyHandlers: make(map[dispatchKey]Handler[Tx])}
 }
 
 // On registers handler for the given (aggregateType, eventType); registering the same key twice overwrites.
-func (d *Dispatch[Tx]) On(aggregateType, eventType string, handler Handler[ModificationTx]) *Dispatch[Tx] {
+func (d *Dispatch[Tx]) On(aggregateType, eventType string, handler Handler[Tx]) *Dispatch[Tx] {
 	d.applyHandlers[dispatchKey{aggregateType, eventType}] = handler
 	return d
 }
 
-func (d *Dispatch[Tx]) OnTruncate(handler TruncateHandler[ModificationTx]) *Dispatch[Tx] {
+// OnTruncate registers the handler that clears the projection.
+// Registering twice overwrites.
+func (d *Dispatch[Tx]) OnTruncate(handler TruncateHandler[Tx]) *Dispatch[Tx] {
 	d.truncateHandler = handler
 	return d
 }
@@ -47,8 +48,9 @@ func (d *Dispatch[Tx]) EventFilters() []EventFilter {
 	return filters
 }
 
-// Apply routes the event to its registered handler; events with no matching handler are a no-op.
-func (d *Dispatch[Tx]) Apply(ctx context.Context, tx ModificationTx, event AggregateEvent) error {
+// Apply routes the event to its registered handler.
+// Events with no matching handler are a no-op.
+func (d *Dispatch[Tx]) Apply(ctx context.Context, tx Tx, event AggregateEvent) error {
 	applyHandler, ok := d.applyHandlers[dispatchKey{event.AggregateType, event.Event.Type}]
 	if !ok {
 		return nil
@@ -56,7 +58,8 @@ func (d *Dispatch[Tx]) Apply(ctx context.Context, tx ModificationTx, event Aggre
 	return applyHandler(ctx, tx, event)
 }
 
-func (d *Dispatch[Tx]) Truncate(ctx context.Context, tx ModificationTx) error {
+// Truncate runs the registered truncate handler, or nothing if none was registered.
+func (d *Dispatch[Tx]) Truncate(ctx context.Context, tx Tx) error {
 	if d.truncateHandler == nil {
 		return nil
 	}

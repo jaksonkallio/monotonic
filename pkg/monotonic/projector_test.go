@@ -11,91 +11,155 @@ import (
 	"github.com/jaksonkallio/monotonic/pkg/monotonic"
 )
 
-// testModificationTx is the trivial ModificationTx type the unit tests parameterize over; handlers
-// don't actually need any per-event environment, so a struct{} suffices.
-type testModificationTx struct{}
+// testTx is the trivial ModificationTx the unit tests parameterize over. Handlers don't need any
+// real per-event environment, so it only carries the bookkeeping the backend needs to verify that
+// the projector ends every transaction exactly once.
+type testTx struct {
+	backend  *fakeBackend
+	finished bool
+}
 
-// fakeBackend is an in-memory monotonic.ProjectorBackend[testModificationTx] used by projector unit tests.
-// It records per-projector counters and exposes hooks for failure injection.
+// Rollback ends the transaction without committing, and is a no-op once the transaction has ended,
+// since the projector defers it even on the committed path.
+func (tx *testTx) Rollback(context.Context) error {
+	if tx.finished {
+		return nil
+	}
+	tx.finished = true
+	tx.backend.unlock()
+	return nil
+}
+
+// fakeBackend is an in-memory monotonic.ProjectorBackend[*testTx] used by projector unit tests.
+// It records per-projector state and exposes hooks for failure injection.
 type fakeBackend struct {
-	mu          sync.Mutex
-	state       map[string]uint64
-	failOnEvent uint64 // if non-zero, RunEvent returns failErr for this counter
-	failErr     error
-	runCalls    int
-	resetErr    error // if non-nil, ResetState returns this error without resetting state
-	resetCalls  int
+	mu    sync.Mutex
+	state map[string]monotonic.ProjectorStateSnapshot
+	// locked is held between LockStateForModification and the transaction ending, so the tests can
+	// assert the projector never leaks or double-ends a transaction.
+	locked bool
+
+	lockErr   error // if non-nil, LockStateForModification fails with it
+	commitErr error // if non-nil, both Commit methods fail with it
+	// commitCalls counts Commit attempts, so a test can assert an idle Update writes nothing.
+	commitCalls int
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{state: make(map[string]uint64)}
+	return &fakeBackend{state: make(map[string]monotonic.ProjectorStateSnapshot)}
 }
 
-func (b *fakeBackend) GetState(_ context.Context, projectorName string) (uint64, error) {
+func (b *fakeBackend) unlock() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.state[projectorName], nil
+	b.locked = false
 }
 
-func (b *fakeBackend) RunEvent(ctx context.Context, projectorName string, counter uint64, apply func(ctx context.Context, tx testModificationTx) error) error {
+func (b *fakeBackend) LockStateForModification(_ context.Context, projectorName string) (*testTx, monotonic.ProjectorStateSnapshot, error) {
 	b.mu.Lock()
-	b.runCalls++
-	shouldFail := b.failOnEvent != 0 && counter == b.failOnEvent
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 
-	if shouldFail {
-		return b.failErr
+	if b.lockErr != nil {
+		return nil, monotonic.ProjectorStateSnapshot{}, b.lockErr
 	}
-	if err := apply(ctx, testModificationTx{}); err != nil {
-		return err
+	if b.locked {
+		return nil, monotonic.ProjectorStateSnapshot{}, errors.New("fakeBackend: state already locked")
 	}
+	b.locked = true
+
+	return &testTx{backend: b}, b.state[projectorName], nil
+}
+
+func (b *fakeBackend) CommitAdvancedStateFromModification(_ context.Context, tx *testTx, projectorName string, advancedToGlobalCounter uint64) error {
+	return b.commit(tx, projectorName, func(state monotonic.ProjectorStateSnapshot) monotonic.ProjectorStateSnapshot {
+		state.GlobalCounter = advancedToGlobalCounter
+		return state
+	})
+}
+
+func (b *fakeBackend) CommitTruncatedStateFromModification(_ context.Context, tx *testTx, projectorName string) error {
+	return b.commit(tx, projectorName, func(monotonic.ProjectorStateSnapshot) monotonic.ProjectorStateSnapshot {
+		return monotonic.ProjectorStateSnapshot{}
+	})
+}
+
+func (b *fakeBackend) commit(tx *testTx, projectorName string, update func(monotonic.ProjectorStateSnapshot) monotonic.ProjectorStateSnapshot) error {
 	b.mu.Lock()
-	b.state[projectorName] = counter
-	b.mu.Unlock()
+	defer b.mu.Unlock()
+
+	b.commitCalls++
+	if tx.finished {
+		return errors.New("fakeBackend: transaction already finished")
+	}
+	if b.commitErr != nil {
+		// Leave the transaction open so the projector's deferred Rollback is what ends it.
+		return b.commitErr
+	}
+
+	b.state[projectorName] = update(b.state[projectorName])
+	tx.finished = true
+	b.locked = false
 	return nil
 }
 
-func (b *fakeBackend) ResetState(ctx context.Context, projectorName string, reset func(ctx context.Context, tx testModificationTx) error) error {
+func (b *fakeBackend) EnqueueTruncate(_ context.Context, projectorName string) error {
 	b.mu.Lock()
-	b.resetCalls++
-	b.mu.Unlock()
+	defer b.mu.Unlock()
 
-	if b.resetErr != nil {
-		return b.resetErr
-	}
-	if err := reset(ctx, testModificationTx{}); err != nil {
-		return err
-	}
-	b.mu.Lock()
-	b.state[projectorName] = 0
-	b.mu.Unlock()
+	state := b.state[projectorName]
+	state.TruncateRequested = true
+	b.state[projectorName] = state
 	return nil
+}
+
+func (b *fakeBackend) stateOf(projectorName string) monotonic.ProjectorStateSnapshot {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.state[projectorName]
 }
 
 func (b *fakeBackend) seed(projectorName string, counter uint64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.state[projectorName] = counter
+	b.state[projectorName] = monotonic.ProjectorStateSnapshot{GlobalCounter: counter}
+}
+
+// isLocked reports whether a modification transaction is still open, so tests can assert the
+// projector released the lock on every path.
+func (b *fakeBackend) isLocked() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.locked
 }
 
 // countingDispatch returns a Dispatch that counts handler invocations.
 type counterRef struct{ n int }
 
-func countingDispatch(c *counterRef) *monotonic.Dispatch[testModificationTx] {
-	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+func countingDispatch(c *counterRef) *monotonic.Dispatch[*testTx] {
+	return monotonic.NewDispatch[*testTx]().On("test", "happened", func(_ context.Context, _ *testTx, _ monotonic.AggregateEvent) error {
 		c.n++
 		return nil
 	})
 }
 
-func failingDispatch(err error) *monotonic.Dispatch[testModificationTx] {
-	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+func failingDispatch(err error) *monotonic.Dispatch[*testTx] {
+	return monotonic.NewDispatch[*testTx]().On("test", "happened", func(_ context.Context, _ *testTx, _ monotonic.AggregateEvent) error {
 		return err
 	})
 }
 
-func noopDispatch() *monotonic.Dispatch[testModificationTx] {
-	return monotonic.NewDispatch[testModificationTx]().On("test", "happened", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+func failOnNthDispatch(c *counterRef, n int, err error) *monotonic.Dispatch[*testTx] {
+	return monotonic.NewDispatch[*testTx]().On("test", "happened", func(_ context.Context, _ *testTx, _ monotonic.AggregateEvent) error {
+		c.n++
+		if c.n == n {
+			return err
+		}
+		return nil
+	})
+}
+
+func noopDispatch() *monotonic.Dispatch[*testTx] {
+	return monotonic.NewDispatch[*testTx]().On("test", "happened", func(_ context.Context, _ *testTx, _ monotonic.AggregateEvent) error {
 		return nil
 	})
 }
@@ -119,9 +183,9 @@ func emitEvent(ctx context.Context, t *testing.T, store monotonic.Store, counter
 // --- Dispatch tests ---
 
 func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
-	d := monotonic.NewDispatch[testModificationTx]().
-		On("a", "x", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil }).
-		On("b", "y", func(context.Context, testModificationTx, monotonic.AggregateEvent) error { return nil })
+	d := monotonic.NewDispatch[*testTx]().
+		On("a", "x", func(context.Context, *testTx, monotonic.AggregateEvent) error { return nil }).
+		On("b", "y", func(context.Context, *testTx, monotonic.AggregateEvent) error { return nil })
 
 	filters := d.EventFilters()
 	if len(filters) != 2 {
@@ -138,11 +202,11 @@ func TestDispatch_EventFiltersDerivedFromHandlers(t *testing.T) {
 
 func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 	called := false
-	d := monotonic.NewDispatch[testModificationTx]().On("a", "x", func(_ context.Context, _ testModificationTx, _ monotonic.AggregateEvent) error {
+	d := monotonic.NewDispatch[*testTx]().On("a", "x", func(_ context.Context, _ *testTx, _ monotonic.AggregateEvent) error {
 		called = true
 		return nil
 	})
-	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
+	err := d.Apply(context.Background(), &testTx{}, monotonic.AggregateEvent{
 		AggregateType: "a",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "x"}},
 	})
@@ -155,8 +219,8 @@ func TestDispatch_ApplyRoutesToRegisteredHandler(t *testing.T) {
 }
 
 func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
-	d := monotonic.NewDispatch[testModificationTx]()
-	err := d.Apply(context.Background(), testModificationTx{}, monotonic.AggregateEvent{
+	d := monotonic.NewDispatch[*testTx]()
+	err := d.Apply(context.Background(), &testTx{}, monotonic.AggregateEvent{
 		AggregateType: "x",
 		Event:         monotonic.AcceptedEvent{Event: monotonic.Event{Type: "y"}},
 	})
@@ -167,23 +231,49 @@ func TestDispatch_ApplyUnregisteredIsNoop(t *testing.T) {
 
 // --- Projector tests ---
 
-func TestProjector_UpdateReturnsZeroWhenNoPendingEvents(t *testing.T) {
+func TestProjector_UpdateReportsNoWorkWhenNoPendingEvents(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	backend := newFakeBackend()
 	cr := &counterRef{}
 
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	p, err := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
 
-	n, err := p.Update(ctx)
+	result, err := p.Update(ctx)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if n != 0 {
-		t.Errorf("expected 0 processed events, got %d", n)
+	if result.Updated() {
+		t.Errorf("Updated() = true on a caught-up projector, want false")
+	}
+	if result.AppliedEvents != 0 {
+		t.Errorf("AppliedEvents = %d, want 0", result.AppliedEvents)
+	}
+}
+
+// TestProjector_UpdateDoesNotCommitWhenCaughtUp pins the short-circuit in advance: an idle
+// projector polls on every tick, and rewriting the counter to the value it already holds would
+// mean a write and a commit per tick per projector forever.
+func TestProjector_UpdateDoesNotCommitWhenCaughtUp(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	for i := 0; i < 3; i++ {
+		if _, err := p.Update(ctx); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+	}
+
+	if backend.commitCalls != 0 {
+		t.Errorf("caught-up Updates committed %d times, want 0", backend.commitCalls)
+	}
+	if backend.isLocked() {
+		t.Error("modification lock still held after a caught-up Update")
 	}
 }
 
@@ -196,35 +286,45 @@ func TestProjector_UpdateProcessesAllPendingEvents(t *testing.T) {
 
 	backend := newFakeBackend()
 	cr := &counterRef{}
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	p, err := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
 
-	n, err := p.Update(ctx)
+	result, err := p.Update(ctx)
 	if err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("expected 3 processed, got %d", n)
+	if result.AppliedEvents != 3 {
+		t.Errorf("AppliedEvents = %d, want 3", result.AppliedEvents)
 	}
 	if cr.n != 3 {
 		t.Errorf("handler called %d times, want 3", cr.n)
 	}
+	// The whole batch is one transaction, so three events cost exactly one commit.
+	if backend.commitCalls != 1 {
+		t.Errorf("commitCalls = %d, want 1 for a 3-event batch", backend.commitCalls)
+	}
 }
 
-func TestProjector_GlobalCounterAdvancesAfterUpdate(t *testing.T) {
+func TestProjector_StateAdvancesAfterUpdate(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 	emitEvent(ctx, t, store, 2)
 
 	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(&counterRef{}), backend, 0)
-	p.Update(ctx)
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
 
-	if p.GlobalCounter() == 0 {
-		t.Error("GlobalCounter should have advanced after Update")
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if result.AdvancedToGlobalCounter != 2 {
+		t.Errorf("AdvancedToGlobalCounter = %d, want 2", result.AdvancedToGlobalCounter)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 2 {
+		t.Errorf("backend counter = %d, want 2", got)
 	}
 }
 
@@ -239,24 +339,47 @@ func TestProjector_ResumesFromBackendState(t *testing.T) {
 	backend.seed("p1", 5)
 
 	cr := &counterRef{}
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	p, err := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
-	if p.GlobalCounter() != 5 {
-		t.Errorf("expected resume at counter 5, got %d", p.GlobalCounter())
-	}
 
-	n, _ := p.Update(ctx)
-	if n != 1 {
-		t.Errorf("expected 1 pending event past counter 5, got %d", n)
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if result.AppliedEvents != 1 {
+		t.Errorf("AppliedEvents = %d, want 1 pending event past counter 5", result.AppliedEvents)
 	}
 	if cr.n != 1 {
-		t.Errorf("handler should have been called for 1 event, got %d", cr.n)
+		t.Errorf("handler called %d times, want 1", cr.n)
 	}
 }
 
-func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
+// TestProjector_ResumeStateIsReadPerUpdate covers the counter no longer being cached on the
+// Projector: a second projector constructed over the same backend state picks up where the first
+// left off without any construction-time read.
+func TestProjector_ResumeStateIsReadPerUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+
+	// Constructed while the store is empty, then events arrive.
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
+
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if result.AppliedEvents != 2 {
+		t.Errorf("AppliedEvents = %d, want 2", result.AppliedEvents)
+	}
+}
+
+func TestProjector_TruncateRunsHandlerAndRewindsState(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	for i := int64(1); i <= 3; i++ {
@@ -265,68 +388,121 @@ func TestProjector_ResetRewindsCounterAndRunsResetFunc(t *testing.T) {
 
 	backend := newFakeBackend()
 	cr := &counterRef{}
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	truncated := 0
+	dispatch := countingDispatch(cr).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+
+	p, err := monotonic.NewProjector("p1", store, dispatch, backend, 0)
 	if err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
 	if _, err := p.Update(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
-	if p.GlobalCounter() != 3 {
-		t.Fatalf("expected counter 3 before reset, got %d", p.GlobalCounter())
+	if got := backend.stateOf("p1").GlobalCounter; got != 3 {
+		t.Fatalf("counter = %d before truncate, want 3", got)
 	}
 
-	resetFuncCalled := false
-	if err := p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
-		resetFuncCalled = true
-		return nil
-	}); err != nil {
-		t.Fatalf("Reset: %v", err)
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
 	}
 
-	if !resetFuncCalled {
-		t.Error("reset func was not invoked")
-	}
-	if p.GlobalCounter() != 0 {
-		t.Errorf("expected counter 0 after reset, got %d", p.GlobalCounter())
-	}
-	if got, _ := backend.GetState(ctx, "p1"); got != 0 {
-		t.Errorf("expected backend state 0 after reset, got %d", got)
-	}
-
-	n, err := p.Update(ctx)
+	result, err := p.Update(ctx)
 	if err != nil {
-		t.Fatalf("Update after reset: %v", err)
+		t.Fatalf("Update after EnqueueTruncate: %v", err)
 	}
-	if n != 3 {
-		t.Errorf("expected reset projector to replay all 3 events, got %d", n)
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+	if !result.Updated() {
+		t.Error("Updated() = false after a truncate, want true")
+	}
+	if truncated != 1 {
+		t.Errorf("truncate handler ran %d times, want 1", truncated)
+	}
+
+	state := backend.stateOf("p1")
+	if state.GlobalCounter != 0 {
+		t.Errorf("counter = %d after truncate, want 0", state.GlobalCounter)
+	}
+	if state.TruncateRequested {
+		t.Error("TruncateRequested still set after the truncate was serviced")
+	}
+
+	// A rewound projector replays the whole stream.
+	cr.n = 0
+	result, err = p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after truncate: %v", err)
+	}
+	if result.AppliedEvents != 3 || cr.n != 3 {
+		t.Errorf("replayed %d events (handler %d calls), want 3", result.AppliedEvents, cr.n)
 	}
 }
 
-func TestProjector_ResetPropagatesResetFuncError(t *testing.T) {
+// TestProjector_TruncateWithoutHandlerRewindsState covers a Dispatch that registered no truncate
+// handler: there is nothing to clear, but the state rewind still happens.
+func TestProjector_TruncateWithoutHandlerRewindsState(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
 
 	backend := newFakeBackend()
-	cr := &counterRef{}
-	p, err := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
-	if err != nil {
-		t.Fatalf("NewProjector: %v", err)
-	}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
 	if _, err := p.Update(ctx); err != nil {
 		t.Fatalf("Update: %v", err)
 	}
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
 
-	wantErr := errors.New("reset boom")
-	err = p.Reset(ctx, func(ctx context.Context, tx testModificationTx) error {
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after EnqueueTruncate: %v", err)
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 0 {
+		t.Errorf("counter = %d after truncate, want 0", got)
+	}
+}
+
+func TestProjector_TruncatePropagatesHandlerError(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	wantErr := errors.New("truncate boom")
+	dispatch := countingDispatch(&counterRef{}).OnTruncate(func(context.Context, *testTx) error {
 		return wantErr
 	})
-	if err == nil {
-		t.Fatal("expected error from Reset when reset func fails")
+
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0)
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update: %v", err)
 	}
-	if p.GlobalCounter() != 1 {
-		t.Errorf("counter must not change when reset func fails, got %d", p.GlobalCounter())
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+
+	if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
+		t.Fatalf("Update err = %v, want %v", err, wantErr)
+	}
+
+	// The request survives a failed truncate, so the next Update tries again.
+	state := backend.stateOf("p1")
+	if !state.TruncateRequested {
+		t.Error("TruncateRequested cleared by a failed truncate")
+	}
+	if state.GlobalCounter != 1 {
+		t.Errorf("counter = %d after a failed truncate, want 1 (unchanged)", state.GlobalCounter)
+	}
+	if backend.isLocked() {
+		t.Error("modification lock still held after a failed truncate")
 	}
 }
 
@@ -336,32 +512,17 @@ func TestProjector_UpdatePropagatesHandlerError(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 
 	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(errors.New("apply boom")), backend, 0)
+	p, _ := monotonic.NewProjector("p1", store, failingDispatch(errors.New("apply boom")), backend, 0)
 
-	_, err := p.Update(ctx)
-	if err == nil {
+	if _, err := p.Update(ctx); err == nil {
 		t.Error("expected error from Update when handler fails")
 	}
 }
 
-func TestProjector_CounterDoesNotAdvanceOnHandlerError(t *testing.T) {
-	ctx := context.Background()
-	store := monotonic.NewInMemoryStore()
-	emitEvent(ctx, t, store, 1)
-
-	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(errors.New("boom")), backend, 0)
-	p.Update(ctx)
-
-	if p.GlobalCounter() != 0 {
-		t.Errorf("GlobalCounter must not advance after handler error, got %d", p.GlobalCounter())
-	}
-	if got, _ := backend.GetState(ctx, "p1"); got != 0 {
-		t.Errorf("backend state must not advance after handler error, got %d", got)
-	}
-}
-
-func TestProjector_BackendErrorStopsBatch(t *testing.T) {
+// TestProjector_BatchIsAllOrNothingOnHandlerError pins the point of locking the whole update: the
+// batch is one transaction, so a handler failing partway through discards the events that already
+// applied rather than leaving the projection partially advanced.
+func TestProjector_BatchIsAllOrNothingOnHandlerError(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
@@ -369,20 +530,59 @@ func TestProjector_BackendErrorStopsBatch(t *testing.T) {
 	emitEvent(ctx, t, store, 3)
 
 	backend := newFakeBackend()
-	backend.failOnEvent = 2
-	backend.failErr = errors.New("backend boom")
 	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, failOnNthDispatch(cr, 2, errors.New("boom")), backend, 0)
 
-	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
-	processed, err := p.Update(ctx)
+	result, err := p.Update(ctx)
 	if err == nil {
-		t.Fatal("expected error from backend failure")
+		t.Fatal("expected error from Update when the second handler fails")
 	}
-	if processed != 1 {
-		t.Errorf("expected 1 processed before failure, got %d", processed)
+	if result.AppliedEvents != 0 {
+		t.Errorf("AppliedEvents = %d on a failed batch, want 0", result.AppliedEvents)
 	}
-	if p.GlobalCounter() != 1 {
-		t.Errorf("counter should sit at last successful event (1), got %d", p.GlobalCounter())
+	if got := backend.stateOf("p1").GlobalCounter; got != 0 {
+		t.Errorf("counter = %d after a failed batch, want 0 (nothing committed)", got)
+	}
+	if backend.commitCalls != 0 {
+		t.Errorf("commitCalls = %d on a failed batch, want 0", backend.commitCalls)
+	}
+	if backend.isLocked() {
+		t.Error("modification lock still held after a failed batch")
+	}
+}
+
+func TestProjector_UpdatePropagatesLockError(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	backend.lockErr = errors.New("lock boom")
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	if _, err := p.Update(ctx); !errors.Is(err, backend.lockErr) {
+		t.Fatalf("Update err = %v, want %v", err, backend.lockErr)
+	}
+}
+
+func TestProjector_UpdatePropagatesCommitError(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	backend.commitErr = errors.New("commit boom")
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0)
+	if _, err := p.Update(ctx); !errors.Is(err, backend.commitErr) {
+		t.Fatalf("Update err = %v, want %v", err, backend.commitErr)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 0 {
+		t.Errorf("counter = %d after a failed commit, want 0", got)
+	}
+	// The failed commit left the transaction open; the projector's deferred Rollback must end it.
+	if backend.isLocked() {
+		t.Error("modification lock still held after a failed commit")
 	}
 }
 
@@ -390,7 +590,7 @@ func TestProjector_RunStopsOnContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store := monotonic.NewInMemoryStore()
 	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector(ctx, "p1", store, noopDispatch(), backend, 0)
+	p, _ := monotonic.NewProjector("p1", store, noopDispatch(), backend, 0)
 
 	done := make(chan error, 1)
 	go func() { done <- p.Run(ctx, time.Millisecond) }()
@@ -413,7 +613,7 @@ func TestProjector_RunReturnsErrorFromUpdate(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 
 	backend := newFakeBackend()
-	p, _ := monotonic.NewProjector(ctx, "p1", store, failingDispatch(fmt.Errorf("run boom")), backend, 0)
+	p, _ := monotonic.NewProjector("p1", store, failingDispatch(fmt.Errorf("run boom")), backend, 0)
 
 	err := p.Run(ctx, time.Millisecond)
 	if err == nil {
@@ -426,14 +626,14 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 	defer cancel()
 
 	store := monotonic.NewInMemoryStore()
-	const numEvents = 100
+	const numEvents = 250
 	for i := int64(1); i <= numEvents; i++ {
 		emitEvent(ctx, t, store, i)
 	}
 
 	backend := newFakeBackend()
-	cr := &counterRef{}
-	p, _ := monotonic.NewProjector(ctx, "p1", store, countingDispatch(cr), backend, 0)
+	// A batch size below numEvents forces Run to loop, which is the behavior under test.
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 50)
 
 	go func() {
 		p.Run(ctx, 10*time.Second)
@@ -441,22 +641,21 @@ func TestProjector_RunDrainsWithoutSleepingWhileWorkPending(t *testing.T) {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if p.GlobalCounter() == numEvents {
+		if backend.stateOf("p1").GlobalCounter == numEvents {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	if p.GlobalCounter() != uint64(numEvents) {
-		t.Errorf("processed counter=%d, want %d", p.GlobalCounter(), numEvents)
+	if got := backend.stateOf("p1").GlobalCounter; got != uint64(numEvents) {
+		t.Errorf("counter = %d, want %d; Run slept instead of draining", got, numEvents)
 	}
 }
 
 func TestProjector_NameRequired(t *testing.T) {
-	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	backend := newFakeBackend()
-	_, err := monotonic.NewProjector(ctx, "", store, noopDispatch(), backend, 0)
+	_, err := monotonic.NewProjector("", store, noopDispatch(), backend, 0)
 	if err == nil {
 		t.Error("expected error when name is empty")
 	}
@@ -470,7 +669,7 @@ func TestRunProjectors_AllStopOnContextCancellation(t *testing.T) {
 	backend := newFakeBackend()
 
 	makeProjector := func(name string) monotonic.ProjectorRunner {
-		p, _ := monotonic.NewProjector(ctx, name, store, noopDispatch(), backend, 0)
+		p, _ := monotonic.NewProjector(name, store, noopDispatch(), backend, 0)
 		return p
 	}
 
@@ -497,8 +696,8 @@ func TestRunProjectors_ReturnsErrorWhenOneProjectorFails(t *testing.T) {
 	emitEvent(ctx, t, store, 1)
 
 	backend := newFakeBackend()
-	failP, _ := monotonic.NewProjector(ctx, "fail", store, failingDispatch(errors.New("fail")), backend, 0)
-	okP, _ := monotonic.NewProjector(ctx, "ok", store, noopDispatch(), backend, 0)
+	failP, _ := monotonic.NewProjector("fail", store, failingDispatch(errors.New("fail")), backend, 0)
+	okP, _ := monotonic.NewProjector("ok", store, noopDispatch(), backend, 0)
 
 	err := monotonic.RunProjectors(ctx, time.Millisecond, failP, okP)
 	if err == nil {
