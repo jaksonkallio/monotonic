@@ -198,9 +198,6 @@ func (p *Projector[Tx]) Run(ctx context.Context, pollInterval time.Duration) err
 }
 
 // RequestTruncate asks this projector to clear its projection and rebuild from the start of the event stream on its next Update.
-// It rejects the request outright when no truncate handler is registered, so a wiring gap surfaces synchronously here instead of wedging a background Run loop later.
-//
-// Prefer this over calling ProjectorBackend.EnqueueTruncate directly: the backend takes a projector name as a string, and a name that does not match any running projector enqueues a truncate nothing will ever service.
 func (p *Projector[Tx]) RequestTruncate(ctx context.Context) error {
 	if !p.dispatch.HasTruncateHandler() {
 		return fmt.Errorf("projector %q: cannot request truncate because %w; register one with Dispatch.OnTruncate", p.name, ErrNoTruncateHandler)
