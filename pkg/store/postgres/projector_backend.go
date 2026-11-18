@@ -41,19 +41,20 @@ func (b *ProjectorBackend) Migrate(ctx context.Context) error {
 	return nil
 }
 
-// LockStateForModification opens a transaction, ensures a projector_state row exists for name, and
-// locks it FOR UPDATE. The lock is held until the caller commits or rolls back the returned
-// transaction, so concurrent instances of the same projector block here and then read the lock
-// holder's committed state rather than a stale snapshot.
-//
-// The caller owns the returned transaction and must end it; every error path here ends it first.
-func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name string) (pgx.Tx, monotonic.ProjectorStateSnapshot, error) {
+// LockStateForModification opens a transaction, ensures a projector_state row exists for name, and locks it FOR UPDATE.
+// The caller owns the returned transaction and must end it.
+func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name string, initialGlobalCounter uint64) (pgx.Tx, monotonic.ProjectorStateSnapshot, error) {
+	// Make sure there's a projector state row for this projector, inserting with initialGlobalCounter if missing.
+	if err := b.ensureState(ctx, name, initialGlobalCounter); err != nil {
+		return nil, monotonic.ProjectorStateSnapshot{}, err
+	}
+
 	tx, err := b.pool.Begin(ctx)
 	if err != nil {
 		return nil, monotonic.ProjectorStateSnapshot{}, fmt.Errorf("begin tx: %w", err)
 	}
 
-	snapshot, err := lockState(ctx, tx, name)
+	snapshot, err := lockExistingState(ctx, tx, name)
 	if err != nil {
 		// The caller never saw this transaction, so returning without ending it would leak the connection.
 		_ = tx.Rollback(ctx)
@@ -63,18 +64,21 @@ func (b *ProjectorBackend) LockStateForModification(ctx context.Context, name st
 	return tx, snapshot, nil
 }
 
-// lockState does the work of LockStateForModification inside an already-open transaction, so the
-// error paths have a single place to roll back from.
-func lockState(ctx context.Context, tx pgx.Tx, name string) (monotonic.ProjectorStateSnapshot, error) {
-	// A projector that has never run has no row yet, and the SELECT below would find nothing.
-	if _, err := tx.Exec(ctx, `
+// ensureState creates name's state row if it does not exist yet, which is the one moment initialGlobalCounter applies.
+func (b *ProjectorBackend) ensureState(ctx context.Context, name string, initialGlobalCounter uint64) error {
+	if _, err := b.pool.Exec(ctx, `
 		INSERT INTO projector_state (projector_name, global_counter)
-		VALUES ($1, 0)
+		VALUES ($1, $2)
 		ON CONFLICT (projector_name) DO NOTHING
-	`, name); err != nil {
-		return monotonic.ProjectorStateSnapshot{}, fmt.Errorf("ensure projector_state row for %q: %w", name, err)
+	`, name, int64(initialGlobalCounter)); err != nil {
+		return fmt.Errorf("ensure projector_state row for %q: %w", name, err)
 	}
+	return nil
+}
 
+// lockExistingState locks and reads name's state row inside an already-open transaction, so the
+// error paths have a single place to roll back from.
+func lockExistingState(ctx context.Context, tx pgx.Tx, name string) (monotonic.ProjectorStateSnapshot, error) {
 	var globalCounter int64
 	var truncateRequested bool
 	if err := tx.QueryRow(ctx, `
@@ -92,14 +96,13 @@ func lockState(ctx context.Context, tx pgx.Tx, name string) (monotonic.Projector
 	}, nil
 }
 
-// CommitTruncatedStateFromModification rewinds name to the start of the event stream, clears its
-// truncate request, and commits the transaction along with the truncate handler's writes.
-func (b *ProjectorBackend) CommitTruncatedStateFromModification(ctx context.Context, tx pgx.Tx, name string) error {
+// CommitTruncatedStateFromModification rewinds name to resetToGlobalCounter, clears its truncate request, and commits the transaction along with the truncate handler's writes.
+func (b *ProjectorBackend) CommitTruncatedStateFromModification(ctx context.Context, tx pgx.Tx, name string, resetToGlobalCounter uint64) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE projector_state
-		SET global_counter = 0, truncate_requested = false, updated_at = now()
+		SET global_counter = $2, truncate_requested = false, updated_at = now()
 		WHERE projector_name = $1
-	`, name); err != nil {
+	`, name, int64(resetToGlobalCounter)); err != nil {
 		return fmt.Errorf("reset projector_state for %q: %w", name, err)
 	}
 

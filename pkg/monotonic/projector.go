@@ -2,8 +2,10 @@ package monotonic
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -26,10 +28,55 @@ type ModificationTx interface {
 
 // ProjectorBackend is the store-specific backend for handling projector state and projection modifications.
 type ProjectorBackend[Tx ModificationTx] interface {
-	LockStateForModification(ctx context.Context, projectorName string) (Tx, ProjectorStateSnapshot, error)
-	CommitTruncatedStateFromModification(ctx context.Context, tx Tx, name string) error
+	LockStateForModification(ctx context.Context, projectorName string, initialGlobalCounter uint64) (Tx, ProjectorStateSnapshot, error)
+	CommitTruncatedStateFromModification(ctx context.Context, tx Tx, name string, resetToGlobalCounter uint64) error
 	CommitAdvancedStateFromModification(ctx context.Context, tx Tx, name string, advancedToGlobalCounter uint64) error
 	EnqueueTruncate(ctx context.Context, name string) error
+}
+
+// InitialCounterMode selects where a projector's resume counter starts the very first time its state row is created.
+// It has no effect afterwards: once a projector has persisted state, that state is the resume position and this setting is never consulted again.
+// Nothing about the choice is stored, so it lives entirely in the code that constructs the projector and changes by redeploying.
+type InitialCounterMode int
+
+const (
+	// InitialCounterZero starts at the beginning of the event stream, replaying everything. It is the default.
+	InitialCounterZero InitialCounterMode = iota
+	// InitialCounterForward starts at the stream head as of the projector's first Update, so everything already written is skipped.
+	// It suits a projector deployed into a system whose history it has no interest in rebuilding, and is the one mode that cannot be truncated.
+	InitialCounterForward
+	// InitialCounterExplicit starts at a literal counter supplied by the caller.
+	InitialCounterExplicit
+)
+
+// ErrInitialCounterNotReproducible reports that a truncate was requested for a projector whose starting point cannot be reproduced.
+var ErrInitialCounterNotReproducible = errors.New("projector initial counter is not reproducible")
+
+// ProjectorOption configures optional Projector behavior.
+type ProjectorOption func(*projectorConfig)
+
+// projectorConfig collects option values; its zero value is the default configuration.
+type projectorConfig struct {
+	initialCounterMode  InitialCounterMode
+	initialCounterValue uint64
+}
+
+// WithInitialCounterForward makes a projector with no persisted state start at the head of the event stream rather than replaying it.
+// Truncation is unavailable to such a projector, because the head it started from was a moment in time that cannot be rewound to; see ErrInitialCounterNotReproducible.
+func WithInitialCounterForward() ProjectorOption {
+	return func(c *projectorConfig) {
+		c.initialCounterMode = InitialCounterForward
+	}
+}
+
+// WithInitialCounterAt makes a projector with no persisted state start at counter, processing only events above it.
+// NewProjector rejects a counter above math.MaxInt64, which is the largest value a global counter can hold.
+// Truncation stays available and rewinds to counter rather than to zero, so a rebuild replays exactly the events the projector was configured to care about.
+func WithInitialCounterAt(counter uint64) ProjectorOption {
+	return func(c *projectorConfig) {
+		c.initialCounterMode = InitialCounterExplicit
+		c.initialCounterValue = counter
+	}
 }
 
 // Projector reads events from a store and applies them to the projected state via dispatch.
@@ -44,6 +91,19 @@ type Projector[Tx ModificationTx] struct {
 	backend ProjectorBackend[Tx]
 	// updateBatchSize caps the number of events loaded per Update call.
 	updateBatchSize int
+	// initialCounterMode decides the resume counter the backend creates this projector's state with.
+	initialCounterMode InitialCounterMode
+	// initialCounterValue is the starting counter when initialCounterMode is InitialCounterExplicit.
+	initialCounterValue uint64
+
+	// resolveInitialCounterMu guards the memoized InitialCounterForward lookup and is held across it, so concurrent Updates resolve the head once rather than racing to read it.
+	resolveInitialCounterMu sync.Mutex
+
+	// initialCounterResolved records that resolvedInitialCounter holds a real answer.
+	initialCounterResolved bool
+
+	// resolvedInitialCounter is the stream head as of the first successful lookup.
+	resolvedInitialCounter uint64
 }
 
 func NewProjector[Tx ModificationTx](
@@ -52,6 +112,7 @@ func NewProjector[Tx ModificationTx](
 	dispatch *Dispatch[Tx],
 	backend ProjectorBackend[Tx],
 	updateBatchSize int,
+	opts ...ProjectorOption,
 ) (*Projector[Tx], error) {
 	if name == "" {
 		return nil, fmt.Errorf("NewProjector: name must be non-empty")
@@ -59,13 +120,51 @@ func NewProjector[Tx ModificationTx](
 	if updateBatchSize <= 0 {
 		updateBatchSize = DefaultUpdateBatchSize
 	}
+	var config projectorConfig
+	for _, opt := range opts {
+		opt(&config)
+	}
+
+	// Global counters are int64 everywhere they are stored and queried, so anything above MaxInt64 wraps negative on its way to the store.
+	if config.initialCounterMode == InitialCounterExplicit && config.initialCounterValue > math.MaxInt64 {
+		return nil, fmt.Errorf("NewProjector: initial counter %d exceeds the largest representable global counter %d", config.initialCounterValue, int64(math.MaxInt64))
+	}
+
 	return &Projector[Tx]{
-		name:            name,
-		store:           store,
-		dispatch:        dispatch,
-		backend:         backend,
-		updateBatchSize: updateBatchSize,
+		name:                name,
+		store:               store,
+		dispatch:            dispatch,
+		backend:             backend,
+		updateBatchSize:     updateBatchSize,
+		initialCounterMode:  config.initialCounterMode,
+		initialCounterValue: config.initialCounterValue,
 	}, nil
+}
+
+// initialGlobalCounter resolves the counter the backend should create this projector's state with.
+func (p *Projector[Tx]) initialGlobalCounter(ctx context.Context) (uint64, error) {
+	switch p.initialCounterMode {
+	case InitialCounterExplicit:
+		return p.initialCounterValue, nil
+	case InitialCounterForward:
+		p.resolveInitialCounterMu.Lock()
+		defer p.resolveInitialCounterMu.Unlock()
+
+		if p.initialCounterResolved {
+			return p.resolvedInitialCounter, nil
+		}
+
+		head, err := p.store.MaxGlobalCounter(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("read stream head for projector %q: %w", p.name, err)
+		}
+
+		p.resolvedInitialCounter = uint64(head)
+		p.initialCounterResolved = true
+		return p.resolvedInitialCounter, nil
+	default:
+		return 0, nil
+	}
 }
 
 // ProjectorUpdateResult reports what a single Update call did.
@@ -87,14 +186,19 @@ func (p ProjectorUpdateResult) Updated() bool {
 
 // Update runs one unit of projector work under a single modification transaction.
 func (p *Projector[Tx]) Update(ctx context.Context) (ProjectorUpdateResult, error) {
-	tx, snapshot, err := p.backend.LockStateForModification(ctx, p.name)
+	initialGlobalCounter, err := p.initialGlobalCounter(ctx)
+	if err != nil {
+		return ProjectorUpdateResult{}, err
+	}
+
+	tx, snapshot, err := p.backend.LockStateForModification(ctx, p.name, initialGlobalCounter)
 	if err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("lock state for modification: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
 	if snapshot.TruncateRequested {
-		return p.truncate(ctx, tx)
+		return p.truncate(ctx, tx, initialGlobalCounter)
 	}
 	return p.advance(ctx, tx, snapshot)
 }
@@ -150,8 +254,13 @@ func (p *Projector[Tx]) advance(ctx context.Context, tx Tx, snapshot ProjectorSt
 // A projector with no truncate handler wedges here rather than rewinding, and that is deliberate.
 // Rewinding without clearing would replay the whole stream over the existing projection, which is silent corruption for any handler that accumulates.
 // The request is left set so the wedge survives a restart: the only ways out are to register a handler or to clear the flag by hand, both of which are deliberate acts.
-func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateResult, error) {
-	// Checked before dispatching so the error can name the projector and the fix; Dispatch.Truncate reports the same sentinel for anyone calling it directly.
+func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx, resetToGlobalCounter uint64) (ProjectorUpdateResult, error) {
+	// Checked here as well as in RequestTruncate because the flag can also be set straight on the backend or by hand in the store.
+	if p.initialCounterMode == InitialCounterForward {
+		return ProjectorUpdateResult{}, fmt.Errorf("truncate requested but %w", ErrInitialCounterNotReproducible)
+	}
+
+	// Checked before dispatching so the error can name the condition; Dispatch.Truncate reports the same sentinel for anyone calling it directly.
 	if !p.dispatch.HasTruncateHandler() {
 		return ProjectorUpdateResult{}, fmt.Errorf("truncate requested but %w", ErrNoTruncateHandler)
 	}
@@ -161,13 +270,14 @@ func (p *Projector[Tx]) truncate(ctx context.Context, tx Tx) (ProjectorUpdateRes
 		return ProjectorUpdateResult{}, fmt.Errorf("truncate: %w", err)
 	}
 
-	// Commit the truncated projector state.
-	if err := p.backend.CommitTruncatedStateFromModification(ctx, tx, p.name); err != nil {
+	// Rewound to where this projector starts rather than to zero, so an InitialCounterExplicit projector replays exactly the events it was configured to care about.
+	if err := p.backend.CommitTruncatedStateFromModification(ctx, tx, p.name, resetToGlobalCounter); err != nil {
 		return ProjectorUpdateResult{}, fmt.Errorf("commit truncated state: %w", err)
 	}
 
 	return ProjectorUpdateResult{
-		Truncated: true,
+		Truncated:               true,
+		AdvancedToGlobalCounter: resetToGlobalCounter,
 	}, nil
 }
 
@@ -257,8 +367,12 @@ func (p *Projector[Tx]) Drive(ctx context.Context, pollInterval time.Duration, e
 
 // RequestTruncate asks this projector to clear its projection and rebuild from the start of the event stream on its next Update.
 func (p *Projector[Tx]) RequestTruncate(ctx context.Context) error {
+	if p.initialCounterMode == InitialCounterForward {
+		return fmt.Errorf("cannot request truncate because %w; reconfigure it with a fixed starting counter to make truncation available", ErrInitialCounterNotReproducible)
+	}
+
 	if !p.dispatch.HasTruncateHandler() {
-		return fmt.Errorf("projector %q: cannot request truncate because %w; register one with Dispatch.OnTruncate", p.name, ErrNoTruncateHandler)
+		return fmt.Errorf("cannot request truncate because %w; register one with Dispatch.OnTruncate", ErrNoTruncateHandler)
 	}
 
 	if err := p.backend.EnqueueTruncate(ctx, p.name); err != nil {

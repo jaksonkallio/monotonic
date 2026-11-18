@@ -473,7 +473,7 @@ func TestProjectorBackend_LockStateCreatesMissingRow(t *testing.T) {
 	ctx := context.Background()
 	backend := resetProjectorState(t)
 
-	tx, state, err := backend.LockStateForModification(ctx, "never_ran")
+	tx, state, err := backend.LockStateForModification(ctx, "never_ran", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification on an unknown projector: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestProjectorBackend_SlowBatchDoesNotFailAConcurrentInstance(t *testing.T) 
 	appendTestEvent(t, store, "x", 2, "did")
 
 	// Stand in for a long-running batch holding the state lock.
-	holder, _, err := backend.LockStateForModification(ctx, "slow")
+	holder, _, err := backend.LockStateForModification(ctx, "slow", 0)
 	if err != nil {
 		t.Fatalf("holder LockStateForModification: %v", err)
 	}
@@ -732,5 +732,254 @@ func TestProjectorBackend_SlowBatchDoesNotFailAConcurrentInstance(t *testing.T) 
 	}
 	if got := projectedTotal(t, "proj_slow"); got != 2 {
 		t.Errorf("proj_slow total = %d, want 2", got)
+	}
+}
+
+// TestProjectorBackend_InitialCounterForwardSkipsHistory verifies Forward against a real stream:
+// the projector_state row is created at the current MAX(global_counter), so events written before
+// the projector existed are never replayed.
+func TestProjectorBackend_InitialCounterForwardSkipsHistory(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_forward")
+
+	for i := int64(1); i <= 4; i++ {
+		appendTestEvent(t, store, "x", i, "did")
+	}
+	head, err := store.MaxGlobalCounter(ctx)
+	if err != nil {
+		t.Fatalf("MaxGlobalCounter: %v", err)
+	}
+	if head != 4 {
+		t.Fatalf("stream head = %d, want 4", head)
+	}
+
+	p, err := monotonic.NewProjector("forward", store, countingDispatch("proj_forward", nil), backend, 0, monotonic.WithInitialCounterForward())
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if got := projectedTotal(t, "proj_forward"); got != 0 {
+		t.Errorf("proj_forward total = %d, want 0; pre-existing history must be skipped", got)
+	}
+	if got := readProjectorState(t, "forward").GlobalCounter; got != uint64(head) {
+		t.Errorf("projector_state = %d, want the stream head %d", got, head)
+	}
+
+	// Events after deployment are processed normally.
+	appendTestEvent(t, store, "x", 5, "did")
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after new event: %v", err)
+	}
+	if got := projectedTotal(t, "proj_forward"); got != 1 {
+		t.Errorf("proj_forward total = %d, want 1", got)
+	}
+}
+
+// TestProjectorBackend_InitialCounterOnlyAppliesOnRowCreation pins that the setting is consulted
+// only by the INSERT that creates the row. A restart must resume from the committed counter, or a
+// Forward projector would skip every event written while it was down.
+func TestProjectorBackend_InitialCounterOnlyAppliesOnRowCreation(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_once")
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	first, err := monotonic.NewProjector("once", store, countingDispatch("proj_once", nil), backend, 0, monotonic.WithInitialCounterForward())
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := first.Drain(ctx); err != nil {
+		t.Fatalf("first Drain: %v", err)
+	}
+	createdAt := readProjectorState(t, "once").GlobalCounter
+
+	// Events arrive while the projector is down.
+	appendTestEvent(t, store, "x", 2, "did")
+	appendTestEvent(t, store, "x", 3, "did")
+
+	restarted, err := monotonic.NewProjector("once", store, countingDispatch("proj_once", nil), backend, 0, monotonic.WithInitialCounterForward())
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := restarted.Drain(ctx); err != nil {
+		t.Fatalf("restarted Drain: %v", err)
+	}
+
+	if got := projectedTotal(t, "proj_once"); got != 2 {
+		t.Errorf("proj_once total = %d, want 2; a restart must resume from state, not re-skip to the head", got)
+	}
+	if got := readProjectorState(t, "once").GlobalCounter; got <= createdAt {
+		t.Errorf("projector_state = %d, want it past the creation counter %d", got, createdAt)
+	}
+}
+
+func TestProjectorBackend_InitialCounterExplicit(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_explicit")
+
+	for i := int64(1); i <= 5; i++ {
+		appendTestEvent(t, store, "x", i, "did")
+	}
+
+	p, err := monotonic.NewProjector("explicit", store, countingDispatch("proj_explicit", nil), backend, 0, monotonic.WithInitialCounterAt(3))
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if got := projectedTotal(t, "proj_explicit"); got != 2 {
+		t.Errorf("proj_explicit total = %d, want 2 (the events above counter 3)", got)
+	}
+}
+
+// TestProjectorBackend_TruncateRefusedForForward verifies the guard holds against a flag set
+// directly on the backend, which is the path that bypasses RequestTruncate entirely.
+func TestProjectorBackend_TruncateRefusedForForward(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_refuse")
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	dispatch := countingDispatch("proj_refuse", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_refuse`)
+			return err
+		})
+	p, err := monotonic.NewProjector("refuse", store, dispatch, backend, 0, monotonic.WithInitialCounterForward())
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotReproducible", err)
+	}
+	if readProjectorState(t, "refuse").TruncateRequested {
+		t.Fatal("a rejected RequestTruncate still wrote truncate_requested")
+	}
+
+	if err := backend.EnqueueTruncate(ctx, "refuse"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("Update err = %v, want ErrInitialCounterNotReproducible", err)
+	}
+	if !readProjectorState(t, "refuse").TruncateRequested {
+		t.Error("truncate_requested cleared by a refused truncate")
+	}
+}
+
+// TestStore_MaxGlobalCounterIgnoresSequenceGaps covers the reason MaxGlobalCounter reads the table
+// rather than the sequence: a rolled-back Append consumes sequence values permanently, so currval
+// can sit above any counter an event will ever carry and a projector starting there would skip real events.
+func TestStore_MaxGlobalCounterIgnoresSequenceGaps(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	resetProjectorState(t)
+
+	appendTestEvent(t, store, "x", 1, "did")
+
+	// Burn sequence values in a transaction that rolls back.
+	tx, err := sharedPool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO events (aggregate_type, aggregate_id, counter, event_type, payload, accepted_at)
+			 VALUES ('thing', 'doomed', $1, 'ignored', NULL, now())`, i+1,
+		); err != nil {
+			t.Fatalf("insert doomed event: %v", err)
+		}
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	got, err := store.MaxGlobalCounter(ctx)
+	if err != nil {
+		t.Fatalf("MaxGlobalCounter: %v", err)
+	}
+
+	var realMax int64
+	if err := sharedPool.QueryRow(ctx, `SELECT COALESCE(MAX(global_counter), 0) FROM events`).Scan(&realMax); err != nil {
+		t.Fatalf("read real max: %v", err)
+	}
+	if got != realMax {
+		t.Errorf("MaxGlobalCounter = %d, want %d; burned sequence values must not count", got, realMax)
+	}
+}
+
+// TestProjectorBackend_TruncateRewindsToExplicitInitialCounter verifies against a real stream that
+// truncation rewinds to the projector's configured start rather than to zero, so a projector that
+// deliberately skips the beginning of the stream rebuilds the projection it actually had.
+func TestProjectorBackend_TruncateRewindsToExplicitInitialCounter(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_rewind")
+
+	for i := int64(1); i <= 6; i++ {
+		appendTestEvent(t, store, "x", i, "did")
+	}
+
+	dispatch := countingDispatch("proj_rewind", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_rewind`)
+			return err
+		})
+	p, err := monotonic.NewProjector("rewind", store, dispatch, backend, 0, monotonic.WithInitialCounterAt(4))
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 2 {
+		t.Fatalf("proj_rewind total = %d, want 2 (events 5 and 6)", got)
+	}
+
+	if err := p.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate: %v", err)
+	}
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after RequestTruncate: %v", err)
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+
+	state := readProjectorState(t, "rewind")
+	if state.GlobalCounter != 4 {
+		t.Errorf("projector_state = %d after truncate, want 4 (the explicit start), not 0", state.GlobalCounter)
+	}
+	if state.TruncateRequested {
+		t.Error("truncate_requested still set after the truncate was serviced")
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 0 {
+		t.Errorf("proj_rewind total = %d after truncate, want 0", got)
+	}
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after truncate: %v", err)
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 2 {
+		t.Errorf("proj_rewind total = %d after rebuild, want 2; a rewind to zero would have replayed all 6", got)
 	}
 }
