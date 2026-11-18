@@ -80,12 +80,31 @@ func wantValue(t *testing.T, name string, labels map[string]string, want float64
 	}
 }
 
+// freshMetrics drops every series belonging to projectorNames so a test starts from a clean slate.
+//
+// A unique projector name per test isolates the tests from each other, but not from their own reruns: the metric
+// vectors are package-level and live for the whole test binary, and WithLabelValues hands back the existing child for
+// a label set it has already seen. Without this, `go test -count=2` would have the second pass asserting against
+// counts the first pass left behind. Resetting on the way in rather than on the way out also covers the pass that
+// failed partway through and never got to clean up after itself.
+func freshMetrics(t *testing.T, projectorNames ...string) {
+	t.Helper()
+
+	for _, projectorName := range projectorNames {
+		labels := prometheus.Labels{"projector": projectorName}
+		monotonic.ProjectorUpdatesTotal.DeletePartialMatch(labels)
+		monotonic.ProjectorAppliedEventsTotal.DeletePartialMatch(labels)
+		monotonic.ProjectorLastSuccessfulUpdateTimestampSeconds.DeletePartialMatch(labels)
+	}
+}
+
 func TestProjectorMetrics_NewProjectorSeedsSeriesAtZero(t *testing.T) {
 	// Seeded so a rate() over the error series matches something from startup rather than only after the first
 	// failure, which is when an alert on a projector that has never failed would otherwise be matching nothing.
 	// The freshness gauge is seeded too, so a projector that never manages a clean Update reads as stale rather than
 	// as no series at all.
 	const name = "metrics-seeded"
+	freshMetrics(t, name)
 	if _, err := monotonic.NewProjector(name, monotonic.NewInMemoryStore(), noopDispatch(), newFakeBackend(), 0); err != nil {
 		t.Fatalf("NewProjector: %v", err)
 	}
@@ -98,6 +117,7 @@ func TestProjectorMetrics_NewProjectorSeedsSeriesAtZero(t *testing.T) {
 
 func TestProjectorMetrics_SuccessfulUpdateRecordsEventsAndFreshness(t *testing.T) {
 	const name = "metrics-success"
+	freshMetrics(t, name)
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
@@ -132,6 +152,7 @@ func TestProjectorMetrics_SuccessfulUpdateRecordsEventsAndFreshness(t *testing.T
 // caught up and finding nothing is healthy, so it must keep the gauge moving even though it applies no events.
 func TestProjectorMetrics_IdleUpdateIsStillFresh(t *testing.T) {
 	const name = "metrics-idle"
+	freshMetrics(t, name)
 	ctx := context.Background()
 
 	p, err := monotonic.NewProjector(name, monotonic.NewInMemoryStore(), noopDispatch(), newFakeBackend(), 0)
@@ -159,6 +180,7 @@ func TestProjectorMetrics_IdleUpdateIsStillFresh(t *testing.T) {
 // back, so its events must not be counted as applied, and the projector must not be reported as fresh.
 func TestProjectorMetrics_FailedUpdateRecordsOnlyTheFailure(t *testing.T) {
 	const name = "metrics-error"
+	freshMetrics(t, name)
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
@@ -185,6 +207,7 @@ func TestProjectorMetrics_FailedUpdateRecordsOnlyTheFailure(t *testing.T) {
 // the first Update dispatches both events and fails on the second, and only the retry's committed events count.
 func TestProjectorMetrics_RetriedBatchIsCountedOnce(t *testing.T) {
 	const name = "metrics-retry"
+	freshMetrics(t, name)
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
@@ -216,6 +239,7 @@ func TestProjectorMetrics_RetriedBatchIsCountedOnce(t *testing.T) {
 // alive without inflating the applied-events count, since a truncate clears the projection rather than applying to it.
 func TestProjectorMetrics_TruncateCountsAsASuccessfulUpdate(t *testing.T) {
 	const name = "metrics-truncate"
+	freshMetrics(t, name)
 	ctx := context.Background()
 
 	truncated := 0
@@ -249,6 +273,8 @@ func TestProjectorMetrics_TruncateCountsAsASuccessfulUpdate(t *testing.T) {
 // TestProjectorMetrics_SeriesAreKeyedPerProjector pins the label: two projectors sharing a process must not share a
 // count, which is the whole point of the metrics being labelled rather than global.
 func TestProjectorMetrics_SeriesAreKeyedPerProjector(t *testing.T) {
+	freshMetrics(t, "metrics-keyed-busy", "metrics-keyed-idle")
+
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)
