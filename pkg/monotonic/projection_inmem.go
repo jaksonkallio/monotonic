@@ -145,9 +145,9 @@ func (p *InMemoryProjection[T]) CommitAdvancedStateFromModification(_ context.Co
 
 // CommitTruncatedStateFromModification commits the truncated rows, rewinds projectorName to the
 // start of the stream and clears its truncate request, then releases the modification lock.
-func (p *InMemoryProjection[T]) CommitTruncatedStateFromModification(_ context.Context, tx *InMemoryProjectionTx[T], projectorName string) error {
+func (p *InMemoryProjection[T]) CommitTruncatedStateFromModification(_ context.Context, tx *InMemoryProjectionTx[T], projectorName string, resetToGlobalCounter uint64) error {
 	return p.commit(tx, projectorName, func(ProjectorStateSnapshot) ProjectorStateSnapshot {
-		return ProjectorStateSnapshot{}
+		return ProjectorStateSnapshot{GlobalCounter: resetToGlobalCounter}
 	})
 }
 

@@ -93,9 +93,9 @@ func (b *fakeBackend) CommitAdvancedStateFromModification(_ context.Context, tx 
 	})
 }
 
-func (b *fakeBackend) CommitTruncatedStateFromModification(_ context.Context, tx *testTx, projectorName string) error {
+func (b *fakeBackend) CommitTruncatedStateFromModification(_ context.Context, tx *testTx, projectorName string, resetToGlobalCounter uint64) error {
 	return b.commit(tx, projectorName, func(monotonic.ProjectorStateSnapshot) monotonic.ProjectorStateSnapshot {
-		return monotonic.ProjectorStateSnapshot{}
+		return monotonic.ProjectorStateSnapshot{GlobalCounter: resetToGlobalCounter}
 	})
 }
 
@@ -1325,58 +1325,107 @@ func TestProjector_InitialCounterForwardPropagatesStoreError(t *testing.T) {
 	}
 }
 
-// TestProjector_TruncateUnavailableWhenInitialCounterIsNotZero pins the rule that makes the feature
-// coherent. Truncation rewinds to zero and nothing about the initial counter is persisted, so
-// servicing one would silently turn a Forward projector into a Zero one and replay all of history.
-func TestProjector_TruncateUnavailableWhenInitialCounterIsNotZero(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		opt  monotonic.ProjectorOption
-	}{
-		{"forward", monotonic.WithInitialCounterForward()},
-		{"explicit", monotonic.WithInitialCounterAt(3)},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			store := monotonic.NewInMemoryStore()
-			emitEvent(ctx, t, store, 1)
-			backend := newFakeBackend()
+// TestProjector_TruncateUnavailableForForward pins the one mode that cannot be truncated. The head
+// it started from was a moment in time that has passed and was never persisted, so there is no
+// number to rewind to: zero would replay the history it was deployed to skip, and a freshly
+// resolved head would discard the projection in exchange for a different one.
+func TestProjector_TruncateUnavailableForForward(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	backend := newFakeBackend()
 
-			truncated := 0
-			dispatch := countingDispatch(&counterRef{}).OnTruncate(func(context.Context, *testTx) error {
-				truncated++
-				return nil
-			})
-			p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0, tc.opt)
+	truncated := 0
+	dispatch := countingDispatch(&counterRef{}).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0, monotonic.WithInitialCounterForward())
 
-			// The front door refuses, and nothing is enqueued.
-			if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
-				t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotZero", err)
-			}
-			if backend.stateOf("p1").TruncateRequested {
-				t.Error("a rejected RequestTruncate still enqueued the truncate")
-			}
+	// The front door refuses, and nothing is enqueued.
+	if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotReproducible", err)
+	}
+	if backend.stateOf("p1").TruncateRequested {
+		t.Error("a rejected RequestTruncate still enqueued the truncate")
+	}
 
-			// The backstop refuses too, since the flag can be set straight on the backend.
-			if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
-				t.Fatalf("EnqueueTruncate: %v", err)
-			}
-			if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
-				t.Fatalf("Update err = %v, want ErrInitialCounterNotZero", err)
-			}
-			if truncated != 0 {
-				t.Errorf("truncate handler ran %d times, want 0", truncated)
-			}
-			if !backend.stateOf("p1").TruncateRequested {
-				t.Error("TruncateRequested cleared by a refused truncate")
-			}
-		})
+	// The backstop refuses too, since the flag can be set straight on the backend.
+	if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+		t.Fatalf("EnqueueTruncate: %v", err)
+	}
+	if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("Update err = %v, want ErrInitialCounterNotReproducible", err)
+	}
+	if truncated != 0 {
+		t.Errorf("truncate handler ran %d times, want 0", truncated)
+	}
+	if !backend.stateOf("p1").TruncateRequested {
+		t.Error("TruncateRequested cleared by a refused truncate")
 	}
 }
 
-// TestProjector_TruncateAvailableAfterMovingToInitialCounterZero covers the documented way out:
-// reconfigure the projector and redeploy, and truncation works against the same persisted state.
-func TestProjector_TruncateAvailableAfterMovingToInitialCounterZero(t *testing.T) {
+// TestProjector_TruncateRewindsToExplicitInitialCounter covers the case a fixed starting counter
+// makes possible: the rebuild replays from that counter, not from zero, so the projector
+// reconstructs exactly the projection it had rather than one built from history it never wanted.
+func TestProjector_TruncateRewindsToExplicitInitialCounter(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 6; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	truncated := 0
+	dispatch := countingDispatch(cr).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+	p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0, monotonic.WithInitialCounterAt(4))
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if cr.n != 2 {
+		t.Fatalf("handler ran %d times, want 2 (events 5 and 6)", cr.n)
+	}
+
+	if err := p.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate: %v", err)
+	}
+
+	cr.n = 0
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after RequestTruncate: %v", err)
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+	if truncated != 1 {
+		t.Errorf("truncate handler ran %d times, want 1", truncated)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 4 {
+		t.Errorf("counter = %d after truncate, want 4 (the explicit start), not 0", got)
+	}
+	if result.AdvancedToGlobalCounter != 4 {
+		t.Errorf("AdvancedToGlobalCounter = %d, want 4", result.AdvancedToGlobalCounter)
+	}
+
+	// The rebuild replays only the events above the explicit start.
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after truncate: %v", err)
+	}
+	if cr.n != 2 {
+		t.Errorf("handler replayed %d events, want 2; a rewind to zero would have replayed all 6", cr.n)
+	}
+}
+
+// TestProjector_TruncateAvailableAfterLeavingForward covers the documented way out of the one
+// mode that refuses: give the projector a fixed starting counter and redeploy, and truncation
+// works against the same persisted state.
+func TestProjector_TruncateAvailableAfterLeavingForward(t *testing.T) {
 	ctx := context.Background()
 	store := monotonic.NewInMemoryStore()
 	emitEvent(ctx, t, store, 1)

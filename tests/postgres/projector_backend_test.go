@@ -843,9 +843,9 @@ func TestProjectorBackend_InitialCounterExplicit(t *testing.T) {
 	}
 }
 
-// TestProjectorBackend_TruncateRefusedForNonZeroInitialCounter verifies the guard holds against a
-// flag set directly on the backend, which is the path that bypasses RequestTruncate entirely.
-func TestProjectorBackend_TruncateRefusedForNonZeroInitialCounter(t *testing.T) {
+// TestProjectorBackend_TruncateRefusedForForward verifies the guard holds against a flag set
+// directly on the backend, which is the path that bypasses RequestTruncate entirely.
+func TestProjectorBackend_TruncateRefusedForForward(t *testing.T) {
 	ctx := context.Background()
 	store := testStore(t)
 	backend := resetProjectorState(t)
@@ -866,8 +866,8 @@ func TestProjectorBackend_TruncateRefusedForNonZeroInitialCounter(t *testing.T) 
 		t.Fatalf("Drain: %v", err)
 	}
 
-	if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
-		t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotZero", err)
+	if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotReproducible", err)
 	}
 	if readProjectorState(t, "refuse").TruncateRequested {
 		t.Fatal("a rejected RequestTruncate still wrote truncate_requested")
@@ -876,8 +876,8 @@ func TestProjectorBackend_TruncateRefusedForNonZeroInitialCounter(t *testing.T) 
 	if err := backend.EnqueueTruncate(ctx, "refuse"); err != nil {
 		t.Fatalf("EnqueueTruncate: %v", err)
 	}
-	if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
-		t.Fatalf("Update err = %v, want ErrInitialCounterNotZero", err)
+	if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotReproducible) {
+		t.Fatalf("Update err = %v, want ErrInitialCounterNotReproducible", err)
 	}
 	if !readProjectorState(t, "refuse").TruncateRequested {
 		t.Error("truncate_requested cleared by a refused truncate")
@@ -922,5 +922,64 @@ func TestStore_MaxGlobalCounterIgnoresSequenceGaps(t *testing.T) {
 	}
 	if got != realMax {
 		t.Errorf("MaxGlobalCounter = %d, want %d; burned sequence values must not count", got, realMax)
+	}
+}
+
+// TestProjectorBackend_TruncateRewindsToExplicitInitialCounter verifies against a real stream that
+// truncation rewinds to the projector's configured start rather than to zero, so a projector that
+// deliberately skips the beginning of the stream rebuilds the projection it actually had.
+func TestProjectorBackend_TruncateRewindsToExplicitInitialCounter(t *testing.T) {
+	ctx := context.Background()
+	store := testStore(t)
+	backend := resetProjectorState(t)
+	resetProjectionTable(t, "proj_rewind")
+
+	for i := int64(1); i <= 6; i++ {
+		appendTestEvent(t, store, "x", i, "did")
+	}
+
+	dispatch := countingDispatch("proj_rewind", nil).
+		OnTruncate(func(ctx context.Context, tx pgx.Tx) error {
+			_, err := tx.Exec(ctx, `TRUNCATE proj_rewind`)
+			return err
+		})
+	p, err := monotonic.NewProjector("rewind", store, dispatch, backend, 0, monotonic.WithInitialCounterAt(4))
+	if err != nil {
+		t.Fatalf("NewProjector: %v", err)
+	}
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 2 {
+		t.Fatalf("proj_rewind total = %d, want 2 (events 5 and 6)", got)
+	}
+
+	if err := p.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate: %v", err)
+	}
+	result, err := p.Update(ctx)
+	if err != nil {
+		t.Fatalf("Update after RequestTruncate: %v", err)
+	}
+	if !result.Truncated {
+		t.Error("Truncated = false, want true")
+	}
+
+	state := readProjectorState(t, "rewind")
+	if state.GlobalCounter != 4 {
+		t.Errorf("projector_state = %d after truncate, want 4 (the explicit start), not 0", state.GlobalCounter)
+	}
+	if state.TruncateRequested {
+		t.Error("truncate_requested still set after the truncate was serviced")
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 0 {
+		t.Errorf("proj_rewind total = %d after truncate, want 0", got)
+	}
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after truncate: %v", err)
+	}
+	if got := projectedTotal(t, "proj_rewind"); got != 2 {
+		t.Errorf("proj_rewind total = %d after rebuild, want 2; a rewind to zero would have replayed all 6", got)
 	}
 }

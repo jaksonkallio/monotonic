@@ -96,14 +96,13 @@ func lockExistingState(ctx context.Context, tx pgx.Tx, name string) (monotonic.P
 	}, nil
 }
 
-// CommitTruncatedStateFromModification rewinds name to the start of the event stream, clears its
-// truncate request, and commits the transaction along with the truncate handler's writes.
-func (b *ProjectorBackend) CommitTruncatedStateFromModification(ctx context.Context, tx pgx.Tx, name string) error {
+// CommitTruncatedStateFromModification rewinds name to resetToGlobalCounter, clears its truncate request, and commits the transaction along with the truncate handler's writes.
+func (b *ProjectorBackend) CommitTruncatedStateFromModification(ctx context.Context, tx pgx.Tx, name string, resetToGlobalCounter uint64) error {
 	if _, err := tx.Exec(ctx, `
 		UPDATE projector_state
-		SET global_counter = 0, truncate_requested = false, updated_at = now()
+		SET global_counter = $2, truncate_requested = false, updated_at = now()
 		WHERE projector_name = $1
-	`, name); err != nil {
+	`, name, int64(resetToGlobalCounter)); err != nil {
 		return fmt.Errorf("reset projector_state for %q: %w", name, err)
 	}
 
