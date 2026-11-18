@@ -104,6 +104,9 @@ type Projector[Tx ModificationTx] struct {
 
 	// resolvedInitialCounter is the stream head as of the first successful lookup.
 	resolvedInitialCounter uint64
+
+	// metrics are this projector's Prometheus series, bound to its name at construction.
+	metrics projectorMetrics
 }
 
 func NewProjector[Tx ModificationTx](
@@ -138,6 +141,7 @@ func NewProjector[Tx ModificationTx](
 		updateBatchSize:     updateBatchSize,
 		initialCounterMode:  config.initialCounterMode,
 		initialCounterValue: config.initialCounterValue,
+		metrics:             newProjectorMetrics(name),
 	}, nil
 }
 
@@ -186,6 +190,13 @@ func (p ProjectorUpdateResult) Updated() bool {
 
 // Update runs one unit of projector work under a single modification transaction.
 func (p *Projector[Tx]) Update(ctx context.Context) (ProjectorUpdateResult, error) {
+	result, err := p.update(ctx)
+	p.metrics.observeUpdate(result, err)
+	return result, err
+}
+
+// update is Update without the metrics bookkeeping.
+func (p *Projector[Tx]) update(ctx context.Context) (ProjectorUpdateResult, error) {
 	initialGlobalCounter, err := p.initialGlobalCounter(ctx)
 	if err != nil {
 		return ProjectorUpdateResult{}, err
