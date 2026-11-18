@@ -41,16 +41,24 @@ Two consequences worth knowing:
 - A context cancellation counts as an error, so expect one increment per projector per shutdown.
 - A truncate counts as a successful `Update` but applies no events, so it moves the freshness gauge and the success counter without touching `applied_events_total`.
 
-## Throughput and lag
+## Throughput
 
-`applied_events_total` is the projector-side throughput signal, and differencing it against the write side is the cheapest lag proxy you can get without instrumenting the store:
+`applied_events_total` is a projector-side throughput signal: how fast this projector is getting through work.
 
 ```promql
 # Events applied per second, per projector
 sum by (projector) (rate(monotonic_projector_applied_events_total[1m]))
 ```
 
-A projector whose freshness gauge keeps moving while this stays at zero is caught up, not stalled. One where both are flat is stuck.
+Read it as throughput, not as lag. Differencing it against the number of events written does not give you a backlog, for three separate reasons:
+
+- **Filtering.** A projector only ever sees the event types its handlers registered, via `Dispatch.EventFilters()`. A projector subscribed to two of your twenty event types is fully caught up while applying a small fraction of what was written, so the difference grows without bound and means nothing.
+- **Starting position.** A projector built with `WithInitialCounterForward()` skips everything written before its first update, and one built with `WithInitialCounterAt(n)` skips everything at or below `n`. Neither will ever account for that history.
+- **Truncation.** A rebuild replays events the projector has already applied once, and both passes add to the same cumulative counter. After a truncate the counter is ahead of the number of distinct events the projector has ever seen.
+
+For an actual backlog, compare the projector's resume counter against the head of the stream. The counter is in the backend's `projector_state` row, and `Store.MaxGlobalCounter` gives you the head.
+
+What this metric *is* good for alongside the freshness gauge is telling apart the two ways a projector can look quiet. One whose freshness gauge keeps moving while this stays flat is caught up and idle. One where both are flat is stuck.
 
 ## Using a non-default registry
 
@@ -65,7 +73,13 @@ reg.MustRegister(
 )
 ```
 
-They stay registered on the default registerer as well, since that happens at package init and cannot be opted out of. If that is a problem — a duplicate-registration panic from some other collector sharing the names, say — unregister them from the default registry after init with `prometheus.Unregister`.
+They stay registered on the default registerer as well, since that happens at package init and cannot be opted out of. To take them back off it, call `prometheus.Unregister` on each during your own setup:
+
+```go
+prometheus.Unregister(monotonic.ProjectorUpdatesTotal)
+```
+
+That only removes collectors that registered successfully. It is not an escape hatch for a name collision: if something else in your process already exports these names on the default registerer, `promauto` panics from inside this package's `init`, before any of your code gets to run. The fix there is to rename the other collector, since these names are fixed.
 
 ## Cost
 
