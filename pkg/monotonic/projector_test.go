@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -1316,12 +1317,110 @@ func TestProjector_InitialCounterForwardResolvesStreamHeadOnce(t *testing.T) {
 func TestProjector_InitialCounterForwardPropagatesStoreError(t *testing.T) {
 	ctx := context.Background()
 	wantErr := errors.New("head boom")
-	store := &countingStore{Store: monotonic.NewInMemoryStore(), maxGlobalCounterErr: wantErr}
+	store := &countingStore{Store: monotonic.NewInMemoryStore(), maxGlobalCounterErr: wantErr, failuresRemaining: -1}
 
 	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), newFakeBackend(), 0, monotonic.WithInitialCounterForward())
 
 	if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
 		t.Errorf("Update err = %v, want %v", err, wantErr)
+	}
+}
+
+// TestProjector_InitialCounterForwardRetriesAfterFailedLookup pins that only successful head
+// lookups are remembered. Caching the failure would poison the projector for the life of the
+// process, which defeats Drive entirely: its whole job is to keep retrying until the store
+// recovers, and it would retry forever against an answer that can never change.
+func TestProjector_InitialCounterForwardRetriesAfterFailedLookup(t *testing.T) {
+	ctx := context.Background()
+	inner := monotonic.NewInMemoryStore()
+	wantErr := errors.New("head unavailable")
+	// Fails the first two lookups, then works.
+	store := &countingStore{Store: inner, maxGlobalCounterErr: wantErr, failuresRemaining: 2}
+
+	emitEvent(ctx, t, inner, 1)
+	emitEvent(ctx, t, inner, 2)
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	// The same Projector instance throughout: recovery must not need a restart.
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0, monotonic.WithInitialCounterForward())
+
+	for attempt := 0; attempt < 2; attempt++ {
+		if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
+			t.Fatalf("attempt %d: Update err = %v, want %v", attempt, err, wantErr)
+		}
+	}
+
+	// The store is healthy now, and the same projector must pick up without being recreated.
+	if _, err := p.Update(ctx); err != nil {
+		t.Fatalf("Update after the store recovered: %v", err)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 2 {
+		t.Errorf("counter = %d, want 2 (the stream head)", got)
+	}
+	if cr.n != 0 {
+		t.Errorf("handler ran %d times, want 0; the head must still be skipped", cr.n)
+	}
+
+	// And the successful answer is remembered, so later polls do not re-read it.
+	callsAfterSuccess := store.maxGlobalCounterCalls
+	for i := 0; i < 3; i++ {
+		if _, err := p.Update(ctx); err != nil {
+			t.Fatalf("idle Update: %v", err)
+		}
+	}
+	if store.maxGlobalCounterCalls != callsAfterSuccess {
+		t.Errorf("MaxGlobalCounter called %d more times after success, want 0", store.maxGlobalCounterCalls-callsAfterSuccess)
+	}
+}
+
+// TestProjector_InitialCounterForwardSurvivesLookupFailureUnderDrive is the end-to-end version:
+// Drive logs and retries, so a store that comes back must leave the projector working.
+func TestProjector_InitialCounterForwardSurvivesLookupFailureUnderDrive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	inner := monotonic.NewInMemoryStore()
+	store := &countingStore{Store: inner, maxGlobalCounterErr: errors.New("head unavailable"), failuresRemaining: 3}
+	emitEvent(context.Background(), t, inner, 1)
+
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0, monotonic.WithInitialCounterForward())
+
+	done := make(chan error, 1)
+	go func() {
+		done <- p.Drive(ctx, time.Millisecond, monotonic.NewRetry(3, monotonic.ConstantBackoff(time.Millisecond)))
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if backend.stateOf("p1").GlobalCounter == 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if got := backend.stateOf("p1").GlobalCounter; got != 1 {
+		t.Errorf("counter = %d, want 1; Drive never recovered from the failed head lookups", got)
+	}
+}
+
+func TestNewProjector_RejectsInitialCounterAboveMaxInt64(t *testing.T) {
+	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
+
+	// Anything above MaxInt64 wraps negative on its way to a store that holds counters as int64.
+	for _, counter := range []uint64{math.MaxInt64 + 1, 1 << 63, math.MaxUint64} {
+		if _, err := monotonic.NewProjector("p1", store, noopDispatch(), backend, 0, monotonic.WithInitialCounterAt(counter)); err == nil {
+			t.Errorf("NewProjector with initial counter %d returned no error, want one", counter)
+		}
+	}
+
+	// The boundary itself is representable and must be accepted.
+	if _, err := monotonic.NewProjector("p1", store, noopDispatch(), backend, 0, monotonic.WithInitialCounterAt(math.MaxInt64)); err != nil {
+		t.Errorf("NewProjector with initial counter MaxInt64: %v", err)
 	}
 }
 
@@ -1464,12 +1563,17 @@ func TestProjector_TruncateAvailableAfterLeavingForward(t *testing.T) {
 type countingStore struct {
 	monotonic.Store
 	maxGlobalCounterCalls int
-	maxGlobalCounterErr   error
+	// maxGlobalCounterErr is returned while failuresRemaining is positive, or always when it is negative.
+	maxGlobalCounterErr error
+	failuresRemaining   int
 }
 
 func (s *countingStore) MaxGlobalCounter(ctx context.Context) (int64, error) {
 	s.maxGlobalCounterCalls++
-	if s.maxGlobalCounterErr != nil {
+	if s.maxGlobalCounterErr != nil && s.failuresRemaining != 0 {
+		if s.failuresRemaining > 0 {
+			s.failuresRemaining--
+		}
 		return 0, s.maxGlobalCounterErr
 	}
 	return s.Store.MaxGlobalCounter(ctx)

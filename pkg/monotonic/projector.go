@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -69,6 +70,7 @@ func WithInitialCounterForward() ProjectorOption {
 }
 
 // WithInitialCounterAt makes a projector with no persisted state start at counter, processing only events above it.
+// NewProjector rejects a counter above math.MaxInt64, which is the largest value a global counter can hold.
 // Truncation stays available and rewinds to counter rather than to zero, so a rebuild replays exactly the events the projector was configured to care about.
 func WithInitialCounterAt(counter uint64) ProjectorOption {
 	return func(c *projectorConfig) {
@@ -94,11 +96,14 @@ type Projector[Tx ModificationTx] struct {
 	// initialCounterValue is the starting counter when initialCounterMode is InitialCounterExplicit.
 	initialCounterValue uint64
 
-	// resolveInitialCounterOnce memoizes the InitialCounterForward lookup.
-	// The answer can only ever be used by the Update that creates the state, so re-reading the stream head on every poll afterwards would be pure waste.
-	resolveInitialCounterOnce sync.Once
-	resolvedInitialCounter    uint64
-	resolveInitialCounterErr  error
+	// resolveInitialCounterMu guards the memoized InitialCounterForward lookup and is held across it, so concurrent Updates resolve the head once rather than racing to read it.
+	resolveInitialCounterMu sync.Mutex
+
+	// initialCounterResolved records that resolvedInitialCounter holds a real answer.
+	initialCounterResolved bool
+
+	// resolvedInitialCounter is the stream head as of the first successful lookup.
+	resolvedInitialCounter uint64
 }
 
 func NewProjector[Tx ModificationTx](
@@ -120,6 +125,11 @@ func NewProjector[Tx ModificationTx](
 		opt(&config)
 	}
 
+	// Global counters are int64 everywhere they are stored and queried, so anything above MaxInt64 wraps negative on its way to the store.
+	if config.initialCounterMode == InitialCounterExplicit && config.initialCounterValue > math.MaxInt64 {
+		return nil, fmt.Errorf("NewProjector: initial counter %d exceeds the largest representable global counter %d", config.initialCounterValue, int64(math.MaxInt64))
+	}
+
 	return &Projector[Tx]{
 		name:                name,
 		store:               store,
@@ -137,15 +147,21 @@ func (p *Projector[Tx]) initialGlobalCounter(ctx context.Context) (uint64, error
 	case InitialCounterExplicit:
 		return p.initialCounterValue, nil
 	case InitialCounterForward:
-		p.resolveInitialCounterOnce.Do(func() {
-			head, err := p.store.MaxGlobalCounter(ctx)
-			if err != nil {
-				p.resolveInitialCounterErr = fmt.Errorf("read stream head for projector %q: %w", p.name, err)
-				return
-			}
-			p.resolvedInitialCounter = uint64(head)
-		})
-		return p.resolvedInitialCounter, p.resolveInitialCounterErr
+		p.resolveInitialCounterMu.Lock()
+		defer p.resolveInitialCounterMu.Unlock()
+
+		if p.initialCounterResolved {
+			return p.resolvedInitialCounter, nil
+		}
+
+		head, err := p.store.MaxGlobalCounter(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("read stream head for projector %q: %w", p.name, err)
+		}
+
+		p.resolvedInitialCounter = uint64(head)
+		p.initialCounterResolved = true
+		return p.resolvedInitialCounter, nil
 	default:
 		return 0, nil
 	}
