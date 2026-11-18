@@ -116,11 +116,17 @@ func (tx *InMemoryProjectionTx[T]) Rollback(context.Context) error {
 // LockStateForModification takes the projection's modification lock and returns a transaction
 // buffering a clone of the committed rows, along with projectorName's state as of that moment.
 // The lock is held until the returned transaction commits or rolls back.
-func (p *InMemoryProjection[T]) LockStateForModification(_ context.Context, projectorName string) (*InMemoryProjectionTx[T], ProjectorStateSnapshot, error) {
+func (p *InMemoryProjection[T]) LockStateForModification(_ context.Context, projectorName string, initialGlobalCounter uint64) (*InMemoryProjectionTx[T], ProjectorStateSnapshot, error) {
 	p.txMu.Lock()
 
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// A projector that has never run has no state yet, and creating it is the one moment initialGlobalCounter applies.
+	// Presence is tested rather than the counter being zero, since a projector legitimately sits at zero before its first event.
+	if _, ok := p.state[projectorName]; !ok {
+		p.state[projectorName] = ProjectorStateSnapshot{GlobalCounter: initialGlobalCounter}
+	}
 
 	// Only the map reference is captured here. Cloning is deferred until a handler actually writes, so an idle poll costs nothing.
 	return &InMemoryProjectionTx[T]{projection: p, base: p.rows}, p.state[projectorName], nil

@@ -153,6 +153,15 @@ func (s *Store) Append(ctx context.Context, events ...monotonic.AggregateEvent) 
 	return tx.Commit(ctx)
 }
 
+// MaxGlobalCounter returns the global counter of the most recently appended event, or 0 if the table is empty.
+func (s *Store) MaxGlobalCounter(ctx context.Context) (int64, error) {
+	var maxGlobalCounter int64
+	if err := s.pool.QueryRow(ctx, `SELECT COALESCE(MAX(global_counter), 0) FROM events`).Scan(&maxGlobalCounter); err != nil {
+		return 0, fmt.Errorf("read max global counter: %w", err)
+	}
+	return maxGlobalCounter, nil
+}
+
 func (s *Store) LoadGlobalEvents(ctx context.Context, filters []monotonic.EventFilter, afterGlobalCounter int64, limit int) ([]monotonic.AggregateEvent, error) {
 	// $1 is always afterGlobalCounter; each filter becomes one OR-ed clause built from its non-empty fields AND-ed together.
 	args := []any{afterGlobalCounter}

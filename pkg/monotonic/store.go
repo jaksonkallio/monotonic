@@ -16,6 +16,9 @@ type Store interface {
 
 	// LoadGlobalEvents returns events matching any of the EventFilters with global counter > afterGlobalCounter, ordered by global counter; an empty filter list returns no events. Limit caps the number of returned events; 0 means no limit.
 	LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64, limit int) ([]AggregateEvent, error)
+
+	// MaxGlobalCounter returns the global counter of the most recently appended event, or 0 if the store is empty.
+	MaxGlobalCounter(ctx context.Context) (int64, error)
 }
 
 // ErrCounterConflict is returned when an event's counter conflicts with an existing event.
@@ -108,6 +111,17 @@ func (s *InMemoryStore) Append(ctx context.Context, events ...AggregateEvent) er
 	}
 
 	return nil
+}
+
+// MaxGlobalCounter returns the global counter of the most recently appended event, or 0 if nothing has been appended.
+func (s *InMemoryStore) MaxGlobalCounter(_ context.Context) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(s.globalEvents) == 0 {
+		return 0, nil
+	}
+	return s.globalEvents[len(s.globalEvents)-1].Event.GlobalCounter, nil
 }
 
 func (s *InMemoryStore) LoadGlobalEvents(ctx context.Context, filters []EventFilter, afterGlobalCounter int64, limit int) ([]AggregateEvent, error) {

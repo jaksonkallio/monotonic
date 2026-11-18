@@ -48,6 +48,8 @@ type fakeBackend struct {
 	commitErr error // if non-nil, both Commit methods fail with it
 	// commitCalls counts Commit attempts, so a test can assert an idle Update writes nothing.
 	commitCalls int
+	// createdWith records the initial counter each state creation used, so a test can assert it is applied once and never again.
+	createdWith []uint64
 }
 
 func newFakeBackend() *fakeBackend {
@@ -63,12 +65,18 @@ func (b *fakeBackend) unlock(projectorName string) {
 	delete(b.locked, projectorName)
 }
 
-func (b *fakeBackend) LockStateForModification(_ context.Context, projectorName string) (*testTx, monotonic.ProjectorStateSnapshot, error) {
+func (b *fakeBackend) LockStateForModification(_ context.Context, projectorName string, initialGlobalCounter uint64) (*testTx, monotonic.ProjectorStateSnapshot, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if b.lockErr != nil {
 		return nil, monotonic.ProjectorStateSnapshot{}, b.lockErr
+	}
+
+	// Mirrors both real backends: the initial counter applies only when state is created.
+	if _, ok := b.state[projectorName]; !ok {
+		b.state[projectorName] = monotonic.ProjectorStateSnapshot{GlobalCounter: initialGlobalCounter}
+		b.createdWith = append(b.createdWith, initialGlobalCounter)
 	}
 	if b.locked[projectorName] {
 		return nil, monotonic.ProjectorStateSnapshot{}, fmt.Errorf("fakeBackend: state for %q already locked", projectorName)
@@ -1151,4 +1159,269 @@ func TestDriveProjectors_AllStopOnContextCancellation(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("DriveProjectors did not stop within 5s of cancellation")
 	}
+}
+
+// --- initial counter tests ---
+
+func TestProjector_InitialCounterZeroReplaysEverything(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 5; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	// No option at all is the default, and must behave exactly as before.
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0)
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if cr.n != 5 {
+		t.Errorf("handler ran %d times, want all 5 events replayed", cr.n)
+	}
+}
+
+func TestProjector_InitialCounterForwardSkipsExistingHistory(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 5; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0, monotonic.WithInitialCounterForward())
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if cr.n != 0 {
+		t.Errorf("handler ran %d times, want 0; history before deployment must be skipped", cr.n)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 5 {
+		t.Errorf("counter = %d, want 5 (the stream head at first Update)", got)
+	}
+
+	// Events appended after the projector started are its business.
+	emitEvent(ctx, t, store, 6)
+	emitEvent(ctx, t, store, 7)
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after new events: %v", err)
+	}
+	if cr.n != 2 {
+		t.Errorf("handler ran %d times for events after the head, want 2", cr.n)
+	}
+}
+
+func TestProjector_InitialCounterForwardOnEmptyStoreStartsAtZero(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0, monotonic.WithInitialCounterForward())
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	// Nothing to skip, so a later event must still be processed rather than fall below the head.
+	emitEvent(ctx, t, store, 1)
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain after first event: %v", err)
+	}
+	if cr.n != 1 {
+		t.Errorf("handler ran %d times, want 1", cr.n)
+	}
+}
+
+func TestProjector_InitialCounterExplicitStartsAtGivenCounter(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 5; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	cr := &counterRef{}
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0, monotonic.WithInitialCounterAt(3))
+
+	if err := p.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if cr.n != 2 {
+		t.Errorf("handler ran %d times, want 2 (events 4 and 5)", cr.n)
+	}
+	if got := backend.stateOf("p1").GlobalCounter; got != 5 {
+		t.Errorf("counter = %d, want 5", got)
+	}
+}
+
+// TestProjector_InitialCounterAppliesOnlyWhenStateIsCreated is the core of the feature: the setting
+// decides where a brand new projector starts and is irrelevant forever after, so a restart must
+// resume from persisted state rather than jumping forward to the head again and skipping events.
+func TestProjector_InitialCounterAppliesOnlyWhenStateIsCreated(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	for i := int64(1); i <= 5; i++ {
+		emitEvent(ctx, t, store, i)
+	}
+
+	backend := newFakeBackend()
+	first, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0, monotonic.WithInitialCounterForward())
+	if err := first.Drain(ctx); err != nil {
+		t.Fatalf("first Drain: %v", err)
+	}
+
+	// Events arrive while the projector is down.
+	emitEvent(ctx, t, store, 6)
+	emitEvent(ctx, t, store, 7)
+
+	// A restart: same name, same Forward configuration, fresh Projector.
+	cr := &counterRef{}
+	restarted, _ := monotonic.NewProjector("p1", store, countingDispatch(cr), backend, 0, monotonic.WithInitialCounterForward())
+	if err := restarted.Drain(ctx); err != nil {
+		t.Fatalf("restarted Drain: %v", err)
+	}
+
+	if cr.n != 2 {
+		t.Errorf("handler ran %d times after restart, want 2; a restart must resume from persisted state, not re-skip to the head", cr.n)
+	}
+	if len(backend.createdWith) != 1 {
+		t.Errorf("state created %d times, want exactly 1", len(backend.createdWith))
+	}
+}
+
+// TestProjector_InitialCounterForwardResolvesStreamHeadOnce covers the memoization: the head can
+// only ever be used by the Update that creates the state, so re-reading it on every poll is waste.
+func TestProjector_InitialCounterForwardResolvesStreamHeadOnce(t *testing.T) {
+	ctx := context.Background()
+	store := &countingStore{Store: monotonic.NewInMemoryStore()}
+	emitEvent(ctx, t, store, 1)
+
+	backend := newFakeBackend()
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0, monotonic.WithInitialCounterForward())
+
+	for i := 0; i < 5; i++ {
+		if err := p.Drain(ctx); err != nil {
+			t.Fatalf("Drain %d: %v", i, err)
+		}
+	}
+	if store.maxGlobalCounterCalls != 1 {
+		t.Errorf("MaxGlobalCounter called %d times across 5 drains, want 1", store.maxGlobalCounterCalls)
+	}
+}
+
+func TestProjector_InitialCounterForwardPropagatesStoreError(t *testing.T) {
+	ctx := context.Background()
+	wantErr := errors.New("head boom")
+	store := &countingStore{Store: monotonic.NewInMemoryStore(), maxGlobalCounterErr: wantErr}
+
+	p, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), newFakeBackend(), 0, monotonic.WithInitialCounterForward())
+
+	if _, err := p.Update(ctx); !errors.Is(err, wantErr) {
+		t.Errorf("Update err = %v, want %v", err, wantErr)
+	}
+}
+
+// TestProjector_TruncateUnavailableWhenInitialCounterIsNotZero pins the rule that makes the feature
+// coherent. Truncation rewinds to zero and nothing about the initial counter is persisted, so
+// servicing one would silently turn a Forward projector into a Zero one and replay all of history.
+func TestProjector_TruncateUnavailableWhenInitialCounterIsNotZero(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  monotonic.ProjectorOption
+	}{
+		{"forward", monotonic.WithInitialCounterForward()},
+		{"explicit", monotonic.WithInitialCounterAt(3)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			store := monotonic.NewInMemoryStore()
+			emitEvent(ctx, t, store, 1)
+			backend := newFakeBackend()
+
+			truncated := 0
+			dispatch := countingDispatch(&counterRef{}).OnTruncate(func(context.Context, *testTx) error {
+				truncated++
+				return nil
+			})
+			p, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0, tc.opt)
+
+			// The front door refuses, and nothing is enqueued.
+			if err := p.RequestTruncate(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
+				t.Fatalf("RequestTruncate err = %v, want ErrInitialCounterNotZero", err)
+			}
+			if backend.stateOf("p1").TruncateRequested {
+				t.Error("a rejected RequestTruncate still enqueued the truncate")
+			}
+
+			// The backstop refuses too, since the flag can be set straight on the backend.
+			if err := backend.EnqueueTruncate(ctx, "p1"); err != nil {
+				t.Fatalf("EnqueueTruncate: %v", err)
+			}
+			if _, err := p.Update(ctx); !errors.Is(err, monotonic.ErrInitialCounterNotZero) {
+				t.Fatalf("Update err = %v, want ErrInitialCounterNotZero", err)
+			}
+			if truncated != 0 {
+				t.Errorf("truncate handler ran %d times, want 0", truncated)
+			}
+			if !backend.stateOf("p1").TruncateRequested {
+				t.Error("TruncateRequested cleared by a refused truncate")
+			}
+		})
+	}
+}
+
+// TestProjector_TruncateAvailableAfterMovingToInitialCounterZero covers the documented way out:
+// reconfigure the projector and redeploy, and truncation works against the same persisted state.
+func TestProjector_TruncateAvailableAfterMovingToInitialCounterZero(t *testing.T) {
+	ctx := context.Background()
+	store := monotonic.NewInMemoryStore()
+	emitEvent(ctx, t, store, 1)
+	emitEvent(ctx, t, store, 2)
+	backend := newFakeBackend()
+
+	forward, _ := monotonic.NewProjector("p1", store, countingDispatch(&counterRef{}), backend, 0, monotonic.WithInitialCounterForward())
+	if err := forward.Drain(ctx); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+
+	cr := &counterRef{}
+	truncated := 0
+	dispatch := countingDispatch(cr).OnTruncate(func(context.Context, *testTx) error {
+		truncated++
+		return nil
+	})
+	// Same name and backend, now configured to start from zero.
+	zeroed, _ := monotonic.NewProjector("p1", store, dispatch, backend, 0)
+
+	if err := zeroed.RequestTruncate(ctx); err != nil {
+		t.Fatalf("RequestTruncate after moving to zero: %v", err)
+	}
+	if err := zeroed.Drain(ctx); err != nil {
+		t.Fatalf("Drain after truncate: %v", err)
+	}
+	if truncated != 1 {
+		t.Errorf("truncate handler ran %d times, want 1", truncated)
+	}
+	if cr.n != 2 {
+		t.Errorf("handler replayed %d events after truncate, want 2", cr.n)
+	}
+}
+
+// countingStore wraps a Store to count and optionally fail MaxGlobalCounter lookups.
+type countingStore struct {
+	monotonic.Store
+	maxGlobalCounterCalls int
+	maxGlobalCounterErr   error
+}
+
+func (s *countingStore) MaxGlobalCounter(ctx context.Context) (int64, error) {
+	s.maxGlobalCounterCalls++
+	if s.maxGlobalCounterErr != nil {
+		return 0, s.maxGlobalCounterErr
+	}
+	return s.Store.MaxGlobalCounter(ctx)
 }

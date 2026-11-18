@@ -36,7 +36,7 @@ func TestHarnessSmoke(t *testing.T) {
 
 	// Locking a projector that has never run proves projector_state exists and is queryable, and
 	// must report the zero state. The transaction is abandoned so the smoke test leaves no row behind.
-	tx, state, err := c.Backend.LockStateForModification(ctx, "never-ran")
+	tx, state, err := c.Backend.LockStateForModification(ctx, "never-ran", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}

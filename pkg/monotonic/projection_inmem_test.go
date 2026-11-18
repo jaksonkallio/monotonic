@@ -91,7 +91,7 @@ func runTx(
 	t.Helper()
 	ctx := context.Background()
 
-	tx, _, err := proj.LockStateForModification(ctx, projectorName)
+	tx, _, err := proj.LockStateForModification(ctx, projectorName, 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestInMemoryProjection_RollbackReleasesTheLock(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
-	tx, _, err := proj.LockStateForModification(ctx, "p")
+	tx, _, err := proj.LockStateForModification(ctx, "p", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestInMemoryProjection_RollbackReleasesTheLock(t *testing.T) {
 
 	locked := make(chan struct{})
 	go func() {
-		next, _, err := proj.LockStateForModification(ctx, "p")
+		next, _, err := proj.LockStateForModification(ctx, "p", 0)
 		if err == nil {
 			next.Rollback(ctx)
 		}
@@ -184,7 +184,7 @@ func TestInMemoryProjection_RollbackAfterCommitIsNoop(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
-	tx, _, err := proj.LockStateForModification(ctx, "p")
+	tx, _, err := proj.LockStateForModification(ctx, "p", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
@@ -312,7 +312,7 @@ func TestInMemoryProjection_ReadsDoNotBlockBehindAHandler(t *testing.T) {
 	ctx := context.Background()
 	proj := monotonic.NewInMemoryProjection[summaryRow]()
 
-	tx, _, err := proj.LockStateForModification(ctx, "p")
+	tx, _, err := proj.LockStateForModification(ctx, "p", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
@@ -349,7 +349,7 @@ func TestInMemoryProjection_ClearDoesNotMutateCommittedRows(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	tx, _, err := proj.LockStateForModification(ctx, "p")
+	tx, _, err := proj.LockStateForModification(ctx, "p", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
@@ -379,7 +379,7 @@ func TestInMemoryProjection_DeleteDoesNotMutateCommittedRows(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
-	tx, _, err := proj.LockStateForModification(ctx, "p")
+	tx, _, err := proj.LockStateForModification(ctx, "p", 0)
 	if err != nil {
 		t.Fatalf("LockStateForModification: %v", err)
 	}
