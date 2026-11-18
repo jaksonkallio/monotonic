@@ -346,6 +346,10 @@ Hydration time is the time required to load all events of an aggregate for repla
 | 100                 | 552μs          |
 | 1000                | 3.2ms          |
 
+## Metrics
+
+Projectors export Prometheus metrics, see [docs/metrics.md](./docs/metrics.md).
+
 ## Avoid Monotonic If...
 
 **If you need more than a couple of thousand events per second of sustained write throughput**, because Monotonic funnels every event write through one global event log and serializes assignment of positions in it. That is what makes both the optimistic concurrency model and correct projection resumption possible, and it caps a single Postgres instance in the low thousands of events per second. Batching several events into one `Append` call amortizes the cost if your writes arrive in groups.
